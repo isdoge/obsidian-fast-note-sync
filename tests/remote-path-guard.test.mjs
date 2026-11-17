@@ -71,7 +71,9 @@ async function check(kind, operation, mode, alias = "notes/A\u00a0B.md") {
   onWait = mode === "lateAlias" ? () => physical.set(sourcePath, alias)
     : mode === "foreignLate" ? () => physical.set(sourcePath, "elsewhere/real.md") : () => {};
   const deleted = [], renamed = [], removedHashes = [], ignored = [], completed = [];
-  const pending = new Map([[sourcePath, "unsent edit"]]);
+  const blocked = ["physicalSource", "foreign", "foreignSource", "foreignTarget", "foreignNested", "foreignLate"].includes(mode);
+  // An unsent edit makes an unblocked delete keep the note (#277); only blocked cases carry one here.
+  const pending = new Map(blocked || operation !== "Delete" ? [[sourcePath, "unsent edit"]] : []);
   const plugin = {
     settings: { syncEnabled: true, cloudPreviewEnabled: false },
     app: { vault: {
@@ -83,7 +85,8 @@ async function check(kind, operation, mode, alias = "notes/A\u00a0B.md") {
     addIgnoredFile: p => ignored.push(p), removeIgnoredFile() {},
     lastSyncPathDeleted: new Set(), lastSyncPathRenamed: new Set(), lastSyncMtime: new Map(),
     pendingNoteModifies: pending, fileDownloadSessions: new Map(),
-    fileHashManager: { removeFileHash: p => removedHashes.push(p), setFileHash() {} },
+    fileHashManager: { removeFileHash: p => removedHashes.push(p), setFileHash() {}, getPathHash: () => null },
+    pendingUploadHashes: new Map(),
     folderSnapshotManager: { removeFolder() {}, setFolderMtime() {} },
     localStorageManager: { getMetadata: () => 0, setMetadata() {}, savePending() {} },
     noteSyncTasks: { failed: 0 }, fileSyncTasks: { failed: 0 }, folderSyncTasks: { failed: 0 },
@@ -93,7 +96,6 @@ async function check(kind, operation, mode, alias = "notes/A\u00a0B.md") {
   await handler({ path: rawTarget, oldPath: rawSource, pageIndex: 7, contentHash: "1" }, plugin);
   // Unicode/no-break-space spellings of the same canonical path are the same file; only a
   // physical path that resolves elsewhere is an alias.
-  const blocked = ["physicalSource", "foreign", "foreignSource", "foreignTarget", "foreignNested", "foreignLate"].includes(mode);
   const skipped = blocked || mode === "nonempty";
   const label = JSON.stringify({ kind, operation, mode, alias });
   // A raw source that canonicalizes to the target is the same file: rename in place, nothing replaced.

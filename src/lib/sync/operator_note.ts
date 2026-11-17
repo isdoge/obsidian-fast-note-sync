@@ -516,12 +516,30 @@ export const receiveNoteSyncDelete = async function (data: ReceiveMessage, plugi
   }
   dump(`Receive note delete:`, data.path, data.mtime, data.pathHash)
   const normalizedPath = normalizePath(data.path)
+  let keptLocal: TFile | null = null
 
   try {
     const locked = await plugin.lockManager.withLock(normalizedPath, async () => {
       const file = plugin.app.vault.getFileByPath(normalizedPath)
       if (file instanceof TFile) {
         if (blockAliasedRemoteMutation(plugin, file, data.path, "NoteDelete")) return
+        // 本地有未同步的改动时不执行远端删除：保留本地并重新上传（#277）。只读端以服务端为准，照常删除
+        // Unsynced local edits win over a remote delete: keep the note and upload it again (#277).
+        // A read-only device mirrors the server and still deletes
+        if (!plugin.settings.readonlySyncEnabled) {
+          const baseHash = plugin.fileHashManager.getPathHash(normalizedPath)
+          let changed = plugin.pendingNoteModifies.has(normalizedPath)
+          if (!changed && baseHash !== null) {
+            const localHash = plugin.fileHashManager.getValidHash(normalizedPath, file.stat.mtime, file.stat.size)
+              ?? await hashContentAsync(await plugin.app.vault.read(file))
+            changed = localHash !== baseHash
+          }
+          if (changed) {
+            SyncLogManager.getInstance().addLog('receive', 'NoteDeleteConflict', `本地存在未同步的改动，保留本地并重新上传: ${normalizedPath}`, 'cancelled', data.path)
+            keptLocal = file
+            return
+          }
+        }
         plugin.addIgnoredFile(normalizedPath)
         // 记录待删除路径，用于拦截本地删除事件
         plugin.lastSyncPathDeleted.add(normalizedPath)
@@ -557,6 +575,7 @@ export const receiveNoteSyncDelete = async function (data: ReceiveMessage, plugi
   } finally {
     plugin.recordSyncCompleted('note', data.pageIndex)
   }
+  if (keptLocal) void noteModify(keptLocal, plugin)
 }
 
 /**

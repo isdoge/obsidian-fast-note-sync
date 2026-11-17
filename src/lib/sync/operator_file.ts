@@ -1027,11 +1027,30 @@ export const receiveFileSyncDelete = async function (data: ReceivePathMessage, p
 
   dump(`Receive file delete: `, data.path)
   const normalizedPath = normalizePath(data.path)
+  let keptLocal: TFile | null = null
 
   await plugin.lockManager.withLock(normalizedPath, async () => {
     const file = plugin.app.vault.getFileByPath(normalizedPath)
     if (file instanceof TFile) {
       if (blockAliasedRemoteMutation(plugin, file, data.path, "FileDelete")) return
+      // 本地有未同步的改动时不执行远端删除：保留本地并重新上传（#277）。只读端以服务端为准，照常删除；
+      // 超大附件不读内容，统计信息与已同步记录不符即视为有改动
+      // Unsynced local edits win over a remote delete: keep the file and upload it again (#277).
+      // A read-only device still deletes; large attachments are not read, a stat mismatch counts as changed
+      if (!plugin.settings.readonlySyncEnabled) {
+        const baseHash = plugin.fileHashManager.getPathHash(normalizedPath)
+        let changed = plugin.pendingUploadHashes.has(normalizedPath)
+        if (!changed && baseHash !== null) {
+          let localHash = plugin.fileHashManager.getValidHash(normalizedPath, file.stat.mtime, file.stat.size)
+          if (localHash === null && !isLargeBinarySyncRisk(file.stat.size, plugin)) localHash = await hashFileAsync(plugin.app, normalizedPath)
+          changed = localHash !== baseHash
+        }
+        if (changed) {
+          SyncLogManager.getInstance().addLog('receive', 'FileDeleteConflict', `本地存在未同步的改动，保留本地并重新上传: ${normalizedPath}`, 'cancelled', data.path)
+          keptLocal = file
+          return
+        }
+      }
       plugin.addIgnoredFile(normalizedPath)
       // 记录待删除路径
       plugin.lastSyncPathDeleted.add(normalizedPath)
@@ -1063,6 +1082,7 @@ export const receiveFileSyncDelete = async function (data: ReceivePathMessage, p
   });
 
   plugin.recordSyncCompleted('file', data.pageIndex)
+  if (keptLocal) void fileModify(keptLocal, plugin)
 }
 
 /**
