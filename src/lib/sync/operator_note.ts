@@ -16,6 +16,13 @@ export const noteModify = async function (file: TAbstractFile, plugin: FastSync,
   if (!file.path.endsWith(".md")) return
   if (eventEnter && plugin.isIgnoredFile(file.path)) return
   if (isPathExcluded(file.path, plugin)) return
+  // 冲突未解决的路径暂停上传，否则本端旧稿会覆盖其他端的新内容（#276）；解决冲突时由冲突合并窗口自行推送
+  // Uploads of an unresolved conflict are paused, or this device's stale copy overwrites newer content
+  // from other devices (#276); the conflict resolve modal pushes the merged result itself
+  if (plugin.syncState.conflictedPaths.has(file.path)) {
+    dump(`Note modify paused, unresolved conflict: ${file.path}`)
+    return
+  }
 
   await plugin.lockManager.withLock(file.path, async () => {
     plugin.addIgnoredFile(file.path)
@@ -381,6 +388,13 @@ export const receiveNoteUpload = async function (data: ReceivePathMessage, plugi
   }
   const file = plugin.app.vault.getFileByPath(normalizePath(data.path))
   if (!file) {
+    plugin.recordSyncCompleted('note', data.pageIndex)
+    return
+  }
+  // 冲突未解决：不响应服务端的上传请求，避免旧稿覆盖服务端（#276）
+  // Unresolved conflict: do not answer the server's upload request, so the stale copy never overwrites the server (#276)
+  if (plugin.syncState.conflictedPaths.has(file.path)) {
+    SyncLogManager.getInstance().addLog('send', 'NoteModifyConflict', `冲突未解决，暂停上传: ${file.path}`, 'cancelled', data.path)
     plugin.recordSyncCompleted('note', data.pageIndex)
     return
   }

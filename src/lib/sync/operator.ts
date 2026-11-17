@@ -683,9 +683,18 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
   try {
     if (await adapter.exists(conflictDir)) {
       const files = await adapter.list(conflictDir);
+      // 未解决冲突的 base/remote 备份要保留给冲突合并窗口（其上传已暂停，见 #276）
+      // Keep the base/remote backups of unresolved conflicts for the resolve modal (their uploads are paused, see #276)
+      const keep = new Set<string>();
+      for (const p of plugin.syncState.conflictedPaths) {
+        const stem = `${conflictDir}/${p.replace(/\.md$/, "").replace(/[/\\]/g, "_")}_${hashContent(p)}`;
+        keep.add(`${stem}.base.md`);
+        keep.add(`${stem}.remote.md`);
+      }
       const deletePromises: Promise<void>[] = [];
       if (files && files.files) {
         for (const f of files.files) {
+          if (keep.has(f)) continue;
           deletePromises.push(adapter.remove(f));
         }
       }
