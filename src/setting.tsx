@@ -1791,8 +1791,13 @@ export class SettingTab extends PluginSettingTab {
       $("setting.sync.config_dirs_desc"),
       () => parseRules(this.plugin.settings.configSyncOtherDirs),
       async (rules) => {
-        this.plugin.settings.configSyncOtherDirs = JSON.stringify(rules)
-        await this.plugin.saveAndReloadServices()
+        const nextDirs = JSON.stringify(rules)
+        const changed = nextDirs !== this.plugin.settings.configSyncOtherDirs
+        this.plugin.settings.configSyncOtherDirs = nextDirs
+        if (changed) {
+          this.plugin.localStorageManager.setMetadata("lastConfigSyncTime", 0)
+        }
+        await this.plugin.saveAndReloadServices(changed ? "configSyncOtherDirs" : "")
       },
       false,
       $("ui.button.add_dir"),

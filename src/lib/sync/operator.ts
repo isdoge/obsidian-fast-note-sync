@@ -1144,6 +1144,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         }
         if (isLoadLastTime
           && stat.mtime < Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"))
+          && plugin.configHashManager.getPathHash(path) !== null
           && !plugin.pendingConfigModifies.has(path)) continue;
 
         // 处理大配置文件时更新消息

@@ -913,6 +913,10 @@ export default class FastSync extends Plugin {
       this.runWsApi = this.settings.api ? this.settings.api.replace(/^http/, "ws") : "";
     }
 
+    if (forceRegister && (setItem === "configSyncOtherDirs" || setItem === "configSyncEnabled")) {
+      void this.configManager?.reloadCustomDirs()
+    }
+
     if (forceRegister && this.settings.api && this.settings.apiToken) {
       const runRegister = () => {
         if (this.wsSettingChange) {
@@ -932,7 +936,7 @@ export default class FastSync extends Plugin {
           this.syncTimer = window.setTimeout(() => {
             if (setItem == "syncEnabled" && this.settings.syncEnabled) {
               void handleSync(this, false, "note")
-            } else if (setItem == "configSyncEnabled" && this.settings.configSyncEnabled) {
+            } else if ((setItem == "configSyncEnabled" || setItem == "configSyncOtherDirs") && this.settings.configSyncEnabled) {
               void handleSync(this, false, "config")
             }
             this.syncTimer = null
@@ -958,6 +962,7 @@ export default class FastSync extends Plugin {
       this.lastSyncPathRenamed = new Set()
       this.fileDownloadSessions = new Map()
     } else {
+      void this.configManager?.stop()
       this.websocket?.unRegister()
       this.ignoredFiles = new Set()
       this.ignoredConfigFiles = new Set()
