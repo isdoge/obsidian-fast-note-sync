@@ -35,6 +35,7 @@ function load(name) {
       if (id === "../utils/helpers") return helpers;
       if (id === "../storage/file_cloud_preview") return { FileCloudPreview: { isRestrictedType: () => false } };
       if (id === "../api/http_api_service") return { HttpApiService: {} };
+      if (id === "../../i18n/lang") return { $: key => key };
       throw new Error(`Unexpected import: ${id}`);
     },
   }, { filename: name });
