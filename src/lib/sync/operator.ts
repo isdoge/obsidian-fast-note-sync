@@ -896,6 +896,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
 
         try {
           if (file instanceof TFolder) {
+            if (plugin.settings.readonlySyncEnabled) continue;
             if (file.path === "/") continue;
             if (isFolderSyncPathExcluded(file.path, plugin)) continue;
             let mtime = plugin.folderSnapshotManager.getMtime(file.path) || Date.now();
@@ -1051,8 +1052,8 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
           }
         }
 
-        // 检测被删除的文件夹
-        if (plugin.folderSnapshotManager && plugin.folderSnapshotManager.isReady()) {
+        // 检测被删除的文件夹（只读模式下不上传本地删除的目录）
+        if (!plugin.settings.readonlySyncEnabled && plugin.folderSnapshotManager && plugin.folderSnapshotManager.isReady()) {
           const trackedFolderPaths = plugin.folderSnapshotManager.getAllPaths();
           const localFolderPathsSet = new Set(list.filter(f => f instanceof TFolder).map(f => f.path));
           let folderCount = 0;
@@ -1143,6 +1144,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         }
         if (isLoadLastTime
           && stat.mtime < Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"))
+          && plugin.configHashManager.getPathHash(path) !== null
           && !plugin.pendingConfigModifies.has(path)) continue;
 
         // 处理大配置文件时更新消息
@@ -1692,14 +1694,17 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
 
     // 并发分批发送 FolderSync / NoteSync / FileSync
     // Concurrently batch-send FolderSync / NoteSync / FileSync
-    dump(`[Sync] Starting batch send: ${folderData.folders.length} folders, ${noteData.notes.length} notes, ${fileData.files.length} files`);
+    const isReadonly = !!plugin.settings.readonlySyncEnabled;
+    const foldersToSend = isReadonly ? [] : folderData.folders;
+    const delFoldersToSend = !isReadonly && plugin.settings.offlineDeleteSyncEnabled ? folderData.delFolders : [];
+    dump(`[Sync] Starting batch send: ${foldersToSend.length} folders, ${noteData.notes.length} notes, ${fileData.files.length} files`);
     jobs.push(sendSyncInBatches(
       plugin,
       "FolderSync",
       "FolderSyncBatchAck",
       folderData.context,
-      folderData.folders,
-      plugin.settings.offlineDeleteSyncEnabled ? folderData.delFolders : [],
+      foldersToSend,
+      delFoldersToSend,
       folderData.missingFolders,
       (mainChunk, delChunk, missingChunk, batchIndex, totalBatches) => ({
         vault: plugin.settings.vault,
@@ -1708,12 +1713,14 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
         context: folderData.context,
         batchIndex,
         totalBatches,
-        ...(plugin.settings.offlineDeleteSyncEnabled ? { delFolders: delChunk } : {}),
+        ...(!isReadonly && plugin.settings.offlineDeleteSyncEnabled ? { delFolders: delChunk } : {}),
         ...(missingChunk.length > 0 ? { missingFolders: missingChunk } : {}),
       }),
       () => {
-        const paths = folderData.folders.map(f => f.path);
-        plugin.folderSnapshotManager.setFolderMtimes(paths, Date.now());
+        if (foldersToSend.length > 0) {
+          const paths = foldersToSend.map(f => f.path);
+          plugin.folderSnapshotManager.setFolderMtimes(paths, Date.now());
+        }
       }
     ));
 
@@ -1811,7 +1818,9 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
     if (plugin.settings.offlineDeleteSyncEnabled) {
       plugin.pendingDeleteNotePaths = new Set(noteData.delNotes.map(i => i.path));
       plugin.pendingDeleteFilePaths = new Set(fileData.delFiles.map(i => i.path));
-      plugin.pendingDeleteFolderPaths = new Set(folderData.delFolders.map(i => i.path));
+      if (!plugin.settings.readonlySyncEnabled) {
+        plugin.pendingDeleteFolderPaths = new Set(folderData.delFolders.map(i => i.path));
+      }
     }
   }
 

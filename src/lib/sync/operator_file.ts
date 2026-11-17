@@ -331,14 +331,54 @@ const fallbackFileDownloadSessionToMemory = async (plugin: FastSync, session: Fi
  * 清理所有残留的临时目录
  */
 export const clearAllTempChunks = async (plugin: FastSync) => {
+  const adapter = plugin.app.vault.adapter
   const path = getTempChunksDir(plugin)
-  if (await plugin.app.vault.adapter.exists(path)) {
-    dump(`Cleaning all temp chunks: ${path}`)
-    await plugin.app.vault.adapter.rmdir(path, true)
+
+  const removeEntries = async (dirPath: string) => {
+    if (typeof adapter.list !== "function") return
+    try {
+      const entries = await adapter.list(dirPath)
+      for (const file of entries.files || []) {
+        try {
+          await adapter.remove(file)
+        } catch (err) {
+          dumpError(`Failed to remove temp chunk file: ${file}`, err)
+        }
+      }
+      for (const folder of entries.folders || []) {
+        await removeEntries(folder)
+        try {
+          await adapter.rmdir(folder, true)
+        } catch (err) {
+          dumpError(`Failed to remove temp chunk folder: ${folder}`, err)
+        }
+      }
+    } catch (err) {
+      dumpError(`Failed to list temp chunk dir: ${dirPath}`, err)
+    }
   }
+
+  try {
+    if (await adapter.exists(path)) {
+      dump(`Cleaning all temp chunks: ${path}`)
+      try {
+        await adapter.rmdir(path, true)
+      } catch (e) {
+        dumpError(`Failed to remove temp chunks dir: ${path}`, e)
+        await removeEntries(path)
+      }
+    }
+  } catch (e) {
+    dumpError(`Failed to clean temp chunks: ${path}`, e)
+  }
+
   // 确保基础目录在清理后立即存在 (Ensure base dir exists immediately after cleanup)
-  if (!(await plugin.app.vault.adapter.exists(path))) {
-    await plugin.app.vault.adapter.mkdir(path)
+  try {
+    if (!(await adapter.exists(path))) {
+      await adapter.mkdir(path)
+    }
+  } catch (e) {
+    dumpError(`Failed to ensure temp chunks dir exists: ${path}`, e)
   }
 }
 

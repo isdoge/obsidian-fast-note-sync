@@ -10,6 +10,8 @@ export class ConfigManager {
   private pluginDir: string = ""
   private pluginRealDir: string = ""
   private fileStates: Map<string, number> = new Map()
+  private watchedCustomDirs: Set<string> = new Set()
+  private customDirWatchCleanups: Map<string, () => Promise<void> | void> = new Map()
   private rootFilesExclude: string[] = []
   private pluginExtsToWatch: string[] = []
   private themeExtsToWatch: string[] = []
@@ -34,11 +36,46 @@ export class ConfigManager {
     void this.watchCustomDirs()
   }
 
+  public async reloadCustomDirs() {
+    await this.watchCustomDirs()
+    await this.initializeFileStates()
+  }
+
+  public async stop() {
+    await this.clearCustomDirWatches()
+  }
+
+  private async clearCustomDirWatches() {
+    const adapter = this.plugin.app.vault.adapter as typeof this.plugin.app.vault.adapter & {
+      unwatch?: (path: string) => Promise<void> | void
+    }
+    for (const dir of Array.from(this.watchedCustomDirs)) {
+      const cleanup = this.customDirWatchCleanups.get(dir)
+      if (cleanup) {
+        this.customDirWatchCleanups.delete(dir)
+        try {
+          await cleanup()
+        } catch (e) {
+          dumpError(`ConfigManager: Failed to cleanup custom directory watcher ${dir}`, e)
+        }
+        this.watchedCustomDirs.delete(dir)
+      } else if (typeof adapter.unwatch === "function") {
+        try {
+          await adapter.unwatch(dir)
+        } catch (e) {
+          dumpError(`ConfigManager: Failed to unwatch custom directory ${dir}`, e)
+        }
+        this.watchedCustomDirs.delete(dir)
+      }
+    }
+  }
+
   private async watchCustomDirs() {
+    await this.clearCustomDirWatches()
     if (!this.plugin.settings.configSyncEnabled) return
     // Obsidian 默认不监听配置目录之外的隐藏目录；该内部能力并非所有适配器都有。
     const adapter = this.plugin.app.vault.adapter as typeof this.plugin.app.vault.adapter & {
-      watchHiddenRecursive?: (path: string) => Promise<void> | void
+      watchHiddenRecursive?: (path: string) => unknown
     }
     if (typeof adapter.watchHiddenRecursive !== "function") return
     const configDir = this.plugin.app.vault.configDir
@@ -50,8 +87,21 @@ export class ConfigManager {
         || !parts.some(part => part.startsWith("."))
         || dir === configDir || dir.startsWith(configDir + "/")
         || configIsPathExcluded(dir, this.plugin)) continue
+      // 适配器未提供 unwatch/清理句柄时跳过已注册目录，避免重复挂接相同监听器
+      if (this.watchedCustomDirs.has(dir)) continue
       try {
-        await adapter.watchHiddenRecursive(dir)
+        const result = await adapter.watchHiddenRecursive(dir)
+        this.watchedCustomDirs.add(dir)
+        if (typeof result === "function") {
+          this.customDirWatchCleanups.set(dir, result as () => Promise<void> | void)
+        } else if (result && typeof result === "object") {
+          const closable = result as { close?: () => Promise<void> | void; unwatch?: () => Promise<void> | void }
+          if (typeof closable.close === "function") {
+            this.customDirWatchCleanups.set(dir, () => closable.close!())
+          } else if (typeof closable.unwatch === "function") {
+            this.customDirWatchCleanups.set(dir, () => closable.unwatch!())
+          }
+        }
       } catch (e) {
         dumpError(`ConfigManager: Failed to watch custom directory ${dir}`, e)
       }
@@ -59,23 +109,28 @@ export class ConfigManager {
   }
 
   private async initializeFileStates() {
-    if (!this.plugin.settings.configSyncEnabled) return
+    if (!this.plugin.settings.configSyncEnabled) {
+      this.fileStates.clear()
+      return
+    }
 
     const configDir = this.plugin.app.vault.configDir
     const customDirs = getConfigSyncCustomDirs(this.plugin)
     const paths = await configAllPaths([configDir, ...customDirs], this.plugin)
 
+    const nextStates = new Map<string, number>()
     for (const relPath of paths) {
       const fullPath = normalizePath(relPath)
       try {
         const stat = await this.plugin.app.vault.adapter.stat(fullPath)
         if (stat && stat.type === "file") {
-          this.fileStates.set(fullPath, stat.mtime)
+          nextStates.set(fullPath, stat.mtime)
         }
       } catch {
         // 忽略读取不到的单个文件
       }
     }
+    this.fileStates = nextStates
     dump("ConfigManager: Initialized fileStates with", this.fileStates.size, "files")
   }
 
