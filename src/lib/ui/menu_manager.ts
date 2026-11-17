@@ -764,6 +764,13 @@ export class MenuManager {
     }
   }
 
+  removeConflictedPath(path: string): void {
+    const normalizedPath = normalizePath(path);
+    this.plugin.syncState.conflictedPaths.delete(normalizedPath);
+    this.plugin.localStorageManager.setConflictedPaths(this.plugin.syncState.conflictedPaths);
+    this.plugin.statusBarManager.updateConflictBadge();
+  }
+
   async openConflictResolverForPath(path: string) {
     const normalizedPath = normalizePath(path);
     if (!this.plugin.syncState.conflictedPaths.has(normalizedPath)) {
@@ -771,7 +778,11 @@ export class MenuManager {
       return;
     }
     const file = this.plugin.app.vault.getFileByPath(normalizedPath);
-    if (!file) return;
+    if (!file) {
+      new Notice($("ui.conflict.missing_local", { path: normalizedPath }));
+      new NoteHistoryModal(this.plugin.app, this.plugin, normalizedPath).open();
+      return;
+    }
 
     try {
       const adapter = this.plugin.app.vault.adapter;
@@ -819,6 +830,7 @@ export class MenuManager {
       new ConflictResolveModal(this.plugin.app, this.plugin, file, localContent, serverContent, baseContent, serverHash).open();
     } catch (e) {
       console.error("Failed to open conflict resolver for path:", e);
+      new Notice($("ui.conflict.open_failed", { path: normalizedPath }));
     }
   }
 }

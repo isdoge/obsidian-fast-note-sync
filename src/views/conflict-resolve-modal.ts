@@ -359,9 +359,7 @@ export class ConflictResolveModal extends Modal {
         };
 
         // Remove path from suppressed collection // 解除路径抑制
-        this.plugin.syncState.conflictedPaths.delete(this.file.path);
-        this.plugin.localStorageManager.setConflictedPaths(this.plugin.syncState.conflictedPaths);
-        this.plugin.statusBarManager.updateConflictBadge();
+        this.plugin.menuManager.removeConflictedPath(this.file.path);
 
         // 清理本地 conflict-notes 中的备份文件 (位于插件目录下，文件名附加路径哈希以防碰撞)
         try {
