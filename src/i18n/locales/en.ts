@@ -2,7 +2,6 @@
 
 
 export default {
-    "ui.conflict.diff_skipped": "Large file: line-by-line comparison was skipped. Choose a version above or edit the text directly.",
   "fns.desc": "A plugin for private deployment that enables real-time sync & backup of notes, attachments, and configurations across multiple devices. Supports Mac, Windows, Android, iOS, and more, with multi-language support.",
 
   "setting.tab.general": "General",
