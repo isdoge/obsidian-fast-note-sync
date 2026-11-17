@@ -95,4 +95,55 @@ checkSyncCompletion(longRunning, 1, startedAt, 'long-running');
 assert.equal(longRunning.syncState.activeSyncContext, 'long-running');
 assert.equal(longRunning.isSyncing, true);
 assert.equal(statusUpdates.length, 2, 'ongoing transfer remains visible after six hours');
+
+// F-3: stall restarts back off 5/10/20 minutes, then stop and report in the status bar
+{
+  let clock = 90_000_000;
+  class ClockDate extends Date { static now() { return clock; } }
+  const timers = [];
+  const backoffModule = { exports: {} };
+  vm.runInNewContext(integrationCode, {
+    module: backoffModule, exports: backoffModule.exports, console, Date: ClockDate, WebSocket: { OPEN: 1 },
+    window: { setTimeout: (fn, ms) => { timers.push(ms); return 1; }, clearInterval: noop },
+    require: id => id === 'obsidian' ? { normalizePath: x => x, TFile: class {}, TFolder: class {} }
+      : id.includes('helpers') ? { dump: noop }
+      : id.includes('sync_log_manager') ? { SyncLogManager: { getInstance: () => ({ addOrUpdateLog: noop }) } }
+      : id.includes('i18n') ? { $: (key, vars) => vars ? `${key}:${JSON.stringify(vars)}` : key }
+      : id === './operator_file' ? { sweepStalledDownloadSessions: async () => 0 }
+      : {},
+  });
+  const { checkSyncCompletion: check, SYNC_STALL_RESTART_MS: LIMIT, SYNC_STALL_MAX_RESTARTS } = backoffModule.exports;
+  const status = [];
+  const stalled = {
+    syncState: { activeSyncContext: null, progressCheckIntervalId: 1, pendingSyncEndTime: new Map(), syncTimeBaseline: new Map(),
+      pendingNotePushPageIndex: new Map(), pendingFilePushPageIndex: new Map(), pendingConfigPushPageIndex: new Map() },
+    settings: { syncEnabled: true, configSyncEnabled: false, isShowNotice: false },
+    noteSyncTasks: { completed: 0, failed: 0 }, fileSyncTasks: { completed: 0, failed: 0 },
+    folderSyncTasks: { completed: 0, failed: 0 }, configSyncTasks: { completed: 0, failed: 0 },
+    uploadedChunksCount: 0, downloadedChunksCount: 0,
+    concurrencyLimiter: { activeKeys: new Set(), queue: [] },
+    fileDownloadSessions: new Map(), isSyncRequesting: false, isSyncing: true,
+    websocket: { ws: { readyState: 1, bufferedAmount: 0 }, isOpen: true },
+    progressTracker: { getOverallPct: () => 10, getDetailText: () => '', isTypeFullyDone: () => false, forceComplete: noop },
+    syncPageStateMap: new Map(), resetSyncTasks: noop, localStorageManager: { getMetadata: () => 0, setMetadata: noop },
+    updateStatusBar: text => status.push(text),
+  };
+  const stallRound = ctx => {
+    stalled.syncState.activeSyncContext = ctx;
+    check(stalled, 1, 0, ctx);
+    clock += LIMIT + 1;
+    check(stalled, 1, 0, ctx);
+    assert.equal(stalled.syncState.activeSyncContext, null, `${ctx}: stalled round ends`);
+  };
+  stallRound('r1'); stallRound('r2'); stallRound('r3');
+  assert.deepEqual(timers, [LIMIT, 2 * LIMIT, 4 * LIMIT], 'restart delay starts at 5 minutes and doubles');
+  assert.equal(status.at(-1), 'ui.status.stalled_restarting:{"minutes":"20"}');
+  stallRound('r4');
+  assert.equal(SYNC_STALL_MAX_RESTARTS, 3);
+  assert.equal(timers.length, 3, 'no restart scheduled after the limit');
+  assert.equal(status.at(-1), 'ui.status.stalled_gave_up', 'giving up is reported in the status bar');
+  // Giving up resets the budget: a later (e.g. manual) round can restart again
+  stallRound('r5');
+  assert.deepEqual(timers.slice(3), [LIMIT]);
+}
 console.log('sync stall watchdog tests passed');

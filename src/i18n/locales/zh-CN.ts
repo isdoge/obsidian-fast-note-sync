@@ -269,6 +269,8 @@ export default {
   "ui.status.new_version": "发现新版本: ${version}, 点击后跳转更新页面",
   "ui.status.completed": "同步完成",
   "ui.status.completed_with_failures": "同步完成，其中 ${count} 项失败",
+  "ui.status.stalled_restarting": "同步停滞，${minutes} 分钟后重试",
+  "ui.status.stalled_gave_up": "同步多次停滞，已停止自动重试，请手动同步",
   "ui.status.timeout_partial": "同步超时，部分文件未完成，将在下一轮同步继续",
   "ui.status.failed": "同步失败",
   "ui.status.cancelled": "同步已取消",

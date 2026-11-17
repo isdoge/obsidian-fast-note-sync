@@ -269,6 +269,8 @@ export default {
   "ui.status.new_version": "새 버전 발견: ${version}, 클릭하면 업데이트 페이지로 이동합니다",
   "ui.status.completed": "동기화 완료",
   "ui.status.completed_with_failures": "동결 완료, ${count}개 항목 실패",
+  "ui.status.stalled_restarting": "동기화가 멈췄습니다. ${minutes}분 후 다시 시도합니다",
+  "ui.status.stalled_gave_up": "동기화가 반복해서 멈춰 자동 재시도를 중단했습니다. 수동으로 동기화하세요",
   "ui.status.timeout_partial": "동결 시간 초과, 일부 파일이 완료되지 않았으며 다음 동결 주기에서 계속 진행됩니다",
   "ui.status.failed": "동기화 실패",
   "ui.status.cancelled": "동기화가 취소되었습니다",

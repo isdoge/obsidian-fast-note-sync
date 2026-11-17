@@ -106,7 +106,12 @@ function commitScannedHashes(scanned: ScannedHashMap, commit: (m: ScannedHashMap
 // start a new one; completed items do not reappear, so progress accumulates. Pending local edits
 // are kept (cancelSync is not used).
 export const SYNC_STALL_RESTART_MS = 300000;
-const syncStallState: { context?: string; signature: string; lastProgressAt: number } = { signature: "", lastProgressAt: 0 };
+// 停滞重启指数退避：等待 5 分钟起翻倍（5/10/20 分钟），连续最多 3 次；再停滞就停止自动重启并在状态栏报错。
+// 某一轮正常完成或放弃后计数清零。
+// Stall restart backoff: wait 5 minutes, doubling (5/10/20 min), at most 3 in a row; a further stall
+// stops automatic restarts and reports in the status bar. The count resets on completion or give-up.
+export const SYNC_STALL_MAX_RESTARTS = 3;
+const syncStallState: { context?: string; signature: string; lastProgressAt: number; restarts: number } = { signature: "", lastProgressAt: 0, restarts: 0 };
 
 export function isSyncStalled(plugin: FastSync, ownerContext: string | undefined, now = Date.now()): boolean {
   const signature = JSON.stringify([
@@ -171,10 +176,14 @@ function restartStalledSync(plugin: FastSync, intervalId?: number): void {
     }
   }
   settleSyncTimes(plugin, true);
-  dump(`Sync stalled without progress for ${SYNC_STALL_RESTART_MS}ms; restarting. Tasks: note=${JSON.stringify(plugin.noteSyncTasks)}, file=${JSON.stringify(plugin.fileSyncTasks)}`);
+  const giveUp = syncStallState.restarts >= SYNC_STALL_MAX_RESTARTS;
+  const delay = SYNC_STALL_RESTART_MS * 2 ** syncStallState.restarts;
+  syncStallState.restarts = giveUp ? 0 : syncStallState.restarts + 1;
+  dump(`Sync stalled without progress for ${SYNC_STALL_RESTART_MS}ms; ${giveUp ? "giving up" : `restarting in ${delay}ms`}. Tasks: note=${JSON.stringify(plugin.noteSyncTasks)}, file=${JSON.stringify(plugin.fileSyncTasks)}`);
   SyncLogManager.getInstance().addOrUpdateLog({
     id: `stall-${Date.now()}`, type: 'info', action: 'SyncSummary', status: 'error',
-    message: 'Sync stalled waiting for server pages; restarting a new round', timestamp: Date.now()
+    message: giveUp ? `Sync stalled ${SYNC_STALL_MAX_RESTARTS + 1} times in a row; automatic restart stopped`
+      : 'Sync stalled waiting for server pages; restarting a new round', timestamp: Date.now()
   });
   plugin.syncState.activeSyncContext = null;
   plugin.syncTypeCompleteCount = 0;
@@ -191,12 +200,16 @@ function restartStalledSync(plugin: FastSync, intervalId?: number): void {
   plugin.uploadedChunksCount = 0;
   plugin.isSyncing = false;
   plugin.progressTracker.forceComplete();
-  plugin.updateStatusBar("Sync stalled, restarting…");
+  if (giveUp) {
+    plugin.updateStatusBar($("ui.status.stalled_gave_up"));
+    return;
+  }
+  plugin.updateStatusBar($("ui.status.stalled_restarting", { minutes: String(delay / 60000) }));
   window.setTimeout(() => {
     if (plugin.websocket.isOpen && !plugin.isSyncing) {
       void handleSync(plugin, plugin.localStorageManager.getMetadata("isInitSync") as boolean);
     }
-  }, 5000);
+  }, delay);
 }
 
 export function checkSyncCompletion(plugin: FastSync, intervalId?: number, _syncStartTime?: number, ownerContext?: string) {
@@ -312,6 +325,7 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, _sync
     // 未参与完成判定的类型（如本轮中途关闭了同步）仍有暂存时间时回到基线
     // Types left unsettled (e.g. sync disabled mid-round) fall back to their baseline
     settleSyncTimes(plugin, true);
+    syncStallState.restarts = 0;
 
     plugin.syncState.activeSyncContext = null; // 同步完成，清空活跃的上下文 / Sync completed, reset the active context
     plugin.isSyncing = false;
