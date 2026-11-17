@@ -7,6 +7,8 @@ import { SyncLogManager } from "./sync_log_manager";
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
 
+// 同一插件会话中每条失败路径只通知一次；重试仍逐次保留同步错误日志。
+const notifiedNoteFailures = new WeakMap<FastSync, Set<string>>();
 
 /**
  * 笔记修改事件处理
@@ -352,7 +354,15 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
     if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'NoteModify')) {
       const message = e instanceof Error ? e.message : String(e);
       SyncLogManager.getInstance().addLog('receive', 'NoteModify', message, 'error', data.path);
-      showSyncNotice(`${$('ui.status.failed')}: ${data.path}\n${message}`, 15000);
+      let notifiedPaths = notifiedNoteFailures.get(plugin);
+      if (!notifiedPaths) {
+        notifiedPaths = new Set();
+        notifiedNoteFailures.set(plugin, notifiedPaths);
+      }
+      if (!notifiedPaths.has(data.path)) {
+        notifiedPaths.add(data.path);
+        showSyncNotice(`${$('ui.status.failed')}: ${data.path}\n${message}`, 15000);
+      }
     }
     plugin.noteSyncTasks.failed++
   } finally {

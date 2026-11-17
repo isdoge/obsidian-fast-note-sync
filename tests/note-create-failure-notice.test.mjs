@@ -43,5 +43,12 @@ for (const path of ['test:colon/note.md', 'notes/test:colon.md', 'notes/valid.md
     assert.equal(logs.length, 1);
   }
   assert.equal(creates, path.startsWith('test:') ? 0 : 1, 'paths are never silently rewritten');
+  if (failed) {
+    await module.exports.receiveNoteSyncModify({ path, content: 'remote', mtime: 1, pageIndex: 3 }, plugin);
+    assert.equal(notices.length, 1, 'retries only notify once per path in this plugin session');
+    assert.equal(logs.length, 2, 'every failed retry remains visible in the sync log');
+    assert.equal(plugin.noteSyncTasks.failed, 2);
+    assert.equal(completed, 2);
+  }
 }
 console.log('Note creation failures: visible error and unchanged remote path passed');
