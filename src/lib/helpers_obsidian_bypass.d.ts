@@ -6,3 +6,4 @@ export function dump(...message: unknown[]): void;
 export function dumpError(...message: unknown[]): void;
 export function nativeFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
 export function vaultDelete(vault: Vault, file: TAbstractFile, force?: boolean): Promise<void>;
+export function vaultTrash(vault: Vault, file: TAbstractFile, system: boolean): Promise<void>;

@@ -9,7 +9,8 @@ class TFolder { constructor(path) { this.path = path; this.children = []; } }
 const helpers = { dump: noop, dumpError: noop, isPathExcluded: () => false,
   isFolderSyncPathExcluded: () => false, configIsPathExcluded: () => false,
   isPathInConfigSyncDirs: () => true, waitForFolderEmpty: async () => true,
-  checkAndNotifyCaseConflict: () => false, isLargeBinarySyncRisk: () => false };
+  checkAndNotifyCaseConflict: () => false, isLargeBinarySyncRisk: () => false,
+  vaultTrash: (vault, file, system) => vault.trash(file, system) };
 let permanentCalls = 0;
 const forbidden = () => { permanentCalls++; throw new Error('permanent deletion must not be used'); };
 function load(file) {
@@ -23,6 +24,7 @@ function load(file) {
       : id.includes('helpers_obsidian_bypass') ? { ...helpers, vaultDelete: forbidden }
       : id.includes('helpers') ? { ...helpers, vaultDelete: forbidden }
       : id.includes('sync_log_manager') ? { SyncLogManager: { getInstance: () => ({ addLog: noop }) } }
+      : id.includes('remote_path_guard') ? { blockAliasedRemoteMutation: () => false }
       : {} });
   return module.exports;
 }

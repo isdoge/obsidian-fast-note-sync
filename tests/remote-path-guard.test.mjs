@@ -15,6 +15,7 @@ const helpers = new Proxy({
   isPathExcluded: () => false,
   isFolderSyncPathExcluded: () => false,
   vaultDelete: (vault, file) => vault.trash(file),
+  vaultTrash: (vault, file) => vault.trash(file),
   waitForFolderEmpty: async () => { onWait(); return empty; },
 }, { get: (target, name) => target[name] ?? (() => undefined) });
 const cache = new Map();
