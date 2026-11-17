@@ -13,7 +13,8 @@ const code = ts.transpileModule(fs.readFileSync('src/lib/sync/sync_progress_trac
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }
 }).outputText;
 vm.runInNewContext(code, { module, exports: module.exports, console, window,
-  require: id => id.includes('helpers') ? { dump: () => {} } : {} });
+  require: id => id.includes('helpers') ? { dump: () => {} }
+    : id.includes('i18n') ? { $: key => key } : {} });
 const { SyncProgressTracker } = module.exports;
 const fireAll = () => { const fns = [...timers.values()]; timers.clear(); fns.forEach(f => f()); };
 
