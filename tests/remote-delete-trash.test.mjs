@@ -9,8 +9,7 @@ class TFolder { constructor(path) { this.path = path; this.children = []; } }
 const helpers = { dump: noop, dumpError: noop, isPathExcluded: () => false,
   isFolderSyncPathExcluded: () => false, configIsPathExcluded: () => false,
   isPathInConfigSyncDirs: () => true, waitForFolderEmpty: async () => true,
-  checkAndNotifyCaseConflict: () => false, isLargeBinarySyncRisk: () => false,
-  vaultTrash: (vault, file, system) => vault.trash(file, system) };
+  checkAndNotifyCaseConflict: () => false, isLargeBinarySyncRisk: () => false };
 let permanentCalls = 0;
 const forbidden = () => { permanentCalls++; throw new Error('permanent deletion must not be used'); };
 function load(file) {
@@ -36,15 +35,16 @@ function fixture(kind, fail = false) {
   const path = kind === 'setting' ? '.obsidian/example.json' : 'example';
   const item = kind === 'folder' ? new TFolder(path) : new TFile(path);
   const calls = [], removedHashes = [], completed = [];
-  const trash = async (value, system) => {
-    calls.push([value, system]);
+  const trash = async (value, via) => {
+    calls.push([value, via]);
     if (fail) throw new Error('trash unavailable');
   };
   const p = {
     settings: { syncEnabled: true, configSyncEnabled: true },
     app: { vault: { getFileByPath: () => item, getAbstractFileByPath: () => item,
-      trash, delete: forbidden,
-      adapter: { exists: async () => true, trashLocal: path => trash(path, false), remove: forbidden } } },
+      trash: value => trash(value, 'vault.trash'), delete: forbidden,
+      adapter: { exists: async () => true, trashLocal: path => trash(path, 'trashLocal'), remove: forbidden } },
+      fileManager: { trashFile: value => trash(value, 'trashFile') } },
     lockManager: { withLock: async (_, fn) => fn() },
     addIgnoredFile: noop, removeIgnoredFile: noop, ignoredConfigFiles: new Set(),
     lastSyncPathDeleted: new Set(), lastSyncMtime: new Map(), pendingNoteModifies: new Map(),
@@ -68,7 +68,9 @@ for (const [kind, handler, stats] of [
     const f = fixture(kind, fail);
     await handler({ path: f.path, pageIndex: 3 }, f.p);
     assert.equal(f.calls.length, 1);
-    assert.equal(f.calls[0][1], false, 'always use local rather than system trash');
+    // #286 decision: vault items follow the user's deletion preference via fileManager.trashFile;
+    // config files are not vault items (no TAbstractFile), so they keep the vault-local trash.
+    assert.equal(f.calls[0][1], kind === 'setting' ? 'trashLocal' : 'trashFile', 'remote delete follows the user trash preference');
     assert.equal(f.p[stats].failed, fail ? 1 : 0);
     assert.deepEqual(f.completed, [[kind, 3]], 'account for processing once on success or failure');
     if (fail) assert.equal(f.removedHashes.length, 0, 'failed trash must preserve sync hashes');
@@ -89,7 +91,7 @@ for (const [kind, handler, stats] of [
     assert.equal(actual.isFolderSyncPathExcluded(path, p), true);
   }
 }
-console.log('PASS: local trash for notes/files/folders/config, failure preservation, non-empty folders and trash exclusion');
+console.log('PASS: user-preference trash for notes/files/folders, local trash for config, failure preservation, non-empty folders and trash exclusion');
 
 for (const [kind, handler] of [['note', note.receiveNoteSyncRename], ['file', file.receiveFileSyncRename], ['folder', folder.receiveFolderSyncRename]]) {
   const f = fixture(kind, true);
@@ -105,6 +107,7 @@ for (const [kind, handler] of [['note', note.receiveNoteSyncRename], ['file', fi
   await handler({ oldPath: 'old', path: 'new', pageIndex: 2 }, f.p);
   assert.equal(f.calls.length, 1, 'rename collision must try to trash the old target');
   assert.equal(f.calls[0][0], target);
+  assert.equal(f.calls[0][1], 'trashFile');
   assert.equal(renames, 0, 'failed target recovery must abort rename');
 }
 assert.equal(permanentCalls, 0, 'no fallback to permanent removal on any error path');

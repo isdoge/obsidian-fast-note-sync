@@ -15,7 +15,6 @@ const helpers = new Proxy({
   isPathExcluded: () => false,
   isFolderSyncPathExcluded: () => false,
   vaultDelete: (vault, file) => vault.trash(file),
-  vaultTrash: (vault, file) => vault.trash(file),
   waitForFolderEmpty: async () => { onWait(); return empty; },
 }, { get: (target, name) => target[name] ?? (() => undefined) });
 const cache = new Map();
@@ -79,7 +78,7 @@ async function check(kind, operation, mode, alias = "notes/A\u00a0B.md") {
       adapter, getFileByPath: p => files.get(p), getAbstractFileByPath: p => files.get(p),
       trash: async f => deleted.push(f.path),
       rename: async (f, p) => { renamed.push(p); files.delete(f.path); f.path = p; files.set(p, f); },
-    } },
+    }, fileManager: { trashFile: async f => deleted.push(f.path) } },
     lockManager: { withLock: async (_, callback) => callback() },
     addIgnoredFile: p => ignored.push(p), removeIgnoredFile() {},
     lastSyncPathDeleted: new Set(), lastSyncPathRenamed: new Set(), lastSyncMtime: new Map(),

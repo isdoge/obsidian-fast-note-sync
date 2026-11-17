@@ -67,7 +67,7 @@ For users in Mainland China, it is recommended to use the Tencent `cnb.cool` mir
 
 ### Recovery of remotely deleted files
 
-Server-requested deletions move notes, attachments, empty folders, and configuration files to the vault's local `.trash` directory. Existing targets displaced by a remote rename also go to local trash. This applies regardless of Obsidian's system-trash preference. If moving an item to trash fails, the operation reports an error and does not fall back to permanent deletion.
+Server-requested deletions of notes, attachments and empty folders, and existing targets displaced by a remote rename, follow Obsidian's "Deleted files" preference (system trash, the vault's `.trash` folder, or permanent deletion). Configuration files are not vault items and always go to the vault's local `.trash` directory. If moving an item to trash fails, the operation reports an error and does not fall back to permanent deletion.
 
 The `.trash` directory is excluded from synchronization, including whitelist rules. Recovery copies remain local to that device; restore them manually with your file manager. This does not change temporary-chunk cleanup or the optional cloud-preview feature that removes local attachments after upload.
 

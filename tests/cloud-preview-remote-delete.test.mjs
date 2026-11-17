@@ -17,7 +17,7 @@ vm.runInNewContext(code, { module, exports: module.exports, console,
     : id.includes('file_cloud_preview') ? { FileCloudPreview: { isRestrictedType: ext => ext === '.png' } }
     : id.includes('helpers') ? new Proxy({ isPathExcluded: () => false, isLargeBinarySyncRisk: () => false,
         checkAndNotifyCaseConflict: () => false, getPluginDir: () => 'plugin',
-        vaultDelete: (vault, f) => vault.delete(f), vaultTrash: (vault, f) => vault.trash(f) }, { get: (t, k) => t[k] ?? noop })
+        vaultDelete: (vault, f) => vault.delete(f) }, { get: (t, k) => t[k] ?? noop })
     : id.includes('sync_log_manager') ? { SyncLogManager: { getInstance: () => ({ addLog: noop }) } }
     : id.includes('remote_path_guard') ? { blockAliasedRemoteMutation: () => false }
     : {} });
@@ -29,7 +29,8 @@ function fixture(restricted) {
   const plugin = {
     settings: { syncEnabled: true, cloudPreviewEnabled: true, cloudPreviewTypeRestricted: restricted },
     app: { vault: { getFileByPath: () => file, delete: async f => deleted.push(f.path), trash: async f => deleted.push(f.path),
-      readBinary: async () => new ArrayBuffer(1), modifyBinary: async (f, _b, o) => modified.push(o) } },
+      readBinary: async () => new ArrayBuffer(1), modifyBinary: async (f, _b, o) => modified.push(o) },
+      fileManager: { trashFile: async f => deleted.push(f.path) } },
     lockManager: { withLock: async (_k, fn) => fn() },
     addIgnoredFile: noop, removeIgnoredFile: noop, lastSyncPathDeleted: new Set(), lastSyncMtime: new Map(),
     fileHashManager: { removeFileHash: noop }, concurrencyLimiter: { releaseSlot: noop },

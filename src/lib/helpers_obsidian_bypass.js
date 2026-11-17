@@ -34,7 +34,3 @@ export async function nativeFetch(input, init) {
 export async function vaultDelete(vault, file, force) {
   return await vault.delete(file, force);
 }
-
-export async function vaultTrash(vault, file, system) {
-  return await vault.trash(file, system);
-}
