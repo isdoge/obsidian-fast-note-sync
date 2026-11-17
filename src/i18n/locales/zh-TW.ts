@@ -363,6 +363,7 @@ export default {
   "ui.log.action.NoteModify": "筆記修改",
   "ui.log.action.NoteModifyConflict": "筆記修改衝突",
   "ui.log.action.NoteDeleteConflict": "筆記刪除衝突",
+  "ui.log.action.NoteEmptyProbe": "空白筆記伺服器探測",
   "ui.log.action.FileDeleteConflict": "附件刪除衝突",
   "ui.log.action.ConfigModifyConflict": "配置修改衝突",
   "ui.log.action.FolderDeleteSkipped": "資料夾刪除跳過",

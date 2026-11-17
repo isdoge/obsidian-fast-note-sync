@@ -10,6 +10,101 @@ import { $ } from "../../i18n/lang";
 // 同一插件会话中每条失败路径只通知一次；重试仍逐次保留同步错误日志。
 const notifiedNoteFailures = new WeakMap<FastSync, Set<string>>();
 
+// #205：正在通过 NoteRePush 探测服务端是否已有该笔记的路径集合（挂在 plugin 实例上，
+// 每个插件实例独立；断线重连后由 websocket_manager onClose 统一清空，探测随下一轮事件重发）。
+// #205: paths currently being probed via NoteRePush for whether the server already has the note
+// (per plugin instance; cleared on disconnect by websocket_manager onClose, the probe is re-issued
+// by the next vault event).
+const emptyNoteProbing = new WeakMap<FastSync, Set<string>>();
+// #205：探测结论为"服务端没有该笔记"的路径集合。下一次 noteModify（#277 保留分支的重传）
+// 检查到本标记时跳过拦截直接上传，打断"探测→NoteSyncDelete→重传→再探测"的循环；
+// 上传发起后标记即清除（一次性），Ack 后 hashManager 建立基线，后续编辑走正常路径。
+// #205: paths whose probe verdict was "server doesn't have this note". The next noteModify
+// (the #277 keep-branch re-upload) skips the interception and uploads directly, breaking the
+// probe -> NoteSyncDelete -> re-upload -> probe loop; the mark is one-shot (cleared once the
+// upload is issued), and after the Ack the hashManager baseline makes later edits normal.
+const emptyNoteConfirmedAbsent = new WeakMap<FastSync, Set<string>>();
+
+function emptyNoteProbeSet(plugin: FastSync): Set<string> {
+  let set = emptyNoteProbing.get(plugin);
+  if (!set) {
+    set = new Set<string>();
+    emptyNoteProbing.set(plugin, set);
+  }
+  return set;
+}
+
+function emptyNoteConfirmedAbsentSet(plugin: FastSync): Set<string> {
+  let set = emptyNoteConfirmedAbsent.get(plugin);
+  if (!set) {
+    set = new Set<string>();
+    emptyNoteConfirmedAbsent.set(plugin, set);
+  }
+  return set;
+}
+
+/**
+ * #205：本地空白笔记（如 Obsidian 自动创建的当日日记）在从未同步过（无同步基线）时，
+ * 直接上传会覆盖服务端已有内容。满足三条件（内容为空 / 无基线 / 非冲突路径）时拦截上传，
+ * 改发 NoteRePush 探测：服务端有 → 回 NoteSyncModify 覆盖本地空文件；没有 → 回
+ * NoteSyncDelete，由 receiveNoteSyncDelete 的 #277 保留分支重传空文件完成新建。
+ * 服务端证据：ws_note.go NoteRePush（存在且非删除回 NoteSyncModify，否则回 NoteSyncDelete）。
+ * 返回 true 表示已拦截（调用方不再上传）。
+ *
+ * #205: uploading a never-synced empty local note (e.g. Obsidian's auto-created daily note)
+ * would overwrite the server copy. When all three conditions hold (empty content / no sync
+ * baseline / not a conflicted path), hold the upload and probe with NoteRePush instead:
+ * server has it -> NoteSyncModify overwrites the local empty file; server doesn't ->
+ * NoteSyncDelete, and receiveNoteSyncDelete's #277 keep-branch re-uploads the empty file as a
+ * genuine create. Server evidence: ws_note.go NoteRePush (NoteSyncModify when present and not
+ * deleted, NoteSyncDelete otherwise). Returns true when the upload was intercepted.
+ */
+function probeEmptyNoteInsteadOfUpload(plugin: FastSync, path: string, content: string, baseHash: string | null): boolean {
+  if (content.trim().length !== 0) return false
+  if (baseHash !== null) return false
+  if (plugin.syncState.conflictedPaths.has(path)) return false
+  // 探测已确认服务端没有该笔记：本次上传就是探测结论的落地，直接放行
+  // Probe already confirmed the server doesn't have this note: this upload lands the verdict
+  const confirmedAbsent = emptyNoteConfirmedAbsentSet(plugin)
+  if (confirmedAbsent.has(path)) {
+    confirmedAbsent.delete(path)
+    return false
+  }
+  const probing = emptyNoteProbeSet(plugin)
+  if (probing.has(path)) return true
+  probing.add(path)
+  dump(`Empty unsynced note, probing server instead of uploading: ${path}`)
+  SyncLogManager.getInstance().addLog('send', 'NoteEmptyProbe',
+    `本地空白笔记尚未同步，先探测服务端是否已有该笔记: ${path}`, 'cancelled', path)
+  void plugin.websocket.SendMessage("NoteRePush", {
+    vault: plugin.settings.vault,
+    path: path,
+    pathHash: hashContent(path),
+  })
+  return true
+}
+
+/** #205：探测结论到达（NoteSyncModify / NoteSyncDelete 处理入口）时清除在途标记 */
+/** #205: clear the in-flight probe mark when its verdict arrives (NoteSyncModify / NoteSyncDelete) */
+function consumeEmptyNoteProbe(plugin: FastSync, path: string): void {
+  emptyNoteProbeSet(plugin).delete(path)
+}
+
+/**
+ * #205：连接断开时清空在途探测与"已确认缺失"标记（由 websocket_manager onClose 调用）。
+ * 断线后探测结论不会再到达；在途标记若不清空，重连后同路径的 noteModify 会被
+ * 误判为"探测已在途"而静默拦截。"已确认缺失"标记保留至下一次上传落地，断线同样作废
+ * （服务端状态可能已变，重新探测更安全）。
+ * #205: clear in-flight probe and confirmed-absent marks on disconnect (called from
+ * websocket_manager onClose). No verdict can arrive after the drop; a stale in-flight mark
+ * would silently intercept the same path's noteModify after reconnect. The confirmed-absent
+ * mark is voided too — the server state may have changed, re-probing is safer.
+ */
+export function clearEmptyNoteProbes(plugin: FastSync): void {
+  emptyNoteProbing.get(plugin)?.clear();
+  emptyNoteConfirmedAbsent.get(plugin)?.clear();
+}
+
 /**
  * 笔记修改事件处理
  */
@@ -51,6 +146,10 @@ export const noteModify = async function (file: TAbstractFile, plugin: FastSync,
       }
 
       if (content === null) content = await plugin.app.vault.read(file)
+
+      // #205：空白 + 从未同步 + 非冲突 → 不上传，先探测服务端是否已有该笔记
+      // #205: empty + never synced + not conflicted -> hold the upload, probe the server first
+      if (probeEmptyNoteInsteadOfUpload(plugin, file.path, content, baseHash)) return
 
       const data = {
         vault: plugin.settings.vault,
@@ -236,6 +335,10 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
   dump(`Receive note modify:`, data.path, data.contentHash, data.mtime, data.pathHash)
 
   const normalizedPath = normalizePath(data.path)
+  // #205：NoteSyncModify 可能是空白笔记探测的结论（服务端已有该笔记），清除在途探测标记
+  // #205: this NoteSyncModify may be the verdict of an empty-note probe (server has the note);
+  // clear the in-flight probe mark
+  consumeEmptyNoteProbe(plugin, data.path)
 
   try {
     const locked = await plugin.lockManager.withLock(normalizedPath, async () => {
@@ -429,6 +532,16 @@ export const receiveNoteUpload = async function (data: ReceivePathMessage, plugi
   const content = await plugin.app.vault.read(file);
   if (contentHash === null) contentHash = await hashContentAsync(content);
 
+  // #205：空白 + 从未同步 + 非冲突 → 不响应 NeedPush 上传，先探测服务端是否已有该笔记；
+  // 该页条目立即记为完成，探测结论（Modify/Delete）作为非分页项到达，不阻塞翻页
+  // #205: empty + never synced + not conflicted -> do not answer the NeedPush upload, probe the
+  // server first; the page item is counted complete right away, and the probe verdict
+  // (Modify/Delete) arrives as a non-paginated item, never blocking the page flow
+  if (probeEmptyNoteInsteadOfUpload(plugin, file.path, content, baseHash)) {
+    plugin.recordSyncCompleted('note', data.pageIndex)
+    return
+  }
+
   if (content.length === 0) {
     dump(`Empty note upload: ${data.path}`);
   }
@@ -530,6 +643,18 @@ export const receiveNoteSyncDelete = async function (data: ReceiveMessage, plugi
   dump(`Receive note delete:`, data.path, data.mtime, data.pathHash)
   const normalizedPath = normalizePath(data.path)
   let keptLocal: TFile | null = null
+  // #205：NoteSyncDelete 可能是空白笔记探测的结论（服务端没有该笔记）。先取走在途标记，
+  // 再把"探测在途"并入下面的未同步改动判定——本地空白文件不能被误删，须走保留分支重传
+  // #205: this NoteSyncDelete may be the verdict of an empty-note probe (server doesn't have the
+  // note). Take the in-flight mark first, then fold "probe in flight" into the unsynced-edit check
+  // below — the local empty file must not be deleted, it goes through the keep-branch and re-uploads
+  const wasEmptyNoteProbing = emptyNoteProbeSet(plugin).has(data.path)
+  if (wasEmptyNoteProbing) {
+    consumeEmptyNoteProbe(plugin, data.path)
+    // 探测结论：服务端没有该笔记 → 允许下一次（本函数末尾的）重传直接上传空文件
+    // Probe verdict: server doesn't have the note -> let the re-upload below send the empty file directly
+    emptyNoteConfirmedAbsentSet(plugin).add(data.path)
+  }
 
   try {
     const locked = await plugin.lockManager.withLock(normalizedPath, async () => {
@@ -541,7 +666,7 @@ export const receiveNoteSyncDelete = async function (data: ReceiveMessage, plugi
         // A read-only device mirrors the server and still deletes
         if (!plugin.settings.readonlySyncEnabled) {
           const baseHash = plugin.fileHashManager.getPathHash(normalizedPath)
-          let changed = plugin.pendingNoteModifies.has(normalizedPath)
+          let changed = plugin.pendingNoteModifies.has(normalizedPath) || wasEmptyNoteProbing
           if (!changed && baseHash !== null) {
             const localHash = plugin.fileHashManager.getValidHash(normalizedPath, file.stat.mtime, file.stat.size)
               ?? await hashContentAsync(await plugin.app.vault.read(file))

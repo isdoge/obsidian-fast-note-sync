@@ -363,6 +363,7 @@ export default {
   "ui.log.action.NoteModify": "노트 수정",
   "ui.log.action.NoteModifyConflict": "노트 수정 충돌",
   "ui.log.action.NoteDeleteConflict": "노트 삭제 충돌",
+  "ui.log.action.NoteEmptyProbe": "빈 노트 서버 확인",
   "ui.log.action.FileDeleteConflict": "첨부 파일 삭제 충돌",
   "ui.log.action.ConfigModifyConflict": "설정 수정 충돌",
   "ui.log.action.FolderDeleteSkipped": "폴더 삭제 건너뜀",

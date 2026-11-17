@@ -363,6 +363,7 @@ export default {
   "ui.log.action.NoteModify": "Note Modify",
   "ui.log.action.NoteModifyConflict": "Note Modify Conflict",
   "ui.log.action.NoteDeleteConflict": "Note Delete Conflict",
+  "ui.log.action.NoteEmptyProbe": "Empty Note Server Probe",
   "ui.log.action.FileDeleteConflict": "Attachment Delete Conflict",
   "ui.log.action.ConfigModifyConflict": "Config Modify Conflict",
   "ui.log.action.FolderDeleteSkipped": "Folder Delete Skipped",

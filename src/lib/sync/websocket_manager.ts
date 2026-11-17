@@ -1,6 +1,7 @@
 import { moment, Platform, normalizePath } from "obsidian";
 
 import { invalidateFileDownloads, handleFileChunkDownload, BINARY_PREFIX_FILE_SYNC, clearUploadQueue, receiveFileUploadSessionNotFound } from "./operator_file";
+import { clearEmptyNoteProbes } from "./operator_note";
 import { dump, addRandomParam, showSyncNotice, safeStringify, getPluginDir, hashContent } from "../utils/helpers";
 import { enSendDTOToProtobuf, deReceivePacket } from "../../pb/protobuf_mapper";
 import { receiveOperators, startupSync, startupFullSync, settleAllBatchSendSessionsOnClose, settleSyncTimes } from "./operator";
@@ -181,6 +182,9 @@ export class WebSocketManager {
           settleSyncTimes(this.plugin, true);
         }
         this.receivedFileDetails.clear();
+        // #205：断线后空白笔记探测的结论不会再到达，作废在途/已确认标记，重连后重新探测
+        // #205: no probe verdict can arrive after the drop; void the marks so reconnect re-probes
+        clearEmptyNoteProbes(this.plugin);
         // Downloads requested on the closed connection may no longer commit.
         invalidateFileDownloads(this.plugin);
         clearUploadQueue();
