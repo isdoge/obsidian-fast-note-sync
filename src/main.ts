@@ -815,20 +815,29 @@ export default class FastSync extends Plugin {
   }
 
   private applyingExternalSettings = false
+  private externalSettingsDirty = false
 
   async onExternalSettingsChange() {
     dump("onExternalSettingsChange")
     // Saving unconditionally rewrote data.json (and the token cache) on every external change.
     // With iCloud or config sync touching data.json, that write could raise another external
     // change, producing a continuous save loop. Save only when the loaded settings differ.
-    if (this.applyingExternalSettings) return
+    // A change arriving while one is being applied is not dropped: it is applied once more
+    // afterwards. The rerun saves only if the file still differs, so the loop stays bounded.
+    if (this.applyingExternalSettings) {
+      this.externalSettingsDirty = true
+      return
+    }
     this.applyingExternalSettings = true
     try {
-      const before = JSON.stringify(this.settings)
-      await this.loadSettings()
-      if (JSON.stringify(this.settings) !== before) {
-        await this.saveSettings()
-      }
+      do {
+        this.externalSettingsDirty = false
+        const before = JSON.stringify(this.settings)
+        await this.loadSettings()
+        if (JSON.stringify(this.settings) !== before) {
+          await this.saveSettings()
+        }
+      } while (this.externalSettingsDirty)
     } finally {
       this.applyingExternalSettings = false
     }
