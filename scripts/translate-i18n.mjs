@@ -268,7 +268,7 @@ CRITICAL RULES:
 3. Preserve ALL escape sequences (e.g. \\n, \\", &nbsp;, &amp;)
 4. Preserve ALL CSS class names in HTML attributes
 5. Preserve ALL URLs and links unchanged
-6. Do NOT translate brand names like "Fast Note Sync", "Obsidian", "WebDAV", "MinIO", "Cloudflare", "Ngrok", "GitHub", "Telegram", "Golang", "Websocket", "Sqlite", "React", "PostgreSQL", "MySQL", "SQLite", "S3", "OSS", "R2", "Git", "Cron", "GC", "PDF", "FNS", "CNB"
+6. Do NOT translate brand names like "Fast Note Sync", "Obsidian", "WebDAV", "MinIO", "Cloudflare", "Ngrok", "GitHub", "Telegram", "Golang", "Websocket", "Sqlite", "React", "PostgreSQL", "MySQL", "SQLite", "S3", "OSS", "R2", "Git", "Cron", "GC", "PDF", "FNS"
 7. Keep technical terms like "Endpoint", "Access Key", "Token", "WebSocket", "Host", "Port", "UID" etc. in their original form
 8. For "zh-TW" target, convert Simplified Chinese to Traditional Chinese accurately
 9. Return ONLY a valid JSON object with the same keys, no markdown fences, no explanation
