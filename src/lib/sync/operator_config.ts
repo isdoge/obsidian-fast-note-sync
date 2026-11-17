@@ -13,6 +13,8 @@ import { $ } from "../../i18n/lang";
 export const CONFIG_ROOT_FILES_EXCLUDE = ["workspace.json", "workspace-mobile.json"]
 export const CONFIG_PLUGIN_EXTS_TO_WATCH = [".json", ".js", ".css"]
 export const CONFIG_THEME_EXTS_TO_WATCH = [".css", ".json"]
+// 插件目录中决定插件代码与版本的文件 / Files in a plugin folder that make up its code and version
+const PLUGIN_CODE_FILES = ["main.js", "manifest.json", "styles.css"]
 
 
 /**
@@ -707,6 +709,7 @@ export const configReload = async function (path: string, plugin: FastSync, even
                 readSnippets(): Promise<void>;
             };
             plugins: {
+                plugins?: Record<string, { onExternalSettingsChange?(): unknown }>;
                 enabledPlugins: Set<string>;
                 disablePlugin(id: string): Promise<void>;
                 enablePlugin(id: string): Promise<void>;
@@ -827,8 +830,22 @@ export const configReload = async function (path: string, plugin: FastSync, even
 
             const isCurrentlyEnabled = app.plugins.enabledPlugins.has(id)
             const shouldBeEnabled = plugin.configManager && plugin.configManager.enabledPlugins.has(id)
+            // 只有代码/样式/清单变化才需要先停再开；data.json 等数据文件变化重载会让插件在加载时写回
+            // 本机状态，多端版本不一致时形成无限重载循环（#249 #269）。数据变化改为通知插件自行重读设置
+            // Only code/style/manifest changes need a disable+enable. Reloading on data files such as
+            // data.json makes plugins write back device state on load, which loops forever across devices
+            // running different versions (#249 #269). For data changes, notify the plugin to re-read settings
+            const hasCodeUpdate = updates.some(([p]) => PLUGIN_CODE_FILES.some(f => p === `${configDir}/plugins/${id}/${f}`))
 
-            if (isCurrentlyEnabled) {
+            if (isCurrentlyEnabled && !hasCodeUpdate) {
+                if (updates.some(([p]) => p === `${configDir}/plugins/${id}/data.json`)) {
+                    try {
+                        await app.plugins.plugins?.[id]?.onExternalSettingsChange?.()
+                    } catch (e) {
+                        dumpError(`[Sync] onExternalSettingsChange failed for ${id}:`, e)
+                    }
+                }
+            } else if (isCurrentlyEnabled) {
                 // 如果当前已启用，则执行重载逻辑（先停再开）
                 await app.plugins.disablePlugin(id)
                 await app.plugins.enablePlugin(id)
