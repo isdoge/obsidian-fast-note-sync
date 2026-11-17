@@ -79,7 +79,7 @@ export interface PluginSettings {
    * Whether to show share icon (native file explorer & Notebook Navigator) */
   showShareIcon: boolean
   /** 插件更新源 */
-  updateSource: "github" | "cnb"
+  updateSource: string
   /** 手机端状态点位置 */
   mobileStatusDotPosition: "hidden" | "top-right" | "top-left" | "bottom-right" | "bottom-left" | "menu-bar"
   /** 是否显示更新红点提示（侧边栏及图标） */
@@ -528,7 +528,7 @@ export class SettingTab extends PluginSettingTab {
       dropdown
         .addOption("github", "GitHub")
         .setValue("github")
-        .onChange(async (value: "github" | "cnb") => {
+        .onChange(async (value: string) => {
           this.plugin.settings.updateSource = value
           await this.plugin.saveAndReloadServices()
         }),
