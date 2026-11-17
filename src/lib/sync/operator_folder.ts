@@ -233,10 +233,24 @@ export const receiveFolderSyncDelete = async function (data: { path: string, las
                         SyncLogManager.getInstance().addLog('receive', 'FolderDeleteSkipped', `目录非空，跳过删除，等待下轮同步: ${normalizedPath}`, 'cancelled', data.path);
                         return
                     }
+                    // 等待期间父目录可能已被清理，不再使用过期的目录对象。
+                    const currentFolder = plugin.app.vault.getAbstractFileByPath(normalizedPath)
+                    if (!currentFolder) {
+                        plugin.folderSnapshotManager.removeFolder(normalizedPath)
+                        return
+                    }
+                    if (currentFolder !== folder) return
                     // 记录待删除路径
                     if (blockAliasedRemoteMutation(plugin, folder, data.path, "FolderDelete")) return
                     plugin.lastSyncPathDeleted.add(normalizedPath)
-                    await plugin.app.fileManager.trashFile(folder)
+                    try {
+                        await plugin.app.fileManager.trashFile(folder)
+                    } catch (e) {
+                        const missing = (e as { code?: string })?.code === "ENOENT"
+                            || (e instanceof Error && /\bENOENT\b/.test(e.message))
+                        // 仅在确认路径已消失时将 ENOENT 视为成功，其余错误保留。
+                        if (!missing || await plugin.app.vault.adapter.exists(normalizedPath)) throw e
+                    }
                     plugin.folderSnapshotManager.removeFolder(normalizedPath)
                 } finally {
                     window.setTimeout(() => {
