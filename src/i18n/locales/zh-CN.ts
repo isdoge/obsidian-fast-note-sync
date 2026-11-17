@@ -362,6 +362,8 @@ export default {
   "ui.log.action.NoteSyncRename": "笔记同步重命名",
   "ui.log.action.NoteModify": "笔记修改",
   "ui.log.action.NoteModifyConflict": "笔记修改冲突",
+  "ui.log.action.NoteDeleteConflict": "笔记删除冲突",
+  "ui.log.action.FileDeleteConflict": "附件删除冲突",
   "ui.log.action.ConfigModifyConflict": "配置修改冲突",
   "ui.log.action.FolderDeleteSkipped": "文件夹删除跳过",
   "ui.log.action.ConfigDowngradeSkipped": "插件降级跳过",

@@ -362,6 +362,8 @@ export default {
   "ui.log.action.NoteSyncRename": "ノート同期リネーム",
   "ui.log.action.NoteModify": "ノート変更",
   "ui.log.action.NoteModifyConflict": "ノート変更の競合",
+  "ui.log.action.NoteDeleteConflict": "ノート削除の競合",
+  "ui.log.action.FileDeleteConflict": "添付ファイル削除の競合",
   "ui.log.action.ConfigModifyConflict": "設定変更の競合",
   "ui.log.action.FolderDeleteSkipped": "フォルダ削除のスキップ",
   "ui.log.action.ConfigDowngradeSkipped": "プラグインのダウングレードをスキップ",
