@@ -490,7 +490,7 @@ export default class FastSync extends Plugin {
       this.versionManager.validateAndRefreshTags();
 
       // 0. 清理残留的临时下载目录 (Cleanup residual temp download dirs)
-      void clearAllTempChunks(this)
+      void clearAllTempChunks(this).catch(e => dumpError("Failed to clear temp chunks:", e))
 
       // 1. 初始化统计和日志 (UI)
       void SyncLogManager.getInstance().init(this)
