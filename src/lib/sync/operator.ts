@@ -992,13 +992,20 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                       hashFileAsync(plugin.app, attPath),
                       new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error(`Hash timeout`)), 15000))
                     ]);
-                    plugin.scannedFileHashes.set(attPath, { hash: contentHash, mtime: attMtime, size: attSize });
                     const baseHash = plugin.fileHashManager.getPathHash(attPath);
+                    // 内容未变只是 mtime 被刷新：上报同步时的 mtime，服务端有新版本时按下载处理而非要求上传；
+                    // 此时不缓存新 mtime，下一轮仍能取回同步时的 mtime（#256）
+                    // Unchanged content with a refreshed mtime: report the synced mtime so a newer server
+                    // version is downloaded instead of overwritten; the new mtime is not cached so the synced
+                    // one is still available next round (#256)
+                    const syncedMtime = contentHash === baseHash && !plugin.pendingUploadHashes.has(attPath)
+                      ? plugin.fileHashManager.getSyncedMtime(attPath) : undefined;
+                    if (syncedMtime === undefined) plugin.scannedFileHashes.set(attPath, { hash: contentHash, mtime: attMtime, size: attSize });
                     files.push({
                       path: attPath,
                       pathHash: hashContent(attPath),
                       contentHash: contentHash,
-                      mtime: attMtime,
+                      mtime: syncedMtime ?? attMtime,
                       ctime: attCtime,
                       size: attSize,
                       ...(baseHash !== null ? { baseHash } : { baseHashMissing: true }),

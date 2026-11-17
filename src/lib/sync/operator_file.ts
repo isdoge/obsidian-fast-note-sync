@@ -409,6 +409,16 @@ export const fileModify = async function (file: TAbstractFile, plugin: FastSync,
         logMemorySnapshot(`after modify hash ${file.path}`)
       }
 
+      // 内容与上次同步一致、只有 mtime 变了（如打开 canvas 时 Obsidian 原样写回）：没有可上传的改动。
+      // 若照常上传，较新的 mtime 会让服务端用本地旧内容覆盖其它端的新版本（#256）
+      // Content equals the last synced version and only the mtime moved (e.g. Obsidian rewrites a canvas
+      // unchanged when opening it): nothing to upload. Uploading anyway lets the newer mtime overwrite
+      // another device's newer version on the server with this stale content (#256)
+      if (!forceCheck && contentHash === baseHash && !plugin.pendingUploadHashes.has(file.path)) {
+        dump(`File modify skipped (content unchanged since last sync): ${file.path}`)
+        return
+      }
+
       const data = {
         vault: plugin.settings.vault,
         path: file.path,

@@ -268,6 +268,18 @@ export class FileHashManager {
   }
 
   /**
+   * 内容仍是同步基准时，返回缓存记录的同步时 mtime（没有则 undefined）。
+   * 打开 canvas 等只改写 mtime 不改内容时，用它代替被刷新的本地 mtime 上报（#256）
+   * While the content is still the sync baseline, return the mtime cached at sync time (undefined if
+   * none); reported instead of a refreshed local mtime when e.g. opening a canvas rewrites only the mtime (#256)
+   */
+  getSyncedMtime(path: string): number | undefined {
+    const cache = this.hashMap.get(path);
+    const base = this.syncHashMap.get(path);
+    return cache && base !== undefined && cache.hash === base && cache.mtime > 0 ? cache.mtime : undefined;
+  }
+
+  /**
    * 获取已成功同步的所有文件路径 (用于检测离线删除与拉取缺失文件)
    */
   getAllPaths(): string[] {
