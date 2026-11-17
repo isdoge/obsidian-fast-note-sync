@@ -1,6 +1,6 @@
 import { TFolder, TFile, normalizePath } from "obsidian";
 
-import { receiveFileUpload, receiveFileSyncUpdate, receiveFileSyncDelete, receiveFileSyncMtime, receiveFileSyncChunkDownload, receiveFileSyncEnd, checkAndUploadAttachments, receiveFileSyncRename, receiveFileRenameAck, receiveFileUploadAck, receiveFileDeleteAck, isPluginUnloading, sweepStalledDownloadSessions } from "./operator_file";
+import { receiveFileUpload, receiveFileSyncUpdate, receiveFileSyncDelete, receiveFileSyncMtime, receiveFileSyncChunkDownload, receiveFileSyncEnd, checkAndUploadAttachments, receiveFileSyncRename, receiveFileRenameAck, receiveFileUploadAck, receiveFileDeleteAck, isPluginUnloading, sweepStalledDownloadSessions, invalidateFileDownloads } from "./operator_file";
 import { hashContent, hashContentAsync, dump, isPathExcluded, isFolderSyncPathExcluded, configIsPathExcluded, getConfigSyncCustomDirs, generateUUID, showSyncNotice, isLargeBinarySyncRisk, describeBinarySyncLimit, hashFileAsync, formatFileSize, yieldToMain, getPluginDir } from "../utils/helpers";
 import { receiveConfigSyncModify, receiveConfigUpload, receiveConfigSyncMtime, receiveConfigSyncDelete, receiveConfigSyncEnd, configAllPaths, receiveConfigSyncClear, receiveConfigModifyAck, receiveConfigDeleteAck } from "./operator_config";
 import { receiveNoteSyncModify, receiveNoteUpload, receiveNoteSyncMtime, receiveNoteSyncDelete, receiveNoteSyncEnd, receiveNoteSyncRename, receiveNoteModifyAck, receiveNoteRenameAck, receiveNoteDeleteAck } from "./operator_note";
@@ -111,7 +111,7 @@ export const SYNC_STALL_RESTART_MS = 300000;
 // Stall restart backoff: wait 5 minutes, doubling (5/10/20 min), at most 3 in a row; a further stall
 // stops automatic restarts and reports in the status bar. The count resets on completion or give-up.
 export const SYNC_STALL_MAX_RESTARTS = 3;
-const syncStallState: { context?: string; signature: string; lastProgressAt: number; restarts: number } = { signature: "", lastProgressAt: 0, restarts: 0 };
+const syncStallState: { context?: string; signature: string; lastProgressAt: number; restarts: number; restartTimer?: number } = { signature: "", lastProgressAt: 0, restarts: 0 };
 
 export function isSyncStalled(plugin: FastSync, ownerContext: string | undefined, now = Date.now()): boolean {
   const signature = JSON.stringify([
@@ -205,7 +205,8 @@ function restartStalledSync(plugin: FastSync, intervalId?: number): void {
     return;
   }
   plugin.updateStatusBar($("ui.status.stalled_restarting", { minutes: String(delay / 60000) }));
-  window.setTimeout(() => {
+  syncStallState.restartTimer = window.setTimeout(() => {
+    syncStallState.restartTimer = undefined;
     if (plugin.websocket.isOpen && !plugin.isSyncing) {
       void handleSync(plugin, plugin.localStorageManager.getMetadata("isInitSync") as boolean);
     }
@@ -1313,6 +1314,18 @@ export function cancelSync(plugin: FastSync): void {
     window.clearInterval(plugin.syncState.progressCheckIntervalId);
     plugin.syncState.progressCheckIntervalId = null;
   }
+  // 取消（含插件卸载）后不再自动重启停滞的一轮 / No stall restart after cancel (including plugin unload)
+  if (syncStallState.restartTimer !== undefined) {
+    window.clearTimeout(syncStallState.restartTimer);
+    syncStallState.restartTimer = undefined;
+  }
+  // 与断线同口径：在途下载会话作废，迟到的分片/提交不再写盘或记账
+  // Same as on disconnect: in-flight download sessions are void; late chunks/commits neither write nor count.
+  // 连接仍在，限流器不会被清空：先归还这些会话占用的槽位 / The connection stays open, so return their slots first
+  for (const session of plugin.fileDownloadSessions.values()) {
+    plugin.concurrencyLimiter.releaseSlot(session.initialSlotKey || `download_${session.path}`);
+  }
+  invalidateFileDownloads(plugin);
 
   plugin.syncState.activeSyncContext = null;
   plugin.syncTypeCompleteCount = 0;
