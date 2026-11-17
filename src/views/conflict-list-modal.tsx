@@ -57,12 +57,15 @@ const ConflictListView = ({ plugin, modal }: { plugin: FastSync, modal: Conflict
     React.useEffect(() => {
         const timer = window.setInterval(() => {
             const current = Array.from(plugin.syncState.conflictedPaths);
-            if (current.length !== conflicts.length || current.some((val, idx) => val !== conflicts[idx])) {
-                setConflicts(current);
-            }
+            setConflicts(previous => {
+                if (current.length === previous.length && current.every((path, index) => path === previous[index])) {
+                    return previous;
+                }
+                return current;
+            });
         }, 300);
         return () => window.clearInterval(timer);
-    }, [conflicts]);
+    }, [plugin]);
 
     const handleResolve = async (path: string) => {
         // 在去解决冲突时不再提前强制关闭列表页，以便用户回到列表页时能继续解决其他文件的冲突
@@ -121,23 +124,37 @@ const ConflictListView = ({ plugin, modal }: { plugin: FastSync, modal: Conflict
                                             </div>
                                         </div>
                                     </div>
-                                    <button 
-                                        className="fns-ws-clients-item-type-tag"
-                                        onClick={(e) => {
-                                            e.stopPropagation();
-                                            void handleResolve(path);
-                                        }}
-                                        style={{ 
-                                            background: 'var(--interactive-accent)', 
-                                            color: 'var(--text-on-accent)',
-                                            border: 'none',
-                                            borderRadius: '4px',
-                                            padding: '4px 8px',
-                                            cursor: 'pointer'
-                                        }}
-                                    >
-                                        {$("ui.conflict.menu_item")}
-                                    </button>
+                                    <div className="fns-conflict-item-actions">
+                                        <button
+                                            className="fns-conflict-remove-btn"
+                                            aria-label={$("ui.conflict.remove_from_list")}
+                                            title={$("ui.conflict.remove_from_list")}
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                plugin.menuManager.removeConflictedPath(path);
+                                                setConflicts(Array.from(plugin.syncState.conflictedPaths));
+                                            }}
+                                        >
+                                            <LucideIcon icon="x" size={14} />
+                                        </button>
+                                        <button
+                                            className="fns-ws-clients-item-type-tag"
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                void handleResolve(path);
+                                            }}
+                                            style={{
+                                                background: 'var(--interactive-accent)',
+                                                color: 'var(--text-on-accent)',
+                                                border: 'none',
+                                                borderRadius: '4px',
+                                                padding: '4px 8px',
+                                                cursor: 'pointer'
+                                            }}
+                                        >
+                                            {$("ui.conflict.menu_item")}
+                                        </button>
+                                    </div>
                                 </div>
                             </div>
                         );

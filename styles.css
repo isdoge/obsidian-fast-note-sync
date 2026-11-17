@@ -3490,6 +3490,28 @@ body .suggestion-container {
   font-weight: 500;
 }
 
+.fns-conflict-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.fns-conflict-remove-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  color: var(--text-muted);
+  background: transparent;
+  box-shadow: none;
+}
+
+.fns-conflict-remove-btn:hover {
+  color: var(--text-error);
+  background: var(--background-modifier-hover);
+}
+
 .fns-ws-clients-item-bottom {
   display: flex;
   align-items: center;
