@@ -602,6 +602,7 @@ export default {
   "ui.notice.config_hash_save_failed": "설정 해시 맵 저장 실패: ${msg}",
   "ui.notice.file_hash_manager_timeout": "파일 해시 관리자 초기화 시간 초과, 동기화가 불안정할 수 있습니다",
   "ui.notice.connection_retrying": "동기화 연결이 계속 실패합니다. 백그라운드에서 계속 재시도합니다",
+  "ui.notice.protobuf_fallback": "Protobuf 메시지 디코딩에 실패하여 이 세션에서는 JSON으로 전환했습니다. 저장된 Protobuf 설정은 변경되지 않았습니다.",
   "ui.conflict.list_count": "${count}개 파일 충돌",
   "ui.conflict.list_empty": "현재 충돌하는 노트가 없습니다",
   "ui.conflict.diff_skipped": "파일이 커서 줄 단위 차이 비교를 건너뛰었습니다. 위 버튼으로 로컬/원격 버전을 선택하거나 오른쪽 편집기에서 직접 편집하세요.",

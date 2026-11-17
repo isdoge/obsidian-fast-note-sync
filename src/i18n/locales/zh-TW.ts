@@ -602,6 +602,7 @@ export default {
   "ui.notice.config_hash_save_failed": "儲存設定雜湊對應失敗: ${msg}",
   "ui.notice.file_hash_manager_timeout": "檔案雜湊管理器初始化逾時，同步可能不穩定",
   "ui.notice.connection_retrying": "同步連線持續失敗，將繼續在背景重試",
+  "ui.notice.protobuf_fallback": "Protobuf 訊息解碼失敗，本次工作階段已切換為 JSON；儲存的 Protobuf 設定未變更。",
   "ui.conflict.list_count": "${count} 個檔案衝突",
   "ui.conflict.list_empty": "目前沒有發生衝突的筆記",
   "ui.conflict.diff_skipped": "檔案較大，已略過逐行差異對比。可點擊上方按鈕選用本地/遠端版本，或在右側編輯器直接編輯。",
