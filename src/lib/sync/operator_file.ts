@@ -1052,7 +1052,11 @@ export const receiveFileSyncDelete = async function (data: ReceivePathMessage, p
         }, 500);
       }
     }
-  }, { maxRetries: 5, retryInterval: 100 }).catch(e => {
+  }, { maxRetries: 5, retryInterval: 100 }).then(locked => {
+    // 抢锁失败时任务未执行：按失败处理，不能计为完成
+    // Lock not acquired means the task never ran: count it as a failure, never as completed
+    if (locked === null) throw new Error("Path lock busy")
+  }).catch(e => {
     dumpError(`[FastSync] Failed to receiveFileSyncDelete: ${normalizedPath}`, e);
     SyncLogManager.getInstance().addLog('receive', 'FileDelete', e instanceof Error ? e.message : String(e), 'error', data.path);
     plugin.fileSyncTasks.failed++
@@ -1112,7 +1116,11 @@ export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, p
         }, 500);
       }
     }
-  }, { maxRetries: 5, retryInterval: 100 }).catch(e => {
+  }, { maxRetries: 5, retryInterval: 100 }).then(locked => {
+    // 抢锁失败时任务未执行：按失败处理，不能计为完成
+    // Lock not acquired means the task never ran: count it as a failure, never as completed
+    if (locked === null) throw new Error("Path lock busy")
+  }).catch(e => {
     dumpError(`[FastSync] Failed to receiveFileSyncMtime: ${normalizedPath}`, e);
     if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'FileMtime')) {
       SyncLogManager.getInstance().addLog('receive', 'FileMtime', e instanceof Error ? e.message : String(e), 'error', data.path);
@@ -1497,7 +1505,11 @@ export const receiveFileSyncRename = async function (data: { oldPath: string; pa
         plugin.fileHashManager.setFileHash(data.path, data.contentHash, targetFile instanceof TFile ? targetFile.stat.mtime : 0, targetFile instanceof TFile ? targetFile.stat.size : 0)
       }
     }
-  }, { maxRetries: 10, retryInterval: 100 }).catch(e => {
+  }, { maxRetries: 10, retryInterval: 100 }).then(locked => {
+    // 抢锁失败时任务未执行：按失败处理，不能计为完成
+    // Lock not acquired means the task never ran: count it as a failure, never as completed
+    if (locked === null) throw new Error("Path lock busy")
+  }).catch(e => {
     dumpError(`[FastSync] Failed to receiveFileSyncRename: ${normalizedOldPath} -> ${normalizedNewPath}`, e);
     if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'FileRename')) {
       SyncLogManager.getInstance().addLog('receive', 'FileRename', e instanceof Error ? e.message : String(e), 'error', data.path);

@@ -228,7 +228,7 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
   const normalizedPath = normalizePath(data.path)
 
   try {
-    await plugin.lockManager.withLock(normalizedPath, async () => {
+    const locked = await plugin.lockManager.withLock(normalizedPath, async () => {
       const file = plugin.app.vault.getFileByPath(normalizedPath)
       plugin.addIgnoredFile(normalizedPath)
       try {
@@ -346,6 +346,9 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
         }, 500);
       }
     }, { maxRetries: 5, retryInterval: 100 });
+    // 抢锁失败时任务未执行：按失败处理，不能计为完成
+    // Lock not acquired means the task never ran: count it as a failure, never as completed
+    if (locked === null) throw new Error("Path lock busy")
   } catch (e) {
     dumpError(`[FastSync] Failed to receiveNoteSyncModify: ${normalizedPath}`, e);
     if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'NoteModify')) {
@@ -448,7 +451,7 @@ export const receiveNoteSyncMtime = async function (data: ReceiveMtimeMessage, p
   const normalizedPath = normalizePath(data.path)
 
   try {
-    await plugin.lockManager.withLock(normalizedPath, async () => {
+    const locked = await plugin.lockManager.withLock(normalizedPath, async () => {
       const file = plugin.app.vault.getFileByPath(normalizedPath)
       if (file) {
         const content: string = await plugin.app.vault.read(file)
@@ -474,6 +477,9 @@ export const receiveNoteSyncMtime = async function (data: ReceiveMtimeMessage, p
         }
       }
     }, { maxRetries: 5, retryInterval: 100 });
+    // 抢锁失败时任务未执行：按失败处理，不能计为完成
+    // Lock not acquired means the task never ran: count it as a failure, never as completed
+    if (locked === null) throw new Error("Path lock busy")
   } catch (e) {
     dumpError(`[FastSync] Failed to receiveNoteSyncMtime: ${normalizedPath}`, e);
     if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'NoteMtime')) {
@@ -498,7 +504,7 @@ export const receiveNoteSyncDelete = async function (data: ReceiveMessage, plugi
   const normalizedPath = normalizePath(data.path)
 
   try {
-    await plugin.lockManager.withLock(normalizedPath, async () => {
+    const locked = await plugin.lockManager.withLock(normalizedPath, async () => {
       const file = plugin.app.vault.getFileByPath(normalizedPath)
       if (file instanceof TFile) {
         if (blockAliasedRemoteMutation(plugin, file, data.path, "NoteDelete")) return
@@ -527,6 +533,9 @@ export const receiveNoteSyncDelete = async function (data: ReceiveMessage, plugi
         }
       }
     }, { maxRetries: 5, retryInterval: 100 });
+    // 抢锁失败时任务未执行：按失败处理，不能计为完成
+    // Lock not acquired means the task never ran: count it as a failure, never as completed
+    if (locked === null) throw new Error("Path lock busy")
   } catch (e) {
     dumpError(`[FastSync] Failed to receiveNoteSyncDelete: ${normalizedPath}`, e);
     SyncLogManager.getInstance().addLog('receive', 'NoteDelete', e instanceof Error ? e.message : String(e), 'error', data.path);
@@ -573,7 +582,7 @@ export const receiveNoteSyncRename = async function (data: { path: string, oldPa
 
   try {
     // 对于重命名，我们需要确新路径不被占用。旧路径通常正在被移动，所以锁定新路径。
-    await plugin.lockManager.withLock(normalizedNewPath, async () => {
+    const locked = await plugin.lockManager.withLock(normalizedNewPath, async () => {
       const file = plugin.app.vault.getFileByPath(normalizedOldPath)
       if (file instanceof TFile) {
         if (blockAliasedRemoteMutation(plugin, file, data.oldPath, "NoteRename")) return
@@ -648,6 +657,9 @@ export const receiveNoteSyncRename = async function (data: { path: string, oldPa
         }
       }
     }, { maxRetries: 10, retryInterval: 100 });
+    // 抢锁失败时任务未执行：按失败处理，不能计为完成
+    // Lock not acquired means the task never ran: count it as a failure, never as completed
+    if (locked === null) throw new Error("Path lock busy")
   } catch (e) {
     dumpError(`[FastSync] Failed to receiveNoteSyncRename: ${normalizedOldPath} -> ${normalizedNewPath}`, e);
     if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'NoteRename')) {
