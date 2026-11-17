@@ -271,7 +271,6 @@ export default {
   "ui.status.completed_with_failures": "동결 완료, ${count}개 항목 실패",
   "ui.status.stalled_restarting": "동기화가 멈췄습니다. ${minutes}분 후 다시 시도합니다",
   "ui.status.stalled_gave_up": "동기화가 반복해서 멈춰 자동 재시도를 중단했습니다. 수동으로 동기화하세요",
-  "ui.status.timeout_partial": "동결 시간 초과, 일부 파일이 완료되지 않았으며 다음 동결 주기에서 계속 진행됩니다",
   "ui.status.failed": "동기화 실패",
   "ui.status.cancelled": "동기화가 취소되었습니다",
   "ui.status.conflict": "동기화 충돌이 감지되어 강제 병합되었습니다. ${path}를 수동으로 처리해야 합니다.",
@@ -335,6 +334,7 @@ export default {
   "ui.log.summary.no_changes": "변경 없음",
 
   // --- ui.log.action ---
+  "ui.log.action.ConnectionClosed": "동기화 연결이 끊어졌습니다",
   "ui.log.action.VaultScanning_full": "노트 보관소 해시 계산 진행률(전체)",
   "ui.log.action.VaultScanning_incremental": "노트 보관소 해시 계산 진행률(증분)",
   "ui.log.action.VaultScanningSummary_full": "동기화 시작(전체) - 해시 계산",

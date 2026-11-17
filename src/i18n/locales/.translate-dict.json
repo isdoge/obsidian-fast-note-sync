@@ -455,7 +455,6 @@
   "setting.general.share_manage_button": "210f167936ae0f64b1c55b943b298418",
   "setting.general.share_manage_desc": "c46a5dc602f691aa08e7dba332d1f37b",
   "ui.status.completed_with_failures": "71c52b8721eefaa07a48c61b4be6c038",
-  "ui.status.timeout_partial": "48338c6367ff18eff57cb596e9815719",
   "ui.log.path_copied": "31b7c37c735e2984ce8562a0ef79879b",
   "ui.log.filter_only_failed": "433174f56b8b695fb1519687575fcac0",
   "ui.log.error_code.300": "e67101c9c54089882670a8a1222436b4",

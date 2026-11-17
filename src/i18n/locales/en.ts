@@ -271,7 +271,6 @@ export default {
   "ui.status.completed_with_failures": "Sync completed, ${count} items failed",
   "ui.status.stalled_restarting": "Sync stalled, retrying in ${minutes} min",
   "ui.status.stalled_gave_up": "Sync stalled repeatedly; automatic retry stopped. Please sync manually",
-  "ui.status.timeout_partial": "Sync timed out; some files were not completed and will continue in the next sync cycle",
   "ui.status.failed": "Sync failed",
   "ui.status.cancelled": "Sync cancelled",
   "ui.status.conflict": "Sync conflict detected, forced merge applied. Manual handling required for ${path}.",

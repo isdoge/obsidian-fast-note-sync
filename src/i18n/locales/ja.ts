@@ -271,7 +271,6 @@ export default {
   "ui.status.completed_with_failures": "同期完了、${count}件の失敗あり",
   "ui.status.stalled_restarting": "同期が停止しました。${minutes} 分後に再試行します",
   "ui.status.stalled_gave_up": "同期が繰り返し停止したため、自動再試行を停止しました。手動で同期してください",
-  "ui.status.timeout_partial": "同期タイムアウト、一部のファイルが未完了です。次の同期で続行されます。",
   "ui.status.failed": "同期に失敗しました",
   "ui.status.cancelled": "同期がキャンセルされました",
   "ui.status.conflict": "同期の競合が検出されました。強制マージ済みです。${path} を手動で処理する必要があります。",
@@ -335,6 +334,7 @@ export default {
   "ui.log.summary.no_changes": "変更なし",
 
   // --- ui.log.action ---
+  "ui.log.action.ConnectionClosed": "同期接続が切断されました",
   "ui.log.action.VaultScanning_full": "Vaultハッシュ計算進捗(全量)",
   "ui.log.action.VaultScanning_incremental": "Vaultハッシュ計算進捗(増分)",
   "ui.log.action.VaultScanningSummary_full": "同期開始（フル）- ハッシュ計算",

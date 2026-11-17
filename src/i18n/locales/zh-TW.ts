@@ -271,7 +271,6 @@ export default {
   "ui.status.completed_with_failures": "同步完成，其中 ${count} 項失敗",
   "ui.status.stalled_restarting": "同步停滯，${minutes} 分鐘後重試",
   "ui.status.stalled_gave_up": "同步多次停滯，已停止自動重試，請手動同步",
-  "ui.status.timeout_partial": "同步逾時，部分檔案未完成，將在下一輪同步繼續",
   "ui.status.failed": "同步失敗",
   "ui.status.cancelled": "同步已取消",
   "ui.status.conflict": "檢測到同步衝突，已強制合併，需要手動處理 ${path}。",
