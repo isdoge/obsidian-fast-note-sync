@@ -86,6 +86,9 @@ export class WebSocketManager {
   // startupDelay is documented as delaying only the "first" update check, to avoid contending
   // with other plugins loading at Obsidian startup — it should not be re-applied on every reconnect.
   private hasAppliedStartupDelay = false;
+  // 仅在本次插件会话禁用 protobuf，不修改用户保存的设置；插件重启后仍先尝试 protobuf。
+  // Disable protobuf only for this plugin session, preserving the saved setting for the next launch.
+  private hasProtobufDecodeFailed = false;
 
   // --- 轻量事件总线，用于分批发送时等待服务端 BatchAck ---
   // Lightweight event bus for awaiting server BatchAck during batch send
@@ -136,7 +139,7 @@ export class WebSocketManager {
         const useProtoParam = "&protocol=protobuf";
         // pv=2：声明客户端支持 v2 握手协商（auth 响应携带协商块、窗口流水线、pb 提前升级）
         // pb=1/0：客户端本地 protobufEnabled 设置，供服务端判定是否提前升级 pb（设计稿 §2.2）
-        const isProtobufEnabled = this.plugin.settings.protobufEnabled !== false;
+        const isProtobufEnabled = this.isProtobufEnabled();
         const negotiationParams = "&pv=2&pb=" + (isProtobufEnabled ? "1" : "0");
         return addRandomParam(
           this.plugin.runWsApi +
@@ -193,10 +196,25 @@ export class WebSocketManager {
         this.handleStructuredMessage(action, data);
       },
       serializeMessage: (action, payload) => {
+        // 防御性守卫：client.useProtobuf 与设置变更都会在发送前挡住此回调，正常不可达；
+        // 即便到达，WebSocketClient.Send 也会捕获并退回 JSON 文本帧，消息不会丢失。
+        // Defensive guard: client.useProtobuf and the settings check keep this unreachable;
+        // even if reached, WebSocketClient.Send catches and falls back to a JSON text frame.
+        if (!this.isProtobufEnabled()) {
+          throw new Error("Protobuf disabled after a decode failure");
+        }
         return enSendDTOToProtobuf(action, payload);
       },
       deserializeMessage: (data) => {
-        return deReceivePacket(data) as unknown as { action: string;[key: string]: unknown };
+        if (this.hasProtobufDecodeFailed) {
+          return null;
+        }
+        try {
+          return deReceivePacket(data) as unknown as { action: string;[key: string]: unknown };
+        } catch {
+          this.fallbackToJsonAfterProtobufDecodeFailure();
+          return null;
+        }
       },
     });
 
@@ -204,6 +222,39 @@ export class WebSocketManager {
     this.client.registerBinaryHandler(BINARY_PREFIX_FILE_SYNC, (data) => {
       void handleFileChunkDownload(data, this.plugin);
     });
+  }
+
+  private isProtobufEnabled(): boolean {
+    return !this.hasProtobufDecodeFailed && this.plugin.settings.protobufEnabled !== false;
+  }
+
+  /**
+   * 服务端会分别处理文本 JSON 帧，且 ClientInfo(protobuf=false) 会关闭本连接的 protobuf。
+   * 因而不必断开连接；本会话后续重连则通过握手 pb=0 保持 JSON。
+   * The server parses text JSON frames separately and ClientInfo(protobuf=false) disables
+   * protobuf for this connection, so reconnecting is unnecessary. pb=0 keeps later reconnects on JSON.
+   */
+  private fallbackToJsonAfterProtobufDecodeFailure(): void {
+    if (this.hasProtobufDecodeFailed) {
+      return;
+    }
+    this.hasProtobufDecodeFailed = true;
+    this.client.useProtobuf = false;
+
+    // 每次插件会话只提示一次，鉴权前后的失败路径都走这里。
+    // Notify once per plugin session, on both the pre-auth and post-auth paths.
+    const message = $("ui.notice.protobuf_fallback");
+    showSyncNotice(message);
+    SyncLogManager.getInstance().addLog('error', 'ProtobufFallback', message, 'error');
+
+    if (!this.client.isAuth) {
+      // 降级帧需要已认证连接；若解码在鉴权前失败，用 pb=0 的新连接完成握手。
+      // The downgrade frame requires authentication; reconnect with pb=0 if it failed earlier.
+      this.triggerReconnect();
+      return;
+    }
+
+    this.sendClientInfo();
   }
 
   // 代理一些 WebSocketClient 的方法和属性以保持向后兼容性
@@ -357,7 +408,7 @@ export class WebSocketManager {
           this.plugin.syncState.negotiated = negotiated;
           // protobufAck===true：服务端已在 auth 响应后提前 setUseProtobuf，本连接后续下行帧即为 pb，
           // 客户端同步跟进，无需再等 ClientInfo 响应触发升级（websocket_client.ts:259 该触发仍保留作旧服务端路径）
-          if (nego.protobufAck === true && this.plugin.settings.protobufEnabled !== false) {
+          if (nego.protobufAck === true && this.isProtobufEnabled()) {
             this.client.useProtobuf = true;
             dump("WS Client upgraded to Protobuf via auth negotiation (pv2)");
           }
@@ -403,7 +454,19 @@ export class WebSocketManager {
       } else {
         const errorMsg = data.message || "";
         const errorDetails = data.details ? " Details=" + data.details : "";
-        showSyncNotice("Service Error: Code=" + data.code + " Message=" + errorMsg + errorDetails);
+        // 服务端已成功解码外层响应，但客户端上行 protobuf 的内层 DTO 解码失败。
+        // The server decoded this error envelope, but rejected our uplink protobuf DTO.
+        const isProtobufDecodeError = /(?:^|,\s*)(?:body:\s*)?Protobuf decode failed:/i.test(data.details || "");
+        if (isProtobufDecodeError) {
+          // 仅这类解码错误区别对待：protobuf 仍启用则回退到 JSON；已回退则静默忽略迟到的同类错误。
+          // Only decode errors are special-cased: fall back while protobuf is still enabled,
+          // and silently drop late duplicates afterwards. All other errors keep their notice.
+          if (this.isProtobufEnabled()) {
+            this.fallbackToJsonAfterProtobufDecodeFailure();
+          }
+        } else {
+          showSyncNotice("Service Error: Code=" + data.code + " Message=" + errorMsg + errorDetails);
+        }
         
         // 如果错误数据里含有 sessionID 或 path，也进行释放和清理，防止同步卡死
         // If error payload contains sessionID or path, release slot and increment completed to prevent deadlock
@@ -485,7 +548,7 @@ export class WebSocketManager {
     }
 
     const clientName = this.plugin.getClientName();
-    const isProtobufEnabled = this.plugin.settings.protobufEnabled !== false;
+    const isProtobufEnabled = this.isProtobufEnabled();
 
     if (!isProtobufEnabled) {
       // Reset client's Protobuf flag immediately to fallback to JSON format

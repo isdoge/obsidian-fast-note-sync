@@ -603,6 +603,7 @@ export default {
   "ui.notice.config_hash_save_failed": "Failed to save config hash map: ${msg}",
   "ui.notice.file_hash_manager_timeout": "File hash manager initialization timed out; sync may be unstable",
   "ui.notice.connection_retrying": "Sync connection keeps failing; will keep retrying in the background",
+  "ui.notice.protobuf_fallback": "Protobuf message decoding failed. Switched to JSON for this session; your saved Protobuf setting is unchanged.",
   "ui.conflict.list_count": "${count} file(s) in conflict",
   "ui.conflict.list_empty": "No conflicting notes",
   "ui.status.label_note": "Note",

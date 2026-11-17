@@ -602,6 +602,7 @@ export default {
   "ui.notice.config_hash_save_failed": "設定ハッシュマップの保存に失敗しました: ${msg}",
   "ui.notice.file_hash_manager_timeout": "ファイルハッシュマネージャーの初期化がタイムアウトしました。同期が不安定になる可能性があります",
   "ui.notice.connection_retrying": "同期接続が繰り返し失敗しています。バックグラウンドで再試行を続けます",
+  "ui.notice.protobuf_fallback": "Protobuf メッセージのデコードに失敗したため、このセッションでは JSON に切り替えました。保存済みの Protobuf 設定は変更されていません。",
   "ui.conflict.list_count": "${count} 件の競合ファイル",
   "ui.conflict.list_empty": "現在競合しているノートはありません",
   "ui.conflict.diff_skipped": "ファイルが大きいため、行ごとの差分比較をスキップしました。上のボタンでローカル/リモート版を選択するか、右側のエディターで直接編集してください。",
