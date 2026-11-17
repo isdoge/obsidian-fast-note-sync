@@ -25,7 +25,9 @@ function load(file, extra = {}, globals = {}) {
 }
 
 {
-  const { SyncProgressTracker } = load('src/lib/sync/sync_progress_tracker.ts', {}, {
+  const { SyncProgressTracker } = load('src/lib/sync/sync_progress_tracker.ts', {
+    '../../i18n/lang': { $: key => key }
+  }, {
     window: { setTimeout: () => 1, clearTimeout: noop }
   });
   const tracker = new SyncProgressTracker();
