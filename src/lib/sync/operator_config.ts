@@ -81,12 +81,12 @@ const readManifestVersion = async function (path: string, plugin: FastSync): Pro
     }
 }
 
-// 重新上传本地文件：清掉 lastSyncMtime，绕过「哈希与 mtime 都未变」的拦截（只读端由 configModify 自行拦下）
-// Upload the local file again: dropping lastSyncMtime bypasses the unchanged hash+mtime interception
+// 重新上传本地文件：强制上传，绕过内容未变的拦截（只读端由 configModify 自行拦下）
+// Upload the local file again: force upload to bypass unchanged-content interception
 // (configModify itself still refuses on a read-only device)
 const reuploadLocalConfig = function (path: string, plugin: FastSync) {
     plugin.lastSyncMtime.delete(path)
-    void configModify(path, plugin)
+    void configModify(path, plugin, false, undefined, true)
 }
 
 /**
@@ -145,7 +145,7 @@ const guardPluginDowngrade = async function (data: ReceiveMessage, plugin: FastS
     return false
 }
 
-export const configModify = async function (path: string, plugin: FastSync, eventEnter: boolean = false, content?: string) {
+export const configModify = async function (path: string, plugin: FastSync, eventEnter: boolean = false, content?: string, forceUpload: boolean = false) {
     if (plugin.settings.configSyncEnabled == false || plugin.settings.readonlySyncEnabled) return
     if (!isPathInConfigSyncDirs(path, plugin)) return
     if (eventEnter && plugin.ignoredConfigFiles.has(path)) return
@@ -160,6 +160,7 @@ export const configModify = async function (path: string, plugin: FastSync, even
     let contentHash = ""
     let mtime = 0
     let ctime = 0
+    let size = -1
 
     if (content !== undefined) {
         // 直接使用传入的内容（通常是 LocalStorage）
@@ -183,6 +184,7 @@ export const configModify = async function (path: string, plugin: FastSync, even
                     contentStr = new TextDecoder().decode(contentBuf)
                     mtime = stat.mtime
                     ctime = getSafeCtime(stat)
+                    size = stat.size
                 }
             }
         } catch (error) {
@@ -196,18 +198,24 @@ export const configModify = async function (path: string, plugin: FastSync, even
     }
 
     // --- 新增：哈希校验 ---
-    // 如果当前内容哈希与已记录的哈希一致，则说明无需发送
-    // 这通常发生在接收到服务端更新并写入本地后，文件系统事件触发的回调中
+    // 如果当前内容哈希与已记录的哈希一致，说明文件内容并未改变（例如仅 mtime 被 Obsidian 刷新）：
+    // 只更新本地记录的 mtime，不重新上传，避免多端同时在线时来回同步（#114）
     const savedHash = plugin.configHashManager?.getPathHash(path)
-    const lastSyncMtime = plugin.lastSyncMtime.get(path)
+    const lastSyncMtime = plugin.lastSyncMtime?.get(path)
 
-    if (savedHash === contentHash && (lastSyncMtime !== undefined && lastSyncMtime === mtime)) {
+    if (!forceUpload && savedHash === contentHash && !plugin.pendingConfigModifies?.has(path)) {
         plugin.removeIgnoredConfigFile(path)
-        // 顺便更新一下 ConfigManager 的状态，防止下次误判
+        if (lastSyncMtime !== mtime) {
+            plugin.lastSyncMtime?.set(path, mtime)
+        }
+        // 顺便更新一下 ConfigManager 与 ConfigHashManager 的文件状态，防止下次重复触发
         if (plugin.configManager) {
             plugin.configManager.updateFileState(normalizePath(path), mtime)
         }
-        dump(`Config modify intercepted (hash & mtime match): ${path}`)
+        if (content === undefined && size >= 0 && plugin.configHashManager?.isReady?.()) {
+            plugin.configHashManager.setFileHash?.(path, contentHash, mtime, size)
+        }
+        dump(`Config modify intercepted (content unchanged): ${path}`)
         return
     }
 
@@ -278,7 +286,7 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
         plugin.recordSyncCompleted('setting', data.pageIndex)
         return
     }
-    if (plugin.ignoredConfigFiles.has(data.path)) {
+    if (plugin.ignoredConfigFiles.has(data.path) && !pendingConfigUpdates.has(data.path)) {
         plugin.recordSyncCompleted('setting', data.pageIndex)
         return
     }
@@ -355,8 +363,8 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
         plugin.configSyncTasks.failed++
     }
 
+    // 保持对该文件的忽略直到 configReload 中的 checkAndReload 落盘并更新状态后再解除（#114）
     await configReload(data.path, plugin, false, data.content)
-    plugin.removeIgnoredConfigFile(data.path)
 
     // 更新 ConfigManager 的文件状态，防止重复触发 configModify
     if (plugin.configManager) {
@@ -849,131 +857,149 @@ export const configReload = async function (path: string, plugin: FastSync, even
         pluginCodeBackups.clear()
         reloadTimer = null
 
-        if (app.vault.reloadConfig) await app.vault.reloadConfig()
+        for (const [p] of updates) {
+            plugin.addIgnoredConfigFile?.(p)
+        }
 
-        const pluginsToReload = new Set<string>()
-        for (const [p, d] of updates) {
-            if (p === `${configDir}/app.json` || p === `${configDir}/appearance.json`) {
-                try {
-                    const config = JSON.parse(d) as Record<string, unknown>;
-                    // 仅在值确实改变时才设置，减少刷新频率
-                    for (const key in config) {
-                        if (Object.prototype.hasOwnProperty.call(config, key)) {
-                            if (app.vault.getConfig(key) !== config[key]) {
-                                app.vault.setConfig(key, config[key]);
-                            }
-                        }
-                    }
+        try {
+            if (app.vault.reloadConfig) await app.vault.reloadConfig()
 
-                    if (p === `${configDir}/appearance.json` && app.customCss) {
-                        // 修正属性名：社区主题使用的是 cssTheme
-                        const targetTheme = config.cssTheme as string | undefined;
-                        if (targetTheme !== undefined) {
-                            // 核心检查：在切换主题前，先检查本地是否存在该主题文件
-                            // 防止因为同步延迟导致主题文件夹还没下载完就切换，触发 Obsidian 的自动回落
-                            const themes = (app.customCss as unknown as { themes?: Record<string, unknown> }).themes || {};
-                            if (targetTheme === "" || Object.prototype.hasOwnProperty.call(themes, targetTheme)) {
-                                if (app.customCss.theme !== targetTheme) {
-                                    app.customCss.setTheme(targetTheme)
-                                    app.customCss.onConfigChange()
+            const pluginsToReload = new Set<string>()
+            for (const [p, d] of updates) {
+                if (p === `${configDir}/app.json` || p === `${configDir}/appearance.json`) {
+                    try {
+                        const config = JSON.parse(d) as Record<string, unknown>;
+                        // 仅在值确实改变时才设置，减少刷新频率
+                        for (const key in config) {
+                            if (Object.prototype.hasOwnProperty.call(config, key)) {
+                                if (app.vault.getConfig(key) !== config[key]) {
+                                    app.vault.setConfig(key, config[key]);
                                 }
-                            } else {
-                                console.warn(`[Sync] theme "${targetTheme}" not ready locally, skipping switch to avoid resetting to default`);
                             }
                         }
+
+                        if (p === `${configDir}/appearance.json` && app.customCss) {
+                            // 修正属性名：社区主题使用的是 cssTheme
+                            const targetTheme = config.cssTheme as string | undefined;
+                            if (targetTheme !== undefined) {
+                                // 核心检查：在切换主题前，先检查本地是否存在该主题文件
+                                // 防止因为同步延迟导致主题文件夹还没下载完就切换，触发 Obsidian 的自动回落
+                                const themes = (app.customCss as unknown as { themes?: Record<string, unknown> }).themes || {};
+                                if (targetTheme === "" || Object.prototype.hasOwnProperty.call(themes, targetTheme)) {
+                                    if (app.customCss.theme !== targetTheme) {
+                                        app.customCss.setTheme(targetTheme)
+                                        app.customCss.onConfigChange()
+                                    }
+                                } else {
+                                    console.warn(`[Sync] theme "${targetTheme}" not ready locally, skipping switch to avoid resetting to default`);
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        dumpError(`[Sync] failed to process ${p}:`, e);
                     }
-                } catch (e) {
-                    dumpError(`[Sync] failed to process ${p}:`, e);
+                } else if (p === `${configDir}/community-plugins.json`) {
+                    try {
+                        const newP = JSON.parse(d) as string[]
+                        const oldP = plugin.configManager ? Array.from(plugin.configManager.enabledPlugins) : []
+                        const toE = newP.filter((p: string) => !oldP.includes(p))
+                        const toD = oldP.filter((p: string) => !newP.includes(p))
+                        if (plugin.configManager) {
+                            plugin.configManager.enabledPlugins = new Set(newP)
+                        }
+                        for (const id of toE) {
+                            if (id != "hot-reload" && id != "fast-note-sync") {
+                                pluginsToReload.add(id)
+                            }
+                        }
+                        for (const id of toD) {
+                            if (id != "hot-reload" && id != "fast-note-sync") await app.plugins.disablePlugin(id)
+                        }
+                    } catch { /* ignore */ }
+                } else if (p === `${configDir}/hotkeys.json`) {
+                    if (app.hotkeys) await app.hotkeys.load()
+                } else if (p.startsWith(`${configDir}/snippets/`) && p.endsWith(".css")) {
+                    if (app.customCss) await app.customCss.readSnippets()
+                } else if (p.startsWith(`${configDir}/plugins/`)) {
+                    const parts = p.split("/")
+                    // .obsidian/plugins/id/file -> parts=[".obsidian", "plugins", "id", "file"]
+                    if (parts.length >= 4) {
+                        const id = parts[2]
+                        pluginsToReload.add(id)
+                    }
                 }
-            } else if (p === `${configDir}/community-plugins.json`) {
-                try {
-                    const newP = JSON.parse(d) as string[]
-                    const oldP = plugin.configManager ? Array.from(plugin.configManager.enabledPlugins) : []
-                    const toE = newP.filter((p: string) => !oldP.includes(p))
-                    const toD = oldP.filter((p: string) => !newP.includes(p))
-                    if (plugin.configManager) {
-                        plugin.configManager.enabledPlugins = new Set(newP)
+            }
+
+            // 统一处理插件重载
+            // 将 fast-note-sync 移到最后处理，确保其他插件先重载
+            // Process fast-note-sync last to ensure other plugins reload first
+            const sortedPlugins = Array.from(pluginsToReload);
+            const selfId = "fast-note-sync";
+            if (sortedPlugins.includes(selfId)) {
+                const index = sortedPlugins.indexOf(selfId);
+                sortedPlugins.splice(index, 1);
+                sortedPlugins.push(selfId);
+            }
+
+            for (const id of sortedPlugins) {
+                if (id === "hot-reload") continue
+
+                const hasMainJsUpdate = updates.some(([p]) => p === `${configDir}/plugins/${id}/main.js`)
+                const hasManifestUpdate = updates.some(([p]) => p === `${configDir}/plugins/${id}/manifest.json`)
+
+                // 特殊处理本插件的更新：
+                // 如果 main.js 或 manifest.json 更新了，则进行正常的重载流程
+                // 否则（例如仅 data.json 更新），跳过重载以免影响插件运行
+                if (id === selfId) {
+                    if (hasMainJsUpdate || hasManifestUpdate) {
+                        dump(`[FastNoteSync] Detected critical update for self, triggering reload.`);
+                        plugin.websocket.unRegister();
+                        // Fall through to reload logic
+                    } else {
+                        continue;
                     }
-                    for (const id of toE) {
-                        if (id != "hot-reload" && id != "fast-note-sync") {
-                            pluginsToReload.add(id)
+                }
+
+                const isCurrentlyEnabled = app.plugins.enabledPlugins.has(id)
+                const shouldBeEnabled = plugin.configManager && plugin.configManager.enabledPlugins.has(id)
+                // 只有代码/样式/清单变化才需要先停再开；data.json 等数据文件变化重载会让插件在加载时写回
+                // 本机状态，多端版本不一致时形成无限重载循环（#249 #269）。数据变化改为通知插件自行重读设置
+                // Only code/style/manifest changes need a disable+enable. Reloading on data files such as
+                // data.json makes plugins write back device state on load, which loops forever across devices
+                // running different versions (#249 #269). For data changes, notify the plugin to re-read settings
+                const hasCodeUpdate = updates.some(([p]) => PLUGIN_CODE_FILES.some(f => p === `${configDir}/plugins/${id}/${f}`))
+
+                if (isCurrentlyEnabled && !hasCodeUpdate) {
+                    if (updates.some(([p]) => p === `${configDir}/plugins/${id}/data.json`)) {
+                        try {
+                            await app.plugins.plugins?.[id]?.onExternalSettingsChange?.()
+                        } catch (e) {
+                            dumpError(`[Sync] onExternalSettingsChange failed for ${id}:`, e)
                         }
                     }
-                    for (const id of toD) {
-                        if (id != "hot-reload" && id != "fast-note-sync") await app.plugins.disablePlugin(id)
+                } else if (isCurrentlyEnabled) {
+                    // 如果当前已启用，则执行重载逻辑（先停再开）
+                    await app.plugins.disablePlugin(id)
+                    await app.plugins.enablePlugin(id)
+                } else if (communityPluginsUpdated && shouldBeEnabled) {
+                    // 如果当前未启用，仅当本次同步包含了最新的 community-plugins.json 且要求启用时才开启
+                    await app.plugins.enablePlugin(id)
+                }
+            }
+            if (app.setting?.activeTab) app.setting.activeTab.display()
+        } finally {
+            // 配置应用与落盘完成后，刷新 ConfigManager 的文件状态并解除忽略保护（#114）
+            for (const [p] of updates) {
+                const absPath = normalizePath(p)
+                try {
+                    const stat = await plugin.app?.vault?.adapter?.stat?.(absPath)
+                    if (stat && plugin.configManager?.updateFileState) {
+                        plugin.configManager.updateFileState(absPath, stat.mtime)
                     }
                 } catch { /* ignore */ }
-            } else if (p === `${configDir}/hotkeys.json`) {
-                if (app.hotkeys) await app.hotkeys.load()
-            } else if (p.startsWith(`${configDir}/snippets/`) && p.endsWith(".css")) {
-                if (app.customCss) await app.customCss.readSnippets()
-            } else if (p.startsWith(`${configDir}/plugins/`)) {
-                const parts = p.split("/")
-                // .obsidian/plugins/id/file -> parts=[".obsidian", "plugins", "id", "file"]
-                if (parts.length >= 4) {
-                    const id = parts[2]
-                    pluginsToReload.add(id)
-                }
+                plugin.removeIgnoredConfigFile?.(p)
             }
         }
-
-        // 统一处理插件重载
-        // 将 fast-note-sync 移到最后处理，确保其他插件先重载
-        // Process fast-note-sync last to ensure other plugins reload first
-        const sortedPlugins = Array.from(pluginsToReload);
-        const selfId = "fast-note-sync";
-        if (sortedPlugins.includes(selfId)) {
-            const index = sortedPlugins.indexOf(selfId);
-            sortedPlugins.splice(index, 1);
-            sortedPlugins.push(selfId);
-        }
-
-        for (const id of sortedPlugins) {
-            if (id === "hot-reload") continue
-
-            const hasMainJsUpdate = updates.some(([p]) => p === `${configDir}/plugins/${id}/main.js`)
-            const hasManifestUpdate = updates.some(([p]) => p === `${configDir}/plugins/${id}/manifest.json`)
-
-            // 特殊处理本插件的更新：
-            // 如果 main.js 或 manifest.json 更新了，则进行正常的重载流程
-            // 否则（例如仅 data.json 更新），跳过重载以免影响插件运行
-            if (id === selfId) {
-                if (hasMainJsUpdate || hasManifestUpdate) {
-                    dump(`[FastNoteSync] Detected critical update for self, triggering reload.`);
-                    plugin.websocket.unRegister();
-                    // Fall through to reload logic
-                } else {
-                    continue;
-                }
-            }
-
-            const isCurrentlyEnabled = app.plugins.enabledPlugins.has(id)
-            const shouldBeEnabled = plugin.configManager && plugin.configManager.enabledPlugins.has(id)
-            // 只有代码/样式/清单变化才需要先停再开；data.json 等数据文件变化重载会让插件在加载时写回
-            // 本机状态，多端版本不一致时形成无限重载循环（#249 #269）。数据变化改为通知插件自行重读设置
-            // Only code/style/manifest changes need a disable+enable. Reloading on data files such as
-            // data.json makes plugins write back device state on load, which loops forever across devices
-            // running different versions (#249 #269). For data changes, notify the plugin to re-read settings
-            const hasCodeUpdate = updates.some(([p]) => PLUGIN_CODE_FILES.some(f => p === `${configDir}/plugins/${id}/${f}`))
-
-            if (isCurrentlyEnabled && !hasCodeUpdate) {
-                if (updates.some(([p]) => p === `${configDir}/plugins/${id}/data.json`)) {
-                    try {
-                        await app.plugins.plugins?.[id]?.onExternalSettingsChange?.()
-                    } catch (e) {
-                        dumpError(`[Sync] onExternalSettingsChange failed for ${id}:`, e)
-                    }
-                }
-            } else if (isCurrentlyEnabled) {
-                // 如果当前已启用，则执行重载逻辑（先停再开）
-                await app.plugins.disablePlugin(id)
-                await app.plugins.enablePlugin(id)
-            } else if (communityPluginsUpdated && shouldBeEnabled) {
-                // 如果当前未启用，仅当本次同步包含了最新的 community-plugins.json 且要求启用时才开启
-                await app.plugins.enablePlugin(id)
-            }
-        }
-        if (app.setting?.activeTab) app.setting.activeTab.display()
     }
 
     reloadTimer = window.setTimeout(() => { void checkAndReload(); }, 1000)
