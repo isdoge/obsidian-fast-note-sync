@@ -2876,6 +2876,65 @@ body .suggestion-container {
   border: 1px dashed var(--interactive-accent);
   animation: fns-pop-in 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
 }
+.fns-paste-toast.is-error {
+  color: var(--text-error);
+  background-color: var(--background-secondary);
+  border-color: var(--text-error);
+}
+
+.fns-manual-paste-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  background-color: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+}
+
+.fns-manual-paste-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+}
+
+.fns-manual-paste-hint {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+
+.fns-manual-paste-textarea {
+  width: 100%;
+  min-height: 92px;
+  box-sizing: border-box;
+  resize: vertical;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--background-modifier-border);
+  background-color: var(--background-primary);
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.fns-manual-paste-textarea:focus {
+  outline: none;
+  border-color: var(--interactive-accent);
+}
+
+.fns-manual-paste-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.fns-manual-paste-btn {
+  cursor: pointer;
+}
 
 @keyframes fns-breathing {
   0% {
@@ -2908,6 +2967,13 @@ body .suggestion-container {
   .fns-status-pill {
     width: 100%;
     justify-content: center;
+  }
+  .fns-manual-paste-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .fns-manual-paste-actions .fns-manual-paste-btn {
+    width: 100%;
   }
 }
 /* --- Fast Note Sync Refactor Utilities --- */
