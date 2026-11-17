@@ -527,8 +527,7 @@ export class SettingTab extends PluginSettingTab {
     new Setting(set).setName($("setting.debug.update_source")).addDropdown((dropdown) =>
       dropdown
         .addOption("github", "GitHub")
-        .addOption("cnb", $("setting.remote.option_cnb"))
-        .setValue(this.plugin.settings.updateSource || "github")
+        .setValue("github")
         .onChange(async (value: "github" | "cnb") => {
           this.plugin.settings.updateSource = value
           await this.plugin.saveAndReloadServices()
@@ -719,7 +718,7 @@ export class SettingTab extends PluginSettingTab {
           $("ui.title.notice"),
           $("setting.support.issue_notice"),
           () => {
-            window.open("https://github.com/haierkeys/obsidian-fast-note-sync/issues", "_blank")
+            window.open("https://github.com/isdoge/obsidian-fast-note-sync/issues", "_blank")
           },
           $("ui.button.goto_feedback"),
           $("ui.button.cancel"),
@@ -730,7 +729,7 @@ export class SettingTab extends PluginSettingTab {
       const featureButton = debugDiv.createEl("button")
       featureButton.setText($("setting.support.feature"))
       featureButton.onclick = () => {
-        window.open("https://github.com/haierkeys/obsidian-fast-note-sync/issues", "_blank")
+        window.open("https://github.com/isdoge/obsidian-fast-note-sync/issues", "_blank")
       }
 
       const telegramButton = debugDiv.createEl("button")
@@ -1023,17 +1022,12 @@ export class SettingTab extends PluginSettingTab {
           btn.textContent = $("setting.debug.version_installing") || "正在安装...";
 
           try {
-            const source = this.plugin.settings.updateSource || "github";
+            // Keep legacy updateSource settings compatible; all values use GitHub Releases.
+            const source = "github";
             const zipFileName = `fast-note-sync-v${latest}.zip`;
             const pluginDir = getPluginDir(this.plugin);
 
-            let url = "";
-            if (source === "github") {
-              url = `https://github.com/haierkeys/obsidian-fast-note-sync/releases/download/${latest}/${zipFileName}`;
-            } else {
-              // CNB 链接格式：releases/download/{version}/fast-note-sync-v{version}.zip
-              url = `https://cnb.cool/haierkeys/obsidian-fast-note-sync/-/releases/download/${latest}/${zipFileName}`;
-            }
+            const url = `https://github.com/isdoge/obsidian-fast-note-sync/releases/download/${latest}/${zipFileName}`;
 
             dump(`[fast-note-sync] preparing download. Source: ${source}, Tag: ${tag}, Zip: ${zipFileName}, Dir: ${pluginDir}, URL: ${url}`);
             showSyncNotice($("ui.version.downloading_file", { file: zipFileName }) || `正在下载 ${zipFileName}...`);
