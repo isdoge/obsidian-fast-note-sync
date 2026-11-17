@@ -2,10 +2,13 @@ import { blockAliasedRemoteMutation } from "./remote_path_guard";
 import { TFile, TAbstractFile, normalizePath } from "obsidian";
 
 import { ReceiveMessage, ReceiveMtimeMessage, ReceivePathMessage, SyncEndData } from "../utils/types";
-import { hashContent, hashContentAsync, dump, dumpError, isPathExcluded, getSafeCtime, checkAndNotifyCaseConflict, getPluginDir } from "../utils/helpers";
+import { hashContent, hashContentAsync, dump, dumpError, isPathExcluded, getSafeCtime, checkAndNotifyCaseConflict, getPluginDir, showSyncNotice } from "../utils/helpers";
 import { SyncLogManager } from "./sync_log_manager";
 import type FastSync from "../../main";
+import { $ } from "../../i18n/lang";
 
+// 同一插件会话中每条失败路径只通知一次；重试仍逐次保留同步错误日志。
+const notifiedNoteFailures = new WeakMap<FastSync, Set<string>>();
 
 /**
  * 笔记修改事件处理
@@ -359,7 +362,17 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
   } catch (e) {
     dumpError(`[FastSync] Failed to receiveNoteSyncModify: ${normalizedPath}`, e);
     if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'NoteModify')) {
-      SyncLogManager.getInstance().addLog('receive', 'NoteModify', e instanceof Error ? e.message : String(e), 'error', data.path);
+      const message = e instanceof Error ? e.message : String(e);
+      SyncLogManager.getInstance().addLog('receive', 'NoteModify', message, 'error', data.path);
+      let notifiedPaths = notifiedNoteFailures.get(plugin);
+      if (!notifiedPaths) {
+        notifiedPaths = new Set();
+        notifiedNoteFailures.set(plugin, notifiedPaths);
+      }
+      if (!notifiedPaths.has(data.path)) {
+        notifiedPaths.add(data.path);
+        showSyncNotice(`${$('ui.status.failed')}: ${data.path}\n${message}`, 15000);
+      }
     }
     plugin.noteSyncTasks.failed++
   } finally {
