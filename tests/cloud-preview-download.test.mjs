@@ -22,6 +22,7 @@ for (const initialized of [false, true]) {
       recordSyncCompleted: () => completed++,
       fileDownloadSessions: new Map(),
       totalFilesToDownload: 0,
+      app: { vault: { getFileByPath: () => null } },
       websocket: { SendMessage: async () => { sends++; } },
       concurrencyLimiter: { waitForSlot: async () => { slots++; return true; }, releaseSlot() {} },
     };
