@@ -17,8 +17,9 @@ vm.runInNewContext(code, { module, exports: module.exports, console,
     : id.includes('file_cloud_preview') ? { FileCloudPreview: { isRestrictedType: ext => ext === '.png' } }
     : id.includes('helpers') ? new Proxy({ isPathExcluded: () => false, isLargeBinarySyncRisk: () => false,
         checkAndNotifyCaseConflict: () => false, getPluginDir: () => 'plugin',
-        vaultDelete: (vault, f) => vault.delete(f) }, { get: (t, k) => t[k] ?? noop })
+        vaultDelete: (vault, f) => vault.delete(f), vaultTrash: (vault, f) => vault.trash(f) }, { get: (t, k) => t[k] ?? noop })
     : id.includes('sync_log_manager') ? { SyncLogManager: { getInstance: () => ({ addLog: noop }) } }
+    : id.includes('remote_path_guard') ? { blockAliasedRemoteMutation: () => false }
     : {} });
 const ops = module.exports;
 
@@ -34,6 +35,7 @@ function fixture(restricted) {
     fileHashManager: { removeFileHash: noop }, concurrencyLimiter: { releaseSlot: noop },
     localStorageManager: { getMetadata: k => k === 'isInitSync' ? true : 0, setMetadata: noop },
     fileSyncTasks: { failed: 0 }, recordSyncCompleted: (...a) => completed.push(a),
+    syncState: { pendingFilePushPageIndex: new Map() },
   };
   return { plugin, deleted, modified, completed };
 }
