@@ -562,13 +562,27 @@ export class FileCloudPreview {
     // produce a path under the note's folder), causing the resulting cloud
     // URL to 404 on the server.
     let vaultPath = filePath;
+    // 显式相对路径以当前笔记目录为基准；本地附件缺失时也必须解析。
+    if (filePath.startsWith("./") || filePath.startsWith("../")) {
+      const parts = sourcePath.split("/").slice(0, -1);
+      for (const part of filePath.split("/")) {
+        if (!part || part === ".") continue;
+        if (part === "..") {
+          if (parts.length === 0) return null;
+          parts.pop();
+        } else {
+          parts.push(part);
+        }
+      }
+      vaultPath = parts.join("/");
+    }
     interface VaultWithConfig {
       // Define getConfig method to avoid 'any' // 定义 getConfig 方法以避免 any
       getConfig?(key: string): unknown;
     }
     const rawConfig = ((this.plugin.app.vault as unknown) as VaultWithConfig).getConfig?.("attachmentFolderPath");
     const attachmentFolderPath = typeof rawConfig === "string" ? rawConfig : "";
-    if (this.plugin.settings.cloudPreviewDynamicAttachment) {
+    if (this.plugin.settings.cloudPreviewDynamicAttachment && !filePath.includes("/")) {
       if (attachmentFolderPath) {
         const prefix = attachmentFolderPath.endsWith("/") ? attachmentFolderPath : attachmentFolderPath + "/";
         const suffix = vaultPath.startsWith("/") ? vaultPath.substring(1) : vaultPath;
