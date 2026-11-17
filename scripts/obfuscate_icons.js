@@ -81,8 +81,8 @@ function chunkString(str, size) {
     return chunks;
 }
 
-const kofiPath = 'scripts/kofi.png';
-const wxPath = 'scripts/wxds.png';
+const kofiPath = 'docs/images/kofi.png';
+const wxPath = 'docs/images/wxds.png';
 
 async function run() {
     const kofiObf = await obfuscate(kofiPath, options);
@@ -106,8 +106,8 @@ export const KofiImage = decodeImage(KofiChunks);
 export const WXImage = decodeImage(WXChunks);
 `;
 
-        fs.writeFileSync('src/lib/icons.ts', output.trim() + '\n');
-        console.log('Successfully updated src/lib/icons.ts');
+        fs.writeFileSync('src/lib/utils/helpers_image.ts', output.trim() + '\n');
+        console.log('Successfully updated src/lib/utils/helpers_image.ts');
     }
 }
 
