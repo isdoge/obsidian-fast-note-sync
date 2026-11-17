@@ -38,6 +38,10 @@ const { ConcurrencyLimiter } = load('src/lib/sync/concurrency_limiter.ts');
     fileDownloadSessions: new Map(),
     progressTracker: { isTypeFullyDone: () => false, getOverallPct: () => 100,
       getDetailText: () => 'pending uploads', forceComplete: fail },
+    noteSyncTasks: { completed: 0, failed: 0 }, fileSyncTasks: { completed: 0, failed: 0 },
+    folderSyncTasks: { completed: 0 }, configSyncTasks: { completed: 0 },
+    uploadedChunksCount: 0, downloadedChunksCount: 0, isSyncRequesting: false,
+    concurrencyLimiter: { activeKeys: new Set(['pending-upload']), queue: [] },
     resetSyncTasks: fail,
     updateStatusBar: (...args) => statuses.push(args)
   };

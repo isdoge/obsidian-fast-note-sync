@@ -69,6 +69,7 @@ vm.runInNewContext(integrationCode, {
     : id.includes('helpers') ? { dump: noop }
     : id.includes('sync_log_manager') ? { SyncLogManager: { getInstance: () => ({ addOrUpdateLog: noop }) } }
     : id.includes('i18n') ? { $: key => key }
+    : id === './operator_file' ? { sweepStalledDownloadSessions: async () => 0 }
     : {},
 });
 const { checkSyncCompletion } = integrationModule.exports;
