@@ -115,6 +115,14 @@ export class FileHashManager {
     if (!hasRestoredSync) {
       dump("FileHashManager: sync baseline is empty, migrating from local hash cache...");
       for (const [path, cache] of this.hashMap.entries()) {
+        // #205：迁移是给"从未同步过"的文件伪造基线，而空文件恰恰是探测拦截的反例——
+        // 新设备上 Obsidian 自动创建的空白日记若被伪造成基线，首次同步会绕过探测，
+        // 把空内容上传覆盖服务端当天日记。空文件不伪造基线，留给探测逻辑处理
+        // #205: the migration fabricates a baseline for never-synced files, but an empty file is
+        // exactly the case the #205 probe must intercept — if Obsidian's auto-created empty daily
+        // note got a fabricated baseline on a new device, the first sync would bypass the probe
+        // and overwrite the server copy. Empty files get no fabricated baseline; the probe handles them
+        if (cache.size === 0) continue;
         this.syncHashMap.set(path, cache.hash);
       }
       this.saveSyncToStorage();
