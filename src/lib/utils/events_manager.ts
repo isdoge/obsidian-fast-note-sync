@@ -17,6 +17,9 @@ export class EventManager {
   private pendingRenamePaths: Set<string> = new Set()
   private blurTimer: number | null = null
   private resumeTimer: number | null = null
+  // 注册/认证/抢锁重试定时器，stop()（含插件卸载）时统一清理
+  // Registration / auth / lock retry timers; all cleared by stop() (including plugin unload)
+  private retryTimers: Set<number> = new Set()
 
   constructor(plugin: FastSync) {
     this.plugin = plugin
@@ -29,8 +32,12 @@ export class EventManager {
     // 改为每秒重试、最多 30 分钟，超过才放弃（此时大概率是加载真的失败）。
     if (!this.plugin.fileHashManager || !this.plugin.fileHashManager.isReady()) {
       if (attempt < 1800) {
-        if (attempt === 0) dump("EventManager: fileHashManager not ready, retrying event registration")
-        window.setTimeout(() => this.registerEvents(attempt + 1), 1000)
+        if (attempt === 0) {
+          dump("EventManager: fileHashManager not ready, retrying event registration")
+          // 注册成功前卸载也要停掉重试 / Stop retrying if the plugin unloads before registration succeeds
+          this.plugin.register(() => this.stop())
+        }
+        this.scheduleRetry(() => this.registerEvents(attempt + 1), 1000)
       } else {
         dump("EventManager: fileHashManager never became ready, vault watchers NOT registered")
       }
@@ -76,6 +83,8 @@ export class EventManager {
   public stop() {
     this.rawEventTimers.forEach((timer) => window.clearTimeout(timer))
     this.rawEventTimers.clear()
+    this.retryTimers.forEach((timer) => window.clearTimeout(timer))
+    this.retryTimers.clear()
     this.pendingRenamePaths.clear()
     if (this.blurTimer) {
       window.clearTimeout(this.blurTimer)
@@ -175,13 +184,21 @@ export class EventManager {
       dump(`EventManager: ${eventName} dropped after ${attempt} retries (websocket not authed): ${file.path}`)
       return
     }
-    window.setTimeout(() => {
+    this.scheduleRetry(() => {
       if (!this.plugin.websocket || !this.plugin.websocket.isAuth) {
         this.retryWhenAuthed(eventName, file, handler, attempt + 1)
       } else {
         handler(file)
       }
     }, 1000)
+  }
+
+  private scheduleRetry(fn: () => void, delay: number) {
+    const timer = window.setTimeout(() => {
+      this.retryTimers.delete(timer)
+      fn()
+    }, delay)
+    this.retryTimers.add(timer)
   }
 
   private watchModify = (file: TAbstractFile, ctx?: unknown) => {
@@ -367,7 +384,7 @@ export class EventManager {
       ).then((result) => {
         if (result === null) {
           if (lockRequeue < 60) {
-            window.setTimeout(() => this.runWithDelay(key, task, delayset, lockRequeue + 1), 1000)
+            this.scheduleRetry(() => this.runWithDelay(key, task, delayset, lockRequeue + 1), 1000)
           } else {
             dump(`EventManager: task dropped after ${lockRequeue} lock requeues: ${key}`)
           }
