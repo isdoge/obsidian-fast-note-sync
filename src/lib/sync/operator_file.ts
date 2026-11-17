@@ -19,6 +19,24 @@ const downloadEpochs = new WeakMap<FastSync, number>()
 export function invalidateFileDownloads(plugin: FastSync): void {
   downloadEpochs.set(plugin, (downloadEpochs.get(plugin) || 0) + 1)
   downloadOwners.delete(plugin)
+  // 旧连接的会话不会再收到分片：直接丢弃，不计页、不计失败；否则重连后 120s 看门狗会把它们记到新一轮的页上
+  // Sessions of the closed connection never receive chunks again: drop them without page or failure
+  // accounting, otherwise the watchdog would book them onto the next round's pages after reconnect
+  for (const session of plugin.fileDownloadSessions.values()) {
+    releaseSessionMemory(session)
+    session.chunks?.clear()
+    const id = session.sessionId || session.tempDir?.split("/").pop()
+    if (session.tempDir && id) {
+      void clearTempChunksDir(plugin, id).catch(e => dumpError(`Temp chunk cleanup failed for session ${id}`, e))
+    }
+  }
+  plugin.fileDownloadSessions.clear()
+}
+
+// 会话属于已断开的连接（epoch 已过期）：其迟到的完成/失败不能记到当前一轮
+// The session belongs to a closed connection (stale epoch): its late completion/failure must not count in the current round
+function isStaleDownload(plugin: FastSync, session: FileDownloadSession): boolean {
+  return !!session.commitGuard && session.commitGuard.epoch !== (downloadEpochs.get(plugin) || 0)
 }
 
 function captureDownloadGuard(plugin: FastSync, path: string): NonNullable<FileDownloadSession["commitGuard"]> {
@@ -225,6 +243,7 @@ const cleanupFileDownloadSession = async (plugin: FastSync, session: FileDownloa
       dumpError(`Temp chunk cleanup failed for session ${session.sessionId}`, e)
     }
   }
+  if (isStaleDownload(plugin, session)) return
   if (failed) plugin.fileSyncTasks.failed++
   plugin.recordSyncCompleted('file', session.pageIndex)
 }
@@ -242,7 +261,7 @@ const failFileDownloadSession = async (plugin: FastSync, session: FileDownloadSe
     message
   });
   await cleanupFileDownloadSession(plugin, session, true)
-  if (releaseSlot) {
+  if (releaseSlot && !isStaleDownload(plugin, session)) {
     plugin.concurrencyLimiter.releaseSlot(`download_${session.path}`)
   }
 }
@@ -260,6 +279,8 @@ export const sweepStalledDownloadSessions = async (plugin: FastSync, idleMs = DO
   lastDownloadSweepAt = now
   const stalled: Array<[string, FileDownloadSession]> = []
   for (const [key, session] of plugin.fileDownloadSessions) {
+    // 已进入提交阶段的会话由提交流程自行记账 / Sessions already committing do their own accounting
+    if (session.committing) continue
     if (session.lastActivityAt !== undefined && now - session.lastActivityAt > idleMs) stalled.push([key, session])
   }
   for (const [key, session] of stalled) {
@@ -1351,7 +1372,7 @@ export const handleFileChunkDownload = async function (buf: ArrayBuffer | Blob, 
     });
 
 
-    if (completedCount === session.totalChunks) {
+    if (completedCount === session.totalChunks && !session.committing) {
       await handleFileChunkDownloadComplete(session, plugin)
     }
   } catch (e) {
@@ -1492,6 +1513,7 @@ export const receiveFileSyncRename = async function (data: { oldPath: string; pa
  */
 const handleFileChunkDownloadComplete = async function (session: FileDownloadSession, plugin: FastSync) {
   const slotKey = session.initialSlotKey || `download_${session.path}`;
+  session.committing = true
   try {
     if (isLargeBinarySyncRisk(session.size, plugin)) {
       dump(`Skip assembling large downloaded attachment (${describeBinarySyncLimit()} limit): ${session.path}`, session.size)
@@ -1644,7 +1666,7 @@ const handleFileChunkDownloadComplete = async function (session: FileDownloadSes
     }
     await cleanupFileDownloadSession(plugin, session, true)
   } finally {
-    plugin.concurrencyLimiter.releaseSlot(slotKey)
+    if (!isStaleDownload(plugin, session)) plugin.concurrencyLimiter.releaseSlot(slotKey)
   }
 }
 

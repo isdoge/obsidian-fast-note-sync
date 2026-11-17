@@ -18,7 +18,7 @@ vm.runInNewContext(code, { module, exports: module.exports, console,
     : id.includes('helpers') ? helpers
     : id.includes('sync_log_manager') ? { SyncLogManager: { getInstance: () => logs } }
     : {} });
-const { sweepStalledDownloadSessions } = module.exports;
+const { sweepStalledDownloadSessions, invalidateFileDownloads } = module.exports;
 
 const removed = [], released = [], completed = [];
 const now = 1_000_000;
@@ -61,5 +61,42 @@ assert.equal(await sweepStalledDownloadSessions(plugin, 0, now + 1000), 0);
   assert.deepEqual(rel, ['download_x.bin']);
   assert.deepEqual(done, [['file', 7]]);
   assert.equal(p2.fileSyncTasks.failed, 1);
+}
+// F-4: a session already committing is left to the commit path, never failed by the watchdog
+{
+  const rel = [], done = [];
+  const p3 = { ...plugin, fileSyncTasks: { failed: 0 },
+    fileDownloadSessions: new Map([['c', { path: 'c.bin', sessionId: 'c', totalChunks: 1, size: 1, pageIndex: 1,
+      chunks: new Map(), committing: true, lastActivityAt: now }]]),
+    recordSyncCompleted: (type, page) => done.push([type, page]),
+    concurrencyLimiter: { releaseSlot: key => rel.push(key) } };
+  assert.equal(await sweepStalledDownloadSessions(p3, 120000, now + 400000), 0);
+  assert.equal(p3.fileDownloadSessions.size, 1);
+  assert.deepEqual(done, []);
+  assert.equal(p3.fileSyncTasks.failed, 0);
+}
+
+// F-2: on disconnect, sessions of the old connection are dropped without page or failure
+// accounting, so a sweep after reconnect cannot book them onto the new round
+{
+  const rel = [], done = [], rm = [];
+  const p4 = { ...plugin, fileSyncTasks: { failed: 0 },
+    fileDownloadSessions: new Map([
+      ['old', { path: 'o.bin', sessionId: 'old', totalChunks: 3, size: 1, pageIndex: 4,
+        tempDir: '.plugin/temp-chunks/old', downloadedChunks: new Set([0]), lastActivityAt: now }],
+      ['temp_t.bin', { path: 't.bin', sessionId: '', totalChunks: 0, size: 1, pageIndex: 4,
+        tempDir: '.plugin/temp-chunks/init_t', downloadedChunks: new Set(), lastActivityAt: now }],
+    ]),
+    app: { vault: { adapter: { exists: async () => true, rmdir: async p => rm.push(p) } } },
+    recordSyncCompleted: (type, page) => done.push([type, page]),
+    concurrencyLimiter: { releaseSlot: key => rel.push(key) } };
+  invalidateFileDownloads(p4);
+  assert.equal(p4.fileDownloadSessions.size, 0, 'old sessions are dropped on close');
+  await new Promise(r => setTimeout(r, 0));
+  assert.deepEqual(rm.sort(), ['.plugin/temp-chunks/init_t', '.plugin/temp-chunks/old']);
+  assert.equal(await sweepStalledDownloadSessions(p4, 120000, now + 800000), 0);
+  assert.deepEqual(done, [], 'no page completion recorded for old sessions');
+  assert.equal(p4.fileSyncTasks.failed, 0, 'no failure recorded for old sessions');
+  assert.deepEqual(rel, []);
 }
 console.log('stalled download watchdog tests passed');

@@ -114,6 +114,8 @@ export interface FileDownloadSession {
     initialSlotKey?: string;
     /** Last time a response or chunk arrived for this session; used by the stalled-download watchdog */
     lastActivityAt?: number;
+    /** 已进入组装/写盘阶段，看门狗跳过，避免与提交流程重复记账 / Assembling or writing; skipped by the watchdog to avoid double accounting */
+    committing?: boolean;
 }
 
 export interface ReceiveMtimeMessage {

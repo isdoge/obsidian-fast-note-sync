@@ -24,7 +24,8 @@ function fixture(){
  const session=async(id,byte)=>{const s={commitGuard:await m.exports.testCapture(plugin,'example.bin'),path:'example.bin',sessionId:id,contentHash:String(byte),ctime:1,mtime:50,lastTime:1000,size:1,totalChunks:1,chunks:new Map([[0,Uint8Array.from([byte]).buffer]]),pageIndex:1};plugin.fileDownloadSessions.set(id,s);return s;};
  return{plugin,files,writes,cache,reads,session,view:()=>({bytes:files.get('example.bin')?.bytes??null,mtime:files.get('example.bin')?.stat.mtime??null,exists:files.has('example.bin')})};
 }
-const results=[];async function run(name,setup,expect){const f=fixture();await setup(f);const actual=f.view();const normal=name.startsWith('normal')||name.startsWith('uncontested');assert.equal(f.plugin.fileSyncTasks.failed,normal?0:1,name+' failure accounting');assert.equal(f.cache.length,(normal||name.startsWith('older session'))?1:0,name+' acknowledged hash must only advance on commit');results.push({name,actual,expected:expect,protectionPassed:JSON.stringify(actual)===JSON.stringify(expect),writes:f.writes});}
+const results=[];async function run(name,setup,expect){const f=fixture();await setup(f);const actual=f.view();const normal=name.startsWith('normal')||name.startsWith('uncontested');// A session from a closed connection is dropped without failure accounting (it belongs to no current round).
+const stale=name.startsWith('disconnect');assert.equal(f.plugin.fileSyncTasks.failed,normal||stale?0:1,name+' failure accounting');assert.equal(f.cache.length,(normal||name.startsWith('older session'))?1:0,name+' acknowledged hash must only advance on commit');results.push({name,actual,expected:expect,protectionPassed:JSON.stringify(actual)===JSON.stringify(expect),writes:f.writes});}
 (async()=>{
  await run('normal download control',async f=>m.exports.testComplete(await f.session('a',2),f.plugin),{bytes:[2],mtime:50,exists:true});
  await run('unsent local edit during download',async f=>{const s=await f.session('a',2);f.files.get('example.bin').bytes=[9];f.files.get('example.bin').stat.mtime=200;f.plugin.pendingUploadHashes.set('example.bin','9');await m.exports.testComplete(s,f.plugin);},{bytes:[9],mtime:200,exists:true});
@@ -47,6 +48,11 @@ const results=[];async function run(name,setup,expect){const f=fixture();await s
   const s=p.fileDownloadSessions.get('s2');assert.ok(s,'reply for a pending request with newer server metadata must proceed');
   assert.equal(s.contentHash,'7');assert.equal(s.pageIndex,2);assert.ok(s.commitGuard,'guard carried to the real session');
   assert.equal(p.fileDownloadSessions.has('temp_example.bin'),false);}
+ {// F-2: a session finishing after its connection closed books nothing onto the current round.
+  const f=fixture();const done=[],rel=[];f.plugin.recordSyncCompleted=(...x)=>done.push(x);f.plugin.concurrencyLimiter.releaseSlot=k=>rel.push(k);
+  const a=await f.session('a',2);m.exports.invalidateFileDownloads(f.plugin);await m.exports.testComplete(a,f.plugin);
+  assert.deepEqual(done,[],'stale session must not complete a page');assert.equal(f.plugin.fileSyncTasks.failed,0);assert.deepEqual(rel,[],'stale session must not release a slot');
+  assert.deepEqual(f.view(),{bytes:[0],mtime:100,exists:true});}
  assert.equal(results[0].protectionPassed,true,'control must work');
  for(const r of results)assert.equal(r.protectionPassed,true,r.name);
  console.log('download commit race tests passed ('+results.length+' cases)');
