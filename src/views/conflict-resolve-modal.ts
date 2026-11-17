@@ -626,7 +626,7 @@ export class ConflictResolveModal extends Modal {
       // (() => this.onClose()) here reads this.onClose lazily at call time,
       // which after the reassignment resolves back to the wrapper itself and
       // recurses until "Maximum call stack size exceeded".
-      const originalOnClose = this.onClose.bind(this);
+      const originalOnClose = this.onClose.bind(this) as () => void;
       this.onClose = () => {
         observer.disconnect();
         originalOnClose();
