@@ -1,6 +1,6 @@
 import { normalizePath, App } from "obsidian";
 
-import { hashContent, dump, dumpError, configIsPathExcluded, getSafeCtime, isPathInConfigSyncDirs, showSyncNotice, isInWhitelist, hashFileAsync, checkAndNotifyCaseConflict } from "../utils/helpers";
+import { hashContent, dump, dumpError, configIsPathExcluded, getSafeCtime, isPathInConfigSyncDirs, showSyncNotice, isInWhitelist, hashFileAsync, checkAndNotifyCaseConflict, isLargeBinarySyncRisk } from "../utils/helpers";
 import { SyncLogManager } from "./sync_log_manager";
 import { ReceiveMessage, ReceiveMtimeMessage, ReceivePathMessage, SyncEndData } from "../utils/types";
 import type FastSync from "../../main";
@@ -11,7 +11,15 @@ import { $ } from "../../i18n/lang";
  * 排除监听文件的常量（针对 .obsidian 根目录）
  */
 export const CONFIG_ROOT_FILES_EXCLUDE = ["workspace.json", "workspace-mobile.json"]
-export const CONFIG_PLUGIN_EXTS_TO_WATCH = [".json", ".js", ".css"]
+// 配置通道按 UTF-8 文本传输，仅扩展文本资源，不能直接纳入图片等二进制文件。
+export const CONFIG_PLUGIN_EXTS_TO_WATCH = [".json", ".js", ".css", ".dict", ".dic", ".aff", ".txt"]
+const CONFIG_PLUGIN_DIRS_EXCLUDE = new Set(["node_modules", ".git", ".cache", "cache", "caches", ".trash", ".tmp", "tmp", "temp"])
+
+export const isPluginConfigPathExcluded = (path: string, configDir: string): boolean => {
+    const prefix = `${configDir}/plugins/`
+    return path.startsWith(prefix) && path.slice(prefix.length).split("/").slice(1)
+        .some(part => CONFIG_PLUGIN_DIRS_EXCLUDE.has(part.toLowerCase()))
+}
 export const CONFIG_THEME_EXTS_TO_WATCH = [".css", ".json"]
 
 
@@ -64,6 +72,10 @@ export const configModify = async function (path: string, plugin: FastSync, even
             if (exists) {
                 const stat = await plugin.app.vault.adapter.stat(filePath)
                 if (stat) {
+                    if (isLargeBinarySyncRisk(stat.size, plugin)) {
+                        plugin.removeIgnoredConfigFile(path)
+                        return
+                    }
                     contentHash = await hashFileAsync(plugin.app, filePath)
                     const contentBuf = await plugin.app.vault.adapter.readBinary(filePath)
                     contentStr = new TextDecoder().decode(contentBuf)
@@ -298,6 +310,11 @@ export const receiveConfigUpload = async function (data: ReceivePathMessage, plu
         if (exists) {
             const stat = await plugin.app.vault.adapter.stat(filePath);
             if (stat) {
+                if (isLargeBinarySyncRisk(stat.size, plugin)) {
+                    plugin.removeIgnoredConfigFile(data.path);
+                    plugin.recordSyncCompleted('setting', data.pageIndex);
+                    return;
+                }
                 contentHash = await hashFileAsync(plugin.app, filePath);
                 const contentBufRead = await plugin.app.vault.adapter.readBinary(filePath);
                 contentStr = new TextDecoder().decode(contentBufRead);
@@ -551,17 +568,18 @@ export const configAllPaths = async function (configDirs: string[], plugin: Fast
     /**
      * 递归扫描通用目录
      */
-    const scanDirRecursive = async (dirPath: string) => {
+    const scanDirRecursive = async (dirPath: string, pluginResources: boolean = false) => {
         try {
             if (!(await adapter.exists(normalizePath(dirPath)))) return
             const result = await adapter.list(normalizePath(dirPath))
             for (const file of result.files) {
                 if (isExcluded(file)) continue
+                if (pluginResources && !CONFIG_PLUGIN_EXTS_TO_WATCH.some(ext => file.toLowerCase().endsWith(ext))) continue
                 paths.push(file)
             }
             for (const folder of result.folders) {
-                if (isExcluded(folder)) continue
-                await scanDirRecursive(folder)
+                if (isExcluded(folder) || (pluginResources && isPluginConfigPathExcluded(folder, plugin.app.vault.configDir))) continue
+                await scanDirRecursive(folder, pluginResources)
             }
         } catch (e) {
             dump(`Error scanning directory ${dirPath}:`, e)
@@ -598,15 +616,8 @@ export const configAllPaths = async function (configDirs: string[], plugin: Fast
                 if (await adapter.exists(pluginsPath)) {
                     const result = await adapter.list(pluginsPath)
                     for (const folderPath of result.folders) {
-                        const folderName = folderPath.split("/").pop()
-                        const folderItems = await adapter.list(folderPath)
-                        for (const file of folderItems.files) {
-                            const fileName = file.split("/").pop() || ""
-                            if (CONFIG_PLUGIN_EXTS_TO_WATCH.some(ext => fileName.endsWith(ext))) {
-                                const rel = `${configDir}/plugins/${folderName}/${fileName}`
-                                if (!isExcluded(rel)) paths.push(rel)
-                            }
-                        }
+                        if (isExcluded(folderPath)) continue
+                        await scanDirRecursive(folderPath, true)
                     }
                 }
                 const themesPath = normalizePath(`${configDir}/themes`)
