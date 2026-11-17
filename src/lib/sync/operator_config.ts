@@ -35,6 +35,106 @@ export const cleanupConfigReloadTimer = function (): void {
         reloadTimer = null
     }
     pendingConfigUpdates.clear()
+    downgradeBlockedPlugins.clear()
+    pluginCodeBackups.clear()
+}
+
+// 插件降级守卫（#294）：服务端的 manifest.json 版本低于本地时不覆盖本地插件代码，
+// 已在本轮先写入的 main.js / styles.css 用写入前的备份还原，并把本地较新的版本重新上传。
+// Plugin downgrade guard (#294): a server manifest.json older than the local one never replaces the
+// local plugin code; main.js / styles.css already written this round are restored from their
+// pre-write backup, and the newer local files are uploaded again.
+const downgradeBlockedPlugins = new Set<string>()
+const pluginCodeBackups = new Map<string, ArrayBuffer>()
+
+function parseVersion(v: unknown): number[] | null {
+    if (typeof v !== "string") return null
+    const m = v.trim().match(/^v?(\d+(?:\.\d+)*)/)
+    return m ? m[1].split(".").map(Number) : null
+}
+
+/** remote 严格低于 local（无法解析时视为不低）/ remote strictly older than local (unparsable: not older) */
+export const isVersionLower = function (remote: unknown, local: unknown): boolean {
+    const r = parseVersion(remote), l = parseVersion(local)
+    if (!r || !l) return false
+    for (let i = 0; i < Math.max(r.length, l.length); i++) {
+        const a = r[i] ?? 0, b = l[i] ?? 0
+        if (a !== b) return a < b
+    }
+    return false
+}
+
+const readManifestVersion = async function (path: string, plugin: FastSync): Promise<unknown> {
+    try {
+        if (!(await plugin.app.vault.adapter.exists(path))) return undefined
+        return (JSON.parse(await plugin.app.vault.adapter.read(path)) as { version?: unknown }).version
+    } catch {
+        return undefined
+    }
+}
+
+// 重新上传本地文件：清掉 lastSyncMtime，绕过「哈希与 mtime 都未变」的拦截（只读端由 configModify 自行拦下）
+// Upload the local file again: dropping lastSyncMtime bypasses the unchanged hash+mtime interception
+// (configModify itself still refuses on a read-only device)
+const reuploadLocalConfig = function (path: string, plugin: FastSync) {
+    plugin.lastSyncMtime.delete(path)
+    void configModify(path, plugin)
+}
+
+/**
+ * 返回 true 表示本次服务端写入被降级守卫拦下 / Returns true when the server write is blocked by the downgrade guard
+ */
+const guardPluginDowngrade = async function (data: ReceiveMessage, plugin: FastSync): Promise<boolean> {
+    const configDir = plugin.app.vault.configDir
+    const parts = data.path.split("/")
+    if (parts.length !== 4 || parts[0] !== configDir || parts[1] !== "plugins" || !PLUGIN_CODE_FILES.includes(parts[3])) return false
+    const id = parts[2]
+    const adapter = plugin.app.vault.adapter
+
+    if (parts[3] === "manifest.json") {
+        let remoteVersion: unknown
+        try {
+            remoteVersion = (JSON.parse(data.content) as { version?: unknown }).version
+        } catch {
+            return false
+        }
+        const localVersion = await readManifestVersion(normalizePath(data.path), plugin)
+        if (!isVersionLower(remoteVersion, localVersion)) {
+            downgradeBlockedPlugins.delete(id)
+            return false
+        }
+        downgradeBlockedPlugins.add(id)
+        for (const f of PLUGIN_CODE_FILES) {
+            const p = `${configDir}/plugins/${id}/${f}`
+            const backup = pluginCodeBackups.get(p)
+            if (!backup) continue
+            pluginCodeBackups.delete(p)
+            plugin.addIgnoredConfigFile(p)
+            try {
+                await adapter.writeBinary(normalizePath(p), backup)
+                const stat = await adapter.stat(normalizePath(p))
+                if (stat && plugin.configManager) plugin.configManager.updateFileState(normalizePath(p), stat.mtime)
+            } finally {
+                plugin.removeIgnoredConfigFile(p)
+            }
+            reuploadLocalConfig(p, plugin)
+        }
+        reuploadLocalConfig(data.path, plugin)
+        SyncLogManager.getInstance().addLog('receive', 'ConfigDowngradeSkipped', `服务端插件版本 ${String(remoteVersion)} 低于本地 ${String(localVersion)}，保留本地并重新上传: ${id}`, 'cancelled', data.path)
+        showSyncNotice($("ui.status.plugin_downgrade_blocked", { id, remote: String(remoteVersion), local: String(localVersion) }), 10000)
+        return true
+    }
+
+    if (downgradeBlockedPlugins.has(id)) {
+        SyncLogManager.getInstance().addLog('receive', 'ConfigDowngradeSkipped', `插件 ${id} 的服务端版本较旧，跳过覆盖并重新上传本地文件`, 'cancelled', data.path)
+        reuploadLocalConfig(data.path, plugin)
+        return true
+    }
+    // 写入前备份本地文件，供同一轮稍后到达的较旧 manifest.json 还原 / Back up before overwriting, so a
+    // downgraded manifest.json arriving later in the round can restore it
+    const localPath = normalizePath(data.path)
+    if (await adapter.exists(localPath)) pluginCodeBackups.set(data.path, await adapter.readBinary(localPath))
+    return false
 }
 
 export const configModify = async function (path: string, plugin: FastSync, eventEnter: boolean = false, content?: string) {
@@ -223,6 +323,12 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
         if (hasPendingLocalEdit || hasDivergedSinceLastSync) {
             dump(`[FastSync] Skip config overwrite, local unsynced edit detected: ${filePath}`)
             SyncLogManager.getInstance().addLog('receive', 'ConfigModifyConflict', `本地配置存在未同步的改动，跳过服务端覆盖，等待下一轮同步处理冲突: ${filePath}`, 'cancelled', data.path)
+            plugin.removeIgnoredConfigFile(data.path)
+            plugin.recordSyncCompleted('setting', data.pageIndex)
+            return
+        }
+
+        if (await guardPluginDowngrade(data, plugin)) {
             plugin.removeIgnoredConfigFile(data.path)
             plugin.recordSyncCompleted('setting', data.pageIndex)
             return
@@ -728,6 +834,8 @@ export const configReload = async function (path: string, plugin: FastSync, even
         const updates = Array.from(pendingConfigUpdates.entries())
         const communityPluginsUpdated = updates.some(([p]) => p === `${configDir}/community-plugins.json`)
         pendingConfigUpdates.clear()
+        // 本轮写入已全部落定，降级还原用的备份不再需要 / The round's writes are settled; restore backups are no longer needed
+        pluginCodeBackups.clear()
         reloadTimer = null
 
         if (app.vault.reloadConfig) await app.vault.reloadConfig()
