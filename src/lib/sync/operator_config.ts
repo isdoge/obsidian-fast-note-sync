@@ -463,7 +463,8 @@ export const receiveConfigSyncEnd = async function (data: unknown, plugin: FastS
 
     const hasUpdates = (syncData.needUploadCount || 0) + (syncData.needModifyCount || 0) + (syncData.needSyncMtimeCount || 0) + (syncData.needDeleteCount || 0) > 0;
     if (hasUpdates) {
-        plugin.localStorageManager.setMetadata("lastConfigSyncTime", syncData.lastTime)
+        // 暂存，待本类型全部完成且无失败时由 settleSyncTimes 落盘 / Stashed; persisted by settleSyncTimes
+        plugin.syncState.pendingSyncEndTime.set("lastConfigSyncTime", syncData.lastTime)
     }
     plugin.syncTypeCompleteCount++
 }

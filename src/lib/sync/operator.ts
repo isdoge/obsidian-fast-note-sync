@@ -128,6 +128,41 @@ export function isSyncStalled(plugin: FastSync, ownerContext: string | undefined
   return idle && now - syncStallState.lastProgressAt > SYNC_STALL_RESTART_MS;
 }
 
+/**
+ * 处理 SyncEnd 暂存的 lastTime（见 sync_state.ts syncTimeBaseline 注释）。
+ * 类型全部完成且 failed=0：落盘 End 时间；完成但有失败、或 abort（停滞重启/取消/断线）：
+ * 回到本轮请求所用的基线，逐条明细推进过的时间一并撤回，下一轮用旧时间重拉。
+ * Settle the lastTime stashed by SyncEnd (see sync_state.ts syncTimeBaseline). A type that
+ * finished with failed=0 persists the End time; one that finished with failures, or any type on
+ * abort (stall restart / cancel / disconnect), returns to this round's request baseline,
+ * discarding per-item advances too, so the next round re-pulls from the old time.
+ */
+export function settleSyncTimes(plugin: FastSync, abort = false): void {
+  const types = [
+    ["lastNoteSyncTime", "note", plugin.noteSyncTasks],
+    ["lastFileSyncTime", "file", plugin.fileSyncTasks],
+    ["lastFolderSyncTime", "folder", plugin.folderSyncTasks],
+    ["lastConfigSyncTime", "setting", plugin.configSyncTasks],
+  ] as const;
+  const { pendingSyncEndTime, syncTimeBaseline } = plugin.syncState;
+  for (const [field, trackerType, tasks] of types) {
+    const endTime = pendingSyncEndTime.get(field);
+    if (endTime === undefined) continue;
+    const done = plugin.progressTracker.isTypeFullyDone(trackerType)
+      && (trackerType !== "file" || plugin.fileDownloadSessions.size === 0);
+    if (!abort && done && tasks.failed === 0) {
+      plugin.localStorageManager.setMetadata(field, endTime);
+    } else if (abort || done) {
+      const baseline = syncTimeBaseline.get(field);
+      if (baseline !== undefined) plugin.localStorageManager.setMetadata(field, baseline);
+      dump(`[SyncTime] ${field} kept at baseline ${baseline} (failed=${tasks.failed}, abort=${abort}); End time ${endTime} discarded`);
+    } else {
+      continue;
+    }
+    pendingSyncEndTime.delete(field);
+  }
+}
+
 function restartStalledSync(plugin: FastSync, intervalId?: number): void {
   if (intervalId) {
     window.clearInterval(intervalId);
@@ -135,6 +170,7 @@ function restartStalledSync(plugin: FastSync, intervalId?: number): void {
       plugin.syncState.progressCheckIntervalId = null;
     }
   }
+  settleSyncTimes(plugin, true);
   dump(`Sync stalled without progress for ${SYNC_STALL_RESTART_MS}ms; restarting. Tasks: note=${JSON.stringify(plugin.noteSyncTasks)}, file=${JSON.stringify(plugin.fileSyncTasks)}`);
   SyncLogManager.getInstance().addOrUpdateLog({
     id: `stall-${Date.now()}`, type: 'info', action: 'SyncSummary', status: 'error',
@@ -189,6 +225,7 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, _sync
     restartStalledSync(plugin, intervalId);
     return;
   }
+  settleSyncTimes(plugin);
   const ws = plugin.websocket.ws;
   const bufferedAmount = ws && ws.readyState === WebSocket.OPEN ? ws.bufferedAmount : 0;
 
@@ -272,6 +309,9 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, _sync
     // before resetSyncTasks (which also clears offlineGuardSkippedThisRound), so we can decide
     // below whether refreshing lastSyncSuccessTime is trustworthy
     const offlineGuardSkippedThisRound = plugin.syncState.offlineGuardSkippedThisRound;
+    // 未参与完成判定的类型（如本轮中途关闭了同步）仍有暂存时间时回到基线
+    // Types left unsettled (e.g. sync disabled mid-round) fall back to their baseline
+    settleSyncTimes(plugin, true);
 
     plugin.syncState.activeSyncContext = null; // 同步完成，清空活跃的上下文 / Sync completed, reset the active context
     plugin.isSyncing = false;
@@ -589,6 +629,8 @@ async function receiveSyncEndWrapper(data: unknown, plugin: FastSync, type: "not
     tasks.needModify = 0;
     tasks.needSyncMtime = 0;
     tasks.needDelete = 0;
+    // 本类型本轮跳过，时间戳也推迟到下次 / This type was skipped; its timestamp is deferred too
+    plugin.syncState.pendingSyncEndTime.delete(type === "note" ? "lastNoteSyncTime" : "lastFileSyncTime");
   }
 
   // 4. 针对已就绪的本模块，如果存在服务端待下载任务，且尚未发送过首拉，则立即触发首拉 Ack 信号
@@ -1168,6 +1210,12 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       configTime = Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"));
       folderTime = Number(plugin.localStorageManager.getMetadata("lastFolderSyncTime"));
     }
+    // 本轮请求时间即回滚基线 / This round's request times are the rollback baseline
+    plugin.syncState.pendingSyncEndTime.clear();
+    plugin.syncState.syncTimeBaseline = new Map([
+      ["lastFileSyncTime", fileTime], ["lastNoteSyncTime", noteTime],
+      ["lastConfigSyncTime", configTime], ["lastFolderSyncTime", folderTime],
+    ]);
 
     // 分批发送方案替代原截断方案：不再对 sync 数组截断，所有数据通过 sendInBatches 分批发送
     // Replaced truncation with batch-send: arrays are no longer capped; sendInBatches handles chunking
@@ -1246,6 +1294,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
  * Cancel the current sync and reset all runtime states.
  */
 export function cancelSync(plugin: FastSync): void {
+  settleSyncTimes(plugin, true);
   if (plugin.syncState.progressCheckIntervalId !== null) {
     window.clearInterval(plugin.syncState.progressCheckIntervalId);
     plugin.syncState.progressCheckIntervalId = null;

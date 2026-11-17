@@ -550,9 +550,9 @@ export const receiveNoteSyncEnd = async function (data: unknown, plugin: FastSyn
   plugin.noteSyncTasks.needSyncMtime = syncData.needSyncMtimeCount || 0
   plugin.noteSyncTasks.needDelete = syncData.needDeleteCount || 0
 
-  // 无条件更新 lastNoteSyncTime，确保包含服务端本轮同步后的所有异步操作（如 SyncResourceFID）
-  // Unconditionally update lastNoteSyncTime to cover all async server-side ops after this sync round (e.g., SyncResourceFID)
-  plugin.localStorageManager.setMetadata("lastNoteSyncTime", syncData.lastTime)
+  // End 先于明细到达：暂存 lastTime，待本类型全部完成且无失败时由 settleSyncTimes 落盘
+  // End arrives before the details: stash lastTime; settleSyncTimes persists it once the type finished without failures
+  plugin.syncState.pendingSyncEndTime.set("lastNoteSyncTime", syncData.lastTime)
   plugin.syncTypeCompleteCount++
 }
 

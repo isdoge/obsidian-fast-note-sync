@@ -52,7 +52,7 @@ console.log('PASS: negotiated page completion');
     const metadata = new Map();
     const stats = () => ({ needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, failed: 0 });
     const p = {
-      syncState: { activeSyncContext: 'current', newConflictedPathsThisRound: new Set(), offlineGuardSkippedThisRound: false },
+      syncState: { activeSyncContext: 'current', newConflictedPathsThisRound: new Set(), offlineGuardSkippedThisRound: false, pendingSyncEndTime: new Map(), syncTimeBaseline: new Map() },
       settings: { syncEnabled: true, configSyncEnabled: true },
       websocket: { ws: { readyState: 1, bufferedAmount: 0 } },
       progressTracker: { isTypeFullyDone: () => true, getOverallPct: () => 100, forceComplete: noop },

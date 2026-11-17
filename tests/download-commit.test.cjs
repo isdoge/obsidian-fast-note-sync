@@ -34,6 +34,7 @@ const results=[];async function run(name,setup,expect){const f=fixture();await s
  await run('sync disabled while finalizer awaiting commit',async f=>{const a=await f.session('a',2);f.plugin.settings.syncEnabled=false;await m.exports.testComplete(a,f.plugin);},{bytes:[0],mtime:100,exists:true});
  await run('disconnect invalidates retained session',async f=>{const a=await f.session('a',2);m.exports.invalidateFileDownloads(f.plugin);await m.exports.testComplete(a,f.plugin);},{bytes:[0],mtime:100,exists:true});
  await run('disabled while waiting for the path lock',async f=>{const a=await f.session('a',2);f.plugin.lockManager.withLock=async(_p,fn)=>{f.plugin.settings.syncEnabled=false;return fn();};await m.exports.testComplete(a,f.plugin);},{bytes:[0],mtime:100,exists:true});
+ await run('path lock busy at commit',async f=>{const a=await f.session('a',2);f.plugin.lockManager.withLock=async()=>null;await m.exports.testComplete(a,f.plugin);},{bytes:[0],mtime:100,exists:true});
  await run('uncontested absent file downloads',async f=>{f.files.clear();await m.exports.testComplete(await f.session('a',2),f.plugin);},{bytes:[2],mtime:50,exists:true});
 
  {const f=fixture();await f.session('a',2);await f.session('b',3);assert.equal(f.reads.length,0,'capturing the guard must not read local files');}

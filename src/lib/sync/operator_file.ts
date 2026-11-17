@@ -1211,9 +1211,9 @@ export const receiveFileSyncEnd = async function (data: unknown, plugin: FastSyn
   plugin.fileSyncTasks.needSyncMtime = syncData.needSyncMtimeCount || 0
   plugin.fileSyncTasks.needDelete = syncData.needDeleteCount || 0
 
-  // 无条件更新 lastFileSyncTime，确保包含服务端本轮同步后的所有异步操作（如 SyncResourceFID）
-  // Unconditionally update lastFileSyncTime to cover all async server-side ops after this sync round (e.g., SyncResourceFID)
-  plugin.localStorageManager.setMetadata("lastFileSyncTime", syncData.lastTime)
+  // End 先于明细到达：暂存 lastTime，待本类型全部完成且无失败时由 settleSyncTimes 落盘
+  // End arrives before the details: stash lastTime; settleSyncTimes persists it once the type finished without failures
+  plugin.syncState.pendingSyncEndTime.set("lastFileSyncTime", syncData.lastTime)
   plugin.syncTypeCompleteCount++
 }
 
@@ -1568,7 +1568,7 @@ const handleFileChunkDownloadComplete = async function (session: FileDownloadSes
     }
 
     const normalizedPath = normalizePath(session.path)
-    await plugin.lockManager.withLock(normalizedPath, async () => {
+    const committed = await plugin.lockManager.withLock(normalizedPath, async () => {
       assertDownloadCommittable(plugin, session)
       plugin.addIgnoredFile(normalizedPath)
       try {
@@ -1615,7 +1615,11 @@ const handleFileChunkDownloadComplete = async function (session: FileDownloadSes
       // 记录同步后的 mtime
       plugin.lastSyncMtime.set(session.path, session.mtime)
       dump(`Download complete and hash updated for: ${session.path}`, contentHash)
+      return true
     }, { maxRetries: 5, retryInterval: 100 });
+    // 抢锁失败时任务未执行，文件未写入：按失败处理，不能计为完成
+    // Lock not acquired means nothing was written: treat as a failure, never as completed
+    if (!committed) throw new Error("Download not committed: path lock busy")
 
     // 释放内存计数
     releaseSessionMemory(session)

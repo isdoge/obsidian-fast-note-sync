@@ -1,5 +1,7 @@
 import type { FileDownloadSession } from "../utils/types";
 
+export type SyncTimeField = "lastNoteSyncTime" | "lastFileSyncTime" | "lastConfigSyncTime" | "lastFolderSyncTime";
+
 /**
  * Stats for a single sync type (notes / files / configs / folders).
  * 单类同步任务的统计数据（笔记 / 文件 / 配置 / 文件夹）。
@@ -95,6 +97,18 @@ export class SyncState {
    * silently reset the offline duration, defeating the guard on the very next round.
    */
   offlineGuardSkippedThisRound = false;
+
+  /**
+   * 本轮各类型同步请求所带的 lastTime（回滚基线），以及 XxxSyncEnd 下发、尚未落盘的 lastTime。
+   * 服务端先发 End 再分页下发明细，End 到达时明细还没处理；只有该类型全部完成且 failed=0 才把
+   * End 时间落盘，否则回到基线（连同本轮逐条推进的时间），下一轮按旧时间重拉。
+   * Per-type lastTime sent with this round's request (rollback baseline) and the XxxSyncEnd
+   * lastTime not yet persisted. The server sends End before the paged details, so End arrives
+   * before any detail is applied; it is persisted only when the type finished with failed=0,
+   * otherwise the stored time returns to the baseline and the next round re-pulls from there.
+   */
+  syncTimeBaseline = new Map<SyncTimeField, number>();
+  pendingSyncEndTime = new Map<SyncTimeField, number>();
 
   // ─── Per-type sync task statistics ───────────────────────────────────────────
   onCompletedChange?: (type: "note" | "file" | "setting" | "folder") => void;

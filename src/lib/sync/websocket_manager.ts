@@ -3,7 +3,7 @@ import { moment, Platform, normalizePath } from "obsidian";
 import { invalidateFileDownloads, handleFileChunkDownload, BINARY_PREFIX_FILE_SYNC, clearUploadQueue, receiveFileUploadSessionNotFound } from "./operator_file";
 import { dump, addRandomParam, showSyncNotice, safeStringify, getPluginDir, hashContent } from "../utils/helpers";
 import { enSendDTOToProtobuf, deReceivePacket } from "../../pb/protobuf_mapper";
-import { receiveOperators, startupSync, startupFullSync, settleAllBatchSendSessionsOnClose } from "./operator";
+import { receiveOperators, startupSync, startupFullSync, settleAllBatchSendSessionsOnClose, settleSyncTimes } from "./operator";
 import { SyncLogManager } from "./sync_log_manager";
 import * as WSAction from "./websocket_action";
 import { WebSocketClient } from "./websocket_client";
@@ -177,6 +177,8 @@ export class WebSocketManager {
           // in-flight scan bails out at its next yield point instead of scanning to completion
           // and sending a full round under a dead context.
           this.plugin.syncState.activeSyncContext = null;
+          // 本轮未完成：已推进的同步时间回到本轮基线 / Unfinished round: sync times return to the baseline
+          settleSyncTimes(this.plugin, true);
         }
         this.receivedFileDetails.clear();
         // Downloads requested on the closed connection may no longer commit.

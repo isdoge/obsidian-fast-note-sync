@@ -347,8 +347,8 @@ export const receiveFolderSyncEnd = async function (data: unknown, plugin: FastS
     plugin.folderSyncTasks.needSyncMtime = syncData.needSyncMtimeCount || 0
     plugin.folderSyncTasks.needDelete = syncData.needDeleteCount || 0
 
-    // 无条件更新 lastFolderSyncTime，确保包含服务端本轮同步后的所有异步操作（如 SyncResourceFID）
-    // Unconditionally update lastFolderSyncTime to cover all async server-side ops after this sync round (e.g., SyncResourceFID)
-    plugin.localStorageManager.setMetadata("lastFolderSyncTime", syncData.lastTime)
+    // End 先于明细到达：暂存 lastTime，待本类型全部完成且无失败时由 settleSyncTimes 落盘
+    // End arrives before the details: stash lastTime; settleSyncTimes persists it once the type finished without failures
+    plugin.syncState.pendingSyncEndTime.set("lastFolderSyncTime", syncData.lastTime)
     plugin.syncTypeCompleteCount++
 }

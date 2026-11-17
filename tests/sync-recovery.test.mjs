@@ -32,7 +32,7 @@ const { ConcurrencyLimiter } = load('src/lib/sync/concurrency_limiter.ts');
     './operator_file': { sweepStalledDownloadSessions: async () => 0 }
   }, { WebSocket: { OPEN: 1 } });
   const p = {
-    syncState: { activeSyncContext: 'long-running' }, isSyncing: true,
+    syncState: { activeSyncContext: 'long-running', pendingSyncEndTime: new Map(), syncTimeBaseline: new Map() }, isSyncing: true,
     settings: { syncEnabled: true, configSyncEnabled: true },
     websocket: { ws: { readyState: 1, bufferedAmount: 0 } },
     fileDownloadSessions: new Map(),

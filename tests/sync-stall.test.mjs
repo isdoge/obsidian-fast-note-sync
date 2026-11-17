@@ -76,7 +76,7 @@ const { checkSyncCompletion } = integrationModule.exports;
 const statusUpdates = [];
 const failIfReset = () => { throw new Error('active long-running sync must not be reset'); };
 const longRunning = {
-  syncState: { activeSyncContext: 'long-running', progressCheckIntervalId: 1 },
+  syncState: { activeSyncContext: 'long-running', progressCheckIntervalId: 1, pendingSyncEndTime: new Map(), syncTimeBaseline: new Map() },
   settings: { syncEnabled: true, configSyncEnabled: false, isShowNotice: false },
   noteSyncTasks: { completed: 4, failed: 0 }, fileSyncTasks: { completed: 2, failed: 0 },
   folderSyncTasks: { completed: 0, failed: 0 }, configSyncTasks: { completed: 0, failed: 0 },
