@@ -996,9 +996,10 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                 });
               }
             } else {
-              if (isLargeBinarySyncRisk(file.stat.size, plugin)) continue;
-              const attachmentLimit = (plugin.settings.attachmentSyncLimit ?? 50) * 1024 * 1024;
-              if (file.stat.size > attachmentLimit) continue;
+              if (isLargeBinarySyncRisk(file.stat.size, plugin)) {
+                dump(`Skip scanning large attachment (${describeBinarySyncLimit(plugin)} limit): ${file.path}`, file.stat.size);
+                continue;
+              }
               const skipSync = plugin.settings.cloudPreviewEnabled && (!plugin.settings.cloudPreviewTypeRestricted || FileCloudPreview.isRestrictedType("." + file.extension));
               if (skipSync) continue;
 
