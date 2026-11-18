@@ -105,6 +105,7 @@ export class WebSocketManager {
   private deferredMessages: { action: string; data: StructuredMessageData }[] = [];
   private deferredBytes = 0;
   private replayScheduled = false;
+  private deferredOverflowed = false;
 
   // --- 轻量事件总线，用于分批发送时等待服务端 BatchAck ---
   // Lightweight event bus for awaiting server BatchAck during batch send
@@ -532,6 +533,16 @@ export class WebSocketManager {
       // contexts of this client (late replies of the previous round) are still discarded;
       // other sources (other devices' live broadcasts, replies to this client's contextless
       // requests) are deferred until the round ends instead of being dropped outright
+      // 本机已作废 context 的迟到应答，没有活跃轮次时同样丢弃：取消同步或停滞重启后，服务端
+      // 已发出的旧轮次消息不能继续落地，更不能凭旧 context 回分页确认把被取消的轮次接着跑完
+      // Late replies carrying a retired context of this client are discarded when idle too:
+      // after a cancel or stall restart the old round's in-flight messages must not be applied,
+      // nor may their page acks keep driving the cancelled round to the end
+      if (data.context && data.context !== this.plugin.syncState.activeSyncContext
+        && this.plugin.syncState.retiredSyncContexts.has(data.context)) {
+        dump(`[SyncContext] Discard message ${msgAction} due to mismatched context. Expected: ${this.plugin.syncState.activeSyncContext}, Got: ${data.context}`);
+        return;
+      }
       if (this.plugin.syncState.activeSyncContext) {
         const isControlMsg = msgAction === WSAction.ClientReceiveAuth || msgAction === WSAction.ClientReceiveInfo;
         // Older servers omit context on the UpdateMtime response to NoteModify.
@@ -540,10 +551,6 @@ export class WebSocketManager {
           && typeof data.data?.path === 'string'
           && this.plugin.pendingNoteModifies.has(data.data.path);
         if (!isControlMsg && !isPendingMtimeAck && data.context !== this.plugin.syncState.activeSyncContext) {
-          if (data.context && this.plugin.syncState.retiredSyncContexts.has(data.context)) {
-            dump(`[SyncContext] Discard message ${msgAction} due to mismatched context. Expected: ${this.plugin.syncState.activeSyncContext}, Got: ${data.context}`);
-            return;
-          }
           this.enqueueDeferredMessage(msgAction, data);
           return;
         }
@@ -614,6 +621,7 @@ export class WebSocketManager {
     if (this.deferredMessages.length >= WebSocketManager.DEFERRED_MAX_COUNT
       || this.deferredBytes + size > WebSocketManager.DEFERRED_MAX_BYTES) {
       dump(`[SyncContext] Deferred queue overflow (${this.deferredMessages.length} items, ${this.deferredBytes} bytes); discard incoming ${action}`);
+      this.deferredOverflowed = true;
       return;
     }
     this.deferredMessages.push({ action, data });
@@ -623,7 +631,7 @@ export class WebSocketManager {
 
   /** 轮次结束（activeSyncContext 置空/替换）时异步调度回放；不在置空调用栈里同步重入 */
   private scheduleDeferredReplay(): void {
-    if (this.deferredMessages.length === 0 || this.replayScheduled) return;
+    if ((this.deferredMessages.length === 0 && !this.deferredOverflowed) || this.replayScheduled) return;
     this.replayScheduled = true;
     window.setTimeout(() => {
       this.replayScheduled = false;
@@ -632,6 +640,15 @@ export class WebSocketManager {
   }
 
   private drainDeferredMessages(): void {
+    // 队列溢出丢过消息：回放其余消息时不能再推进同步时间，否则会越过被丢弃的那条。
+    // 退回"本连接尚未完成同步"的状态，等下一轮同步按已结算的时间重新拉取
+    // Messages were dropped on overflow: replaying the rest must not advance the sync cursor past
+    // the dropped ones. Fall back to "no clean round on this connection" until the next round
+    // re-pulls from the settled cursor
+    if (this.deferredOverflowed) {
+      this.deferredOverflowed = false;
+      this.plugin.syncState.hasSyncedThisConnection = false;
+    }
     // 回放期间新一轮同步已开始：剩余消息留队，等该轮结束的下次触发
     // A new round started mid-replay: leave the rest queued for that round's next trigger
     while (this.deferredMessages.length > 0 && !this.plugin.syncState.activeSyncContext) {
@@ -653,6 +670,7 @@ export class WebSocketManager {
     this.deferredMessages = [];
     this.deferredBytes = 0;
     this.replayScheduled = false;
+    this.deferredOverflowed = false;
   }
 
   public sendClientInfo() {

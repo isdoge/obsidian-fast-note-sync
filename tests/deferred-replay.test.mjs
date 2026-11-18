@@ -44,6 +44,7 @@ function makeManager(initialContext = null, retired = []) {
   m.deferredMessages = [];
   m.deferredBytes = 0;
   m.replayScheduled = false;
+  m.deferredOverflowed = false;
   m.receivedFileDetails = new Set();
   m.receivedFileContext = null;
   m.plugin = {
@@ -52,6 +53,7 @@ function makeManager(initialContext = null, retired = []) {
       _active: initialContext,
       retiredSyncContexts: new Set(retired),
       onSyncContextRetired: undefined,
+      hasSyncedThisConnection: true,
       get activeSyncContext() { return this._active; },
       set activeSyncContext(v) {
         const old = this._active; this._active = v;
@@ -99,6 +101,17 @@ const flushTimers = async () => { while (timers.length) { const t = timers.shift
   assert.equal(received.length, 1, 'matching context is processed immediately');
 }
 
+// 3b. 没有活跃轮次时（取消同步、停滞重启之后），本机已作废 context 的迟到消息同样丢弃
+{
+  received.length = 0; logs.length = 0;
+  const m = makeManager('round-1');
+  m.plugin.syncState.activeSyncContext = null;   // 取消同步：round-1 作废
+  await flushTimers();
+  m.handleStructuredMessage('NoteSyncModify', { code: 200, vault: 'test', context: 'round-1', data: { path: 'late.md' } });
+  assert.equal(received.length, 0, 'idle: late message of a retired round is discarded');
+  assert.ok(logs.some(l => l[1] && String(l[1]).includes('Discard message NoteSyncModify')), 'idle discard is logged');
+}
+
 // 5. 无活跃轮次：立即处理（原行为）
 {
   received.length = 0;
@@ -137,6 +150,19 @@ const flushTimers = async () => { while (timers.length) { const t = timers.shift
   m.plugin.syncState.activeSyncContext = null;
   await flushTimers();
   assert.equal(received.length, 0, 'overflowed message is never replayed');
+  assert.equal(m.plugin.syncState.hasSyncedThisConnection, false,
+    'after an overflow drop the live cursor is frozen until the next clean round');
+}
+
+// 7a-2. 没有溢出的轮次结束后不动 hasSyncedThisConnection
+{
+  received.length = 0;
+  const m = makeManager('round-6b');
+  m.handleStructuredMessage('NoteSyncModify', { code: 200, vault: 'test', data: { path: 'y.md' } });
+  m.plugin.syncState.activeSyncContext = null;
+  await flushTimers();
+  assert.equal(received.length, 1);
+  assert.equal(m.plugin.syncState.hasSyncedThisConnection, true, 'no overflow: flag untouched');
 }
 
 // 7b. 断线清空队列：私有方法通过原型调用（onClose 桩过重，直接驱动同一方法）

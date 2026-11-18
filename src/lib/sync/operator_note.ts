@@ -860,10 +860,14 @@ export const receiveNoteSyncRename = async function (data: { path: string, oldPa
           pathHash: data.pathHash,
         }
         void plugin.websocket.SendMessage("NoteRePush", rePushData)
+        // 本地还没有这个文件时不能先写同步基线：重推的应答若没到（断线、被丢弃），下一轮扫描
+        // 会把"有基线、本地不存在"当成本地删除，把服务端的笔记删掉。基线等内容真正落盘时再写
+        // Do not record a sync baseline while the file does not exist locally: if the re-push
+        // reply never arrives (disconnect, dropped), the next scan treats "baseline but no local
+        // file" as a local delete and removes the note on the server. The baseline is written
+        // once the content actually lands
         if (targetFile instanceof TFile) {
           plugin.fileHashManager.setFileHash(data.path, data.contentHash, targetFile.stat.mtime, targetFile.stat.size)
-        } else {
-          plugin.fileHashManager.setFileHash(data.path, data.contentHash)
         }
       }
     }, { maxRetries: 10, retryInterval: 100 });

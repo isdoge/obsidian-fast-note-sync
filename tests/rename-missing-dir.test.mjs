@@ -148,4 +148,17 @@ for (const [kind, handler, msg] of cases) {
   assert.equal(f.vault.dirs.has('a/b'), true, 'deep target: the missing leaf level is created');
 }
 
+// 本地既没有旧文件也没有目标文件：请求重推，但不能先写同步基线——重推的应答没到时，
+// 下一轮扫描会把"有基线、本地不存在"当成本地删除，把服务端的笔记删掉。
+{
+  const f = fixture('note');
+  const baselines = [], sent = [];
+  f.p.fileHashManager.setFileHash = (...a) => baselines.push(a);
+  f.p.websocket.SendMessage = async (action, data) => { sent.push([action, data.path]); };
+  await note.receiveNoteSyncRename({ oldPath: '不存在/旧.md', path: '新目录/新.md', pathHash: 'ph', contentHash: 'h' }, f.p);
+  assert.deepEqual(sent, [['NoteRePush', '新目录/新.md']], 'missing source: re-push requested');
+  assert.equal(baselines.length, 0, 'missing source and target: no sync baseline before the content lands');
+  assert.equal(f.renamed.length, 0);
+}
+
 console.log('PASS: rename into missing target dir creates parent folder first (note/file/folder), deep paths included');
