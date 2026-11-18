@@ -1,5 +1,39 @@
 import type { FileDownloadSession } from "../utils/types";
 
+export type SyncTimeField = "lastNoteSyncTime" | "lastFileSyncTime" | "lastConfigSyncTime" | "lastFolderSyncTime";
+
+/**
+ * 单条消息/单条 Ack 的游标统一推进入口（service#101 止损，替代各处理器里散落的
+ * `if (data.lastTime > 当前值) setMetadata(...)`）：
+ * - 轮次进行中（isSyncing 或 activeSyncContext 非空）不落盘：收尾由 settleSyncTimes 统一
+ *   提交本轮 End 时间（服务端查询开始时刻），期间任何单条落盘都会在中途崩溃时留下越过
+ *   未拉取条目的游标（settleSyncTimes 的回滚只在走到 onClose/cancelSync 时生效）；
+ * - 本连接尚未正常完成过一轮同步不落盘：离线增量还没对齐，实时广播/编辑 Ack 把游标推到
+ *   "现在"会掩盖整段离线变更（#101：点同步也拉不回，服务端只查 updated_timestamp >= 游标）；
+ * - 其余情况（空闲在线、已完成首轮）且处理本身成功时才单调递增推进——避免重启后把刚
+ *   处理过的实时变更再拉一遍。
+ * Unified cursor-advance entry for single messages and single Acks (service#101 guard,
+ * replacing the scattered `if (data.lastTime > current) setMetadata(...)` in handlers):
+ * - Never persist while a round is active (isSyncing or activeSyncContext): settlement is
+ *   owned by settleSyncTimes with the round's End time (the server's query start); any
+ *   per-item persist mid-round survives a crash and leaves a cursor past un-pulled items
+ *   (settleSyncTimes' rollback only runs when onClose/cancelSync is reached);
+ * - Never persist before this connection completed one clean round: the offline backlog
+ *   is unaligned, and a live broadcast / edit Ack pushing the cursor to "now" hides the
+ *   whole offline window (#101: even a manual sync can't pull it back — the server only
+ *   queries updated_timestamp >= cursor);
+ * - Otherwise (idle online, first round done) advance monotonically after the handler
+ *   itself succeeded — avoids re-pulling just-handled live changes after a restart.
+ */
+export function advanceLiveSyncTime(plugin: { isSyncing?: boolean; localStorageManager: { getMetadata(k: string): unknown; setMetadata(k: string, v: unknown): void }; syncState: { activeSyncContext: string | null; hasSyncedThisConnection: boolean } }, field: SyncTimeField, lastTime: number | undefined): void {
+  if (!lastTime) return;
+  if (plugin.isSyncing || plugin.syncState.activeSyncContext !== null) return;
+  if (!plugin.syncState.hasSyncedThisConnection) return;
+  if (lastTime > Number(plugin.localStorageManager.getMetadata(field))) {
+    plugin.localStorageManager.setMetadata(field, lastTime);
+  }
+}
+
 /**
  * Stats for a single sync type (notes / files / configs / folders).
  * 单类同步任务的统计数据（笔记 / 文件 / 配置 / 文件夹）。
@@ -78,10 +112,61 @@ export class SyncState {
   isFirstSync = false;
   /** 是否正在等待清理确认以便后续同步 / Whether waiting for clear-sync confirmation */
   isWaitClearSync = false;
+  /**
+   * 本连接是否已至少正常完成过一轮同步（service#101 游标止损）。
+   * 连接鉴权成功与断线时置 false；checkSyncCompletion 判定一轮正常完成（无失败、未被离线
+   * 保护拦截）时置 true。轮次未参与的类型不算未完成：advanceLiveSyncTime 只推进当前处理
+   * 类型自己的游标，参与类型完成的轮次已把该类型离线增量对齐；未参与类型的单条实时消息
+   * 仍会被标志挡住（它们发生在参与类型完成之前或之后的空闲期——参与类型完成前 isSyncing
+   * 仍为 true）。保守规则：取消/失败/离线保护拦截/停滞重启的轮次一律不置 true。
+   * Whether this connection has completed at least one round normally (service#101 cursor
+   * guard). Set false on auth success and on disconnect; set true in checkSyncCompletion
+   * when a round completes cleanly (no failures, not intercepted by the offline guard).
+   * Types not participating in a round don't count as unfinished: advanceLiveSyncTime only
+   * advances the cursor of the type being handled, and the participating types' offline
+   * backlog was aligned by that round. Conservative rule: cancelled / failed / offline-guard
+   * intercepted / stall-restarted rounds never set the flag.
+   */
+  hasSyncedThisConnection = false;
   /** 当前同步类型 / Current sync type */
   currentSyncType: "full" | "incremental" = "incremental";
+  /**
+   * 本机已作废的历史同步 context（最近 16 个）。活跃 context 被置空或被新轮替换时，
+   * 旧值进此集合：websocket_manager 据此区分「本机上一轮的迟到应答」（照旧丢弃）与
+   * 「其它设备的实时广播 / 无 context 应答」（延后到本轮结束再处理）。
+   * Recently retired sync contexts of this client (last 16). When the active context is
+   * cleared or superseded, the old value lands here so websocket_manager can tell late
+   * replies of this client's own old rounds (discard) apart from other devices' live
+   * broadcasts and contextless replies (defer until the round ends).
+   */
+  retiredSyncContexts = new Set<string>();
+  /**
+   * 活跃 context 被置空/替换时触发一次（在置空的调用栈里同步调用）；回放方必须异步调度，
+   * 不能在该调用栈里同步重入消息分发。由 websocket_manager 构造时注册。
+   * Fired once when the active context is cleared or superseded (synchronously in the
+   * clearing call stack); the replay side must schedule asynchronously and must not
+   * re-enter message dispatch synchronously. Registered by websocket_manager.
+   */
+  onSyncContextRetired?: () => void;
+
+  private _activeSyncContext: string | null = null;
   /** 当前活跃的同步上下文 UUID / Current active sync context UUID */
-  activeSyncContext: string | null = null;
+  get activeSyncContext(): string | null { return this._activeSyncContext; }
+  set activeSyncContext(value: string | null) {
+    const old = this._activeSyncContext;
+    this._activeSyncContext = value;
+    if (old !== null && old !== value) {
+      this.retiredSyncContexts.add(old);
+      // Set 迭代序即插入序：重复 add 不改变位置，淘汰最旧的即近似 FIFO / Set iteration
+      // order is insertion order: re-adding keeps position, evicting the first is approx. FIFO
+      while (this.retiredSyncContexts.size > 16) {
+        const oldest = this.retiredSyncContexts.values().next().value as string | undefined;
+        if (oldest === undefined) break;
+        this.retiredSyncContexts.delete(oldest);
+      }
+      this.onSyncContextRetired?.();
+    }
+  }
   /** 用户通过 ribbon 手动触发的待执行同步类型（断开时暂存，重连成功后执行）
    *  Pending sync type triggered manually via ribbon (stored when disconnected, executed after reconnect) */
   pendingSyncType: 'incremental' | 'full' | null = null;
@@ -95,6 +180,25 @@ export class SyncState {
    * silently reset the offline duration, defeating the guard on the very next round.
    */
   offlineGuardSkippedThisRound = false;
+
+  /**
+   * 本轮各类型同步请求所带的 lastTime（回滚基线），以及 XxxSyncEnd 下发、尚未落盘的 lastTime。
+   * 服务端先发 End 再分页下发明细，End 到达时明细还没处理；只有该类型全部完成且 failed=0 才把
+   * End 时间落盘，否则回到基线（连同本轮逐条推进的时间），下一轮按旧时间重拉。
+   * Per-type lastTime sent with this round's request (rollback baseline) and the XxxSyncEnd
+   * lastTime not yet persisted. The server sends End before the paged details, so End arrives
+   * before any detail is applied; it is persisted only when the type finished with failed=0,
+   * otherwise the stored time returns to the baseline and the next round re-pulls from there.
+   */
+  syncTimeBaseline = new Map<SyncTimeField, number>();
+  pendingSyncEndTime = new Map<SyncTimeField, number>();
+  /**
+   * 本轮扫描因达到 hashSyncLimit 而被截断跳过部分文件的同步字段集合。
+   * settleSyncTimes 会跳过这些字段的游标推进，防止被截断的已修改文件在下一轮因 mtime < 新游标而被永久跳过。
+   * Sync time fields whose vault scan was truncated by hashSyncLimit in this round.
+   * settleSyncTimes keeps them at baseline so skipped modified files aren't permanently bypassed next round.
+   */
+  truncatedSyncFields = new Set<SyncTimeField>();
 
   // ─── Per-type sync task statistics ───────────────────────────────────────────
   onCompletedChange?: (type: "note" | "file" | "setting" | "folder") => void;
@@ -240,6 +344,7 @@ export class SyncState {
     this.configSyncEnd = false;
     this.folderSyncEnd = false;
     this.offlineGuardSkippedThisRound = false;
+    this.truncatedSyncFields.clear();
     // 注意：不再清空 scannedXxxHashes。这些哈希是扫描期实打实算出来的，条目自带 mtime/size 校验，
     // 留到下一轮同步结束时提交依然有效；在这里清空会把上一轮（可能仍在收尾）算出的哈希白白丢掉，
     // 导致同一批文件每次同步都要重算。提交由 operator.ts 的 commitScannedHashes 按键移除。

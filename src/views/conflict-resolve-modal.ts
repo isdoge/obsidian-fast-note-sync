@@ -359,9 +359,7 @@ export class ConflictResolveModal extends Modal {
         };
 
         // Remove path from suppressed collection // 解除路径抑制
-        this.plugin.syncState.conflictedPaths.delete(this.file.path);
-        this.plugin.localStorageManager.setConflictedPaths(this.plugin.syncState.conflictedPaths);
-        this.plugin.statusBarManager.updateConflictBadge();
+        this.plugin.menuManager.removeConflictedPath(this.file.path);
 
         // 清理本地 conflict-notes 中的备份文件 (位于插件目录下，文件名附加路径哈希以防碰撞)
         try {
@@ -396,7 +394,10 @@ export class ConflictResolveModal extends Modal {
           console.error("Failed to clean up conflict-notes files on resolve:", e);
         }
 
-        await this.plugin.concurrencyLimiter.waitForSlot(this.file.path);
+        if (!await this.plugin.concurrencyLimiter.waitForSlot(this.file.path)) {
+          this.close();
+          return;
+        }
         void this.plugin.websocket.SendMessage("NoteModify", data);
 
         this.close();
@@ -626,7 +627,7 @@ export class ConflictResolveModal extends Modal {
       // (() => this.onClose()) here reads this.onClose lazily at call time,
       // which after the reassignment resolves back to the wrapper itself and
       // recurses until "Maximum call stack size exceeded".
-      const originalOnClose = this.onClose.bind(this);
+      const originalOnClose = this.onClose.bind(this) as () => void;
       this.onClose = () => {
         observer.disconnect();
         originalOnClose();

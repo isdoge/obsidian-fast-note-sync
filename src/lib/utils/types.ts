@@ -90,6 +90,14 @@ export interface FileSyncChunkDownloadMessage {
 }
 
 export interface FileDownloadSession {
+    /** Local state captured when the download was requested; checked before writing. */
+    commitGuard?: {
+        owner: object;
+        epoch: number;
+        file: import("obsidian").TFile | null;
+        mtime?: number;
+        size?: number;
+    };
     path: string;
     contentHash?: string;
     ctime: number;
@@ -104,6 +112,10 @@ export interface FileDownloadSession {
     /** 所属下载页（0-based），从 receiveFileSyncUpdate 的 pageIndex 透传，供分片下载会话完成时归账（见 ReceiveMessage.pageIndex 注释） */
     pageIndex?: number;
     initialSlotKey?: string;
+    /** Last time a response or chunk arrived for this session; used by the stalled-download watchdog */
+    lastActivityAt?: number;
+    /** 已进入组装/写盘阶段，看门狗跳过，避免与提交流程重复记账 / Assembling or writing; skipped by the watchdog to avoid double accounting */
+    committing?: boolean;
 }
 
 export interface ReceiveMtimeMessage {

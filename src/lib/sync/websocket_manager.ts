@@ -1,9 +1,10 @@
 import { moment, Platform, normalizePath } from "obsidian";
 
-import { handleFileChunkDownload, BINARY_PREFIX_FILE_SYNC, clearUploadQueue, receiveFileUploadSessionNotFound } from "./operator_file";
+import { invalidateFileDownloads, handleFileChunkDownload, BINARY_PREFIX_FILE_SYNC, clearUploadQueue, receiveFileUploadSessionNotFound } from "./operator_file";
+import { clearEmptyNoteProbes } from "./operator_note";
 import { dump, addRandomParam, showSyncNotice, safeStringify, getPluginDir, hashContent } from "../utils/helpers";
 import { enSendDTOToProtobuf, deReceivePacket } from "../../pb/protobuf_mapper";
-import { receiveOperators, startupSync, startupFullSync, settleAllBatchSendSessionsOnClose } from "./operator";
+import { receiveOperators, startupSync, startupFullSync, settleAllBatchSendSessionsOnClose, settleSyncTimes } from "./operator";
 import { SyncLogManager } from "./sync_log_manager";
 import * as WSAction from "./websocket_action";
 import { WebSocketClient } from "./websocket_client";
@@ -79,11 +80,32 @@ export class WebSocketManager {
   public client: WebSocketClient;
   private plugin: FastSync;
   private currentStartHandleId = 0;
+  private receivedFileDetails = new Set<string>();
+  private receivedFileContext: string | null = null;
   // startupDelay 按设置文案（setting.sync.startup_delay_desc）本意是只延迟"首次"检查更新，
   // 用于错开 Obsidian 启动时其他插件并发加载造成的卡顿；不应在每次断线重连时都重复套用。
   // startupDelay is documented as delaying only the "first" update check, to avoid contending
   // with other plugins loading at Obsidian startup — it should not be re-applied on every reconnect.
   private hasAppliedStartupDelay = false;
+  // 仅在本次插件会话禁用 protobuf，不修改用户保存的设置；插件重启后仍先尝试 protobuf。
+  // Disable protobuf only for this plugin session, preserving the saved setting for the next launch.
+  private hasProtobufDecodeFailed = false;
+
+  // ─── 活跃同步期间它源消息的延后队列 ───────────────────────────────────────────
+  // 一轮同步进行中（activeSyncContext 非空）时，context 不匹配且不属于本机已作废 context 的
+  // 消息（其它设备的实时广播、本机无 context 请求的应答如 #205 的 NoteRePush 回包）不再丢弃，
+  // 而是进此队列，本轮结束（activeSyncContext 置空，setter 触发 onSyncContextRetired）后按到达
+  // 顺序走与实时分发完全相同的路径回放。回放中新一轮开始则剩余消息留队等下一次。断线清空。
+  // While a sync round is active, messages whose context mismatches but is not one of this
+  // client's retired contexts (other devices' live broadcasts, replies to this client's
+  // contextless requests such as #205's NoteRePush round trip) are deferred here instead of
+  // being dropped; they replay through the exact same dispatch path in arrival order once the
+  // round ends (the activeSyncContext setter fires onSyncContextRetired). If a new round
+  // starts mid-replay the rest stays queued for the next drain. Cleared on disconnect.
+  private deferredMessages: { action: string; data: StructuredMessageData }[] = [];
+  private deferredBytes = 0;
+  private replayScheduled = false;
+  private deferredOverflowed = false;
 
   // --- 轻量事件总线，用于分批发送时等待服务端 BatchAck ---
   // Lightweight event bus for awaiting server BatchAck during batch send
@@ -124,6 +146,12 @@ export class WebSocketManager {
 
   constructor(plugin: FastSync) {
     this.plugin = plugin;
+    // 活跃同步 context 置空/替换（近十处分散写入点）时，由此集中触发延后队列回放；
+    // 回放异步调度，不在置空的调用栈里同步重入分发
+    // Clearing/superseding the active sync context (scattered write sites) centrally triggers
+    // the deferred-queue replay here; replay is scheduled async, never re-entering dispatch
+    // synchronously inside the clearing call stack
+    this.plugin.syncState.onSyncContextRetired = () => this.scheduleDeferredReplay();
     this.client = new WebSocketClient(this.plugin, {
       getWsUrl: (count) => {
         const client = CLIENT_TYPE;
@@ -134,7 +162,7 @@ export class WebSocketManager {
         const useProtoParam = "&protocol=protobuf";
         // pv=2：声明客户端支持 v2 握手协商（auth 响应携带协商块、窗口流水线、pb 提前升级）
         // pb=1/0：客户端本地 protobufEnabled 设置，供服务端判定是否提前升级 pb（设计稿 §2.2）
-        const isProtobufEnabled = this.plugin.settings.protobufEnabled !== false;
+        const isProtobufEnabled = this.isProtobufEnabled();
         const negotiationParams = "&pv=2&pb=" + (isProtobufEnabled ? "1" : "0");
         return addRandomParam(
           this.plugin.runWsApi +
@@ -164,6 +192,8 @@ export class WebSocketManager {
         dump("Service authorization");
       },
       onClose: (client, code, reason) => {
+        SyncLogManager.getInstance().addLog('error', 'ConnectionClosed',
+          `WebSocket closed: ${code} ${reason}`, 'error');
         if (this.plugin.isSyncing) {
           this.plugin.isSyncing = false;
           this.plugin.isSyncRequesting = false;
@@ -173,7 +203,25 @@ export class WebSocketManager {
           // in-flight scan bails out at its next yield point instead of scanning to completion
           // and sending a full round under a dead context.
           this.plugin.syncState.activeSyncContext = null;
+          // 本轮未完成：已推进的同步时间回到本轮基线 / Unfinished round: sync times return to the baseline
+          settleSyncTimes(this.plugin, true);
         }
+        // 旧连接上的延后消息不该在新连接上处理（其 vault/会话前提可能已失效）；
+        // 断线后本轮游标回基线，重连的增量同步会重新拉这些变更
+        // Deferred messages from the closed connection must not run on a new one (their
+        // vault/session assumptions may be stale); the round's cursor fell back to its
+        // baseline, so the post-reconnect incremental sync re-pulls those changes
+        this.clearDeferredMessages();
+        this.receivedFileDetails.clear();
+        // 断线即失去"本连接已对齐"的保证：单条消息推进游标的许可随连接失效（service#101）
+        // Disconnect voids the "this connection is aligned" guarantee: the per-item cursor
+        // advance permission expires with the connection (service#101)
+        this.plugin.syncState.hasSyncedThisConnection = false;
+        // #205：断线后空白笔记探测的结论不会再到达，作废在途/已确认标记，重连后重新探测
+        // #205: no probe verdict can arrive after the drop; void the marks so reconnect re-probes
+        clearEmptyNoteProbes(this.plugin);
+        // Downloads requested on the closed connection may no longer commit.
+        invalidateFileDownloads(this.plugin);
         clearUploadQueue();
         this.plugin.concurrencyLimiter.clear();
         // 断线：清空所有在途上行批发送窗口会话的重传 timer（设计稿 §3.2 异常路径表）；
@@ -184,10 +232,25 @@ export class WebSocketManager {
         this.handleStructuredMessage(action, data);
       },
       serializeMessage: (action, payload) => {
+        // 防御性守卫：client.useProtobuf 与设置变更都会在发送前挡住此回调，正常不可达；
+        // 即便到达，WebSocketClient.Send 也会捕获并退回 JSON 文本帧，消息不会丢失。
+        // Defensive guard: client.useProtobuf and the settings check keep this unreachable;
+        // even if reached, WebSocketClient.Send catches and falls back to a JSON text frame.
+        if (!this.isProtobufEnabled()) {
+          throw new Error("Protobuf disabled after a decode failure");
+        }
         return enSendDTOToProtobuf(action, payload);
       },
       deserializeMessage: (data) => {
-        return deReceivePacket(data) as unknown as { action: string;[key: string]: unknown };
+        if (this.hasProtobufDecodeFailed) {
+          return null;
+        }
+        try {
+          return deReceivePacket(data) as unknown as { action: string;[key: string]: unknown };
+        } catch {
+          this.fallbackToJsonAfterProtobufDecodeFailure();
+          return null;
+        }
       },
     });
 
@@ -195,6 +258,39 @@ export class WebSocketManager {
     this.client.registerBinaryHandler(BINARY_PREFIX_FILE_SYNC, (data) => {
       void handleFileChunkDownload(data, this.plugin);
     });
+  }
+
+  private isProtobufEnabled(): boolean {
+    return !this.hasProtobufDecodeFailed && this.plugin.settings.protobufEnabled !== false;
+  }
+
+  /**
+   * 服务端会分别处理文本 JSON 帧，且 ClientInfo(protobuf=false) 会关闭本连接的 protobuf。
+   * 因而不必断开连接；本会话后续重连则通过握手 pb=0 保持 JSON。
+   * The server parses text JSON frames separately and ClientInfo(protobuf=false) disables
+   * protobuf for this connection, so reconnecting is unnecessary. pb=0 keeps later reconnects on JSON.
+   */
+  private fallbackToJsonAfterProtobufDecodeFailure(): void {
+    if (this.hasProtobufDecodeFailed) {
+      return;
+    }
+    this.hasProtobufDecodeFailed = true;
+    this.client.useProtobuf = false;
+
+    // 每次插件会话只提示一次，鉴权前后的失败路径都走这里。
+    // Notify once per plugin session, on both the pre-auth and post-auth paths.
+    const message = $("ui.notice.protobuf_fallback");
+    showSyncNotice(message);
+    SyncLogManager.getInstance().addLog('error', 'ProtobufFallback', message, 'error');
+
+    if (!this.client.isAuth) {
+      // 降级帧需要已认证连接；若解码在鉴权前失败，用 pb=0 的新连接完成握手。
+      // The downgrade frame requires authentication; reconnect with pb=0 if it failed earlier.
+      this.triggerReconnect();
+      return;
+    }
+
+    this.sendClientInfo();
   }
 
   // 代理一些 WebSocketClient 的方法和属性以保持向后兼容性
@@ -348,13 +444,19 @@ export class WebSocketManager {
           this.plugin.syncState.negotiated = negotiated;
           // protobufAck===true：服务端已在 auth 响应后提前 setUseProtobuf，本连接后续下行帧即为 pb，
           // 客户端同步跟进，无需再等 ClientInfo 响应触发升级（websocket_client.ts:259 该触发仍保留作旧服务端路径）
-          if (nego.protobufAck === true && this.plugin.settings.protobufEnabled !== false) {
+          if (nego.protobufAck === true && this.isProtobufEnabled()) {
             this.client.useProtobuf = true;
             dump("WS Client upgraded to Protobuf via auth negotiation (pv2)");
           }
         }
 
         dump("Service authorization success");
+        // 新连接：离线增量尚未对齐，单条实时消息不得推进游标，直到本连接完成一轮正常同步
+        //（service#101，见 sync_state.hasSyncedThisConnection）
+        // New connection: the offline backlog is unaligned, per-item live messages must not
+        // advance the cursor until this connection completes one clean round
+        // (service#101, see sync_state.hasSyncedThisConnection)
+        this.plugin.syncState.hasSyncedThisConnection = false;
         this.client.notifyStatusChange(true);
 
         this.sendClientInfo();
@@ -394,7 +496,19 @@ export class WebSocketManager {
       } else {
         const errorMsg = data.message || "";
         const errorDetails = data.details ? " Details=" + data.details : "";
-        showSyncNotice("Service Error: Code=" + data.code + " Message=" + errorMsg + errorDetails);
+        // 服务端已成功解码外层响应，但客户端上行 protobuf 的内层 DTO 解码失败。
+        // The server decoded this error envelope, but rejected our uplink protobuf DTO.
+        const isProtobufDecodeError = /(?:^|,\s*)(?:body:\s*)?Protobuf decode failed:/i.test(data.details || "");
+        if (isProtobufDecodeError) {
+          // 仅这类解码错误区别对待：protobuf 仍启用则回退到 JSON；已回退则静默忽略迟到的同类错误。
+          // Only decode errors are special-cased: fall back while protobuf is still enabled,
+          // and silently drop late duplicates afterwards. All other errors keep their notice.
+          if (this.isProtobufEnabled()) {
+            this.fallbackToJsonAfterProtobufDecodeFailure();
+          }
+        } else {
+          showSyncNotice("Service Error: Code=" + data.code + " Message=" + errorMsg + errorDetails);
+        }
         
         // 如果错误数据里含有 sessionID 或 path，也进行释放和清理，防止同步卡死
         // If error payload contains sessionID or path, release slot and increment completed to prevent deadlock
@@ -412,19 +526,51 @@ export class WebSocketManager {
         return;
       }
 
-      // 基于 Context 进行过滤：如果处于活跃的同步中，必须完全匹配
-      // Filter based on Context: if there's an active sync context, incoming messages (including Acks) must match
+      // 基于 Context 进行过滤：活跃同步中必须完全匹配；不匹配时区分两类——
+      // 本机已作废 context（上一轮的迟到应答）照旧丢弃；其它来源（其它设备的实时广播、
+      // 本机无 context 请求的应答）延后到本轮结束再处理，不再直接丢弃
+      // Context filter: during an active round messages must match. On mismatch, retired
+      // contexts of this client (late replies of the previous round) are still discarded;
+      // other sources (other devices' live broadcasts, replies to this client's contextless
+      // requests) are deferred until the round ends instead of being dropped outright
+      // 本机已作废 context 的迟到应答，没有活跃轮次时同样丢弃：取消同步或停滞重启后，服务端
+      // 已发出的旧轮次消息不能继续落地，更不能凭旧 context 回分页确认把被取消的轮次接着跑完
+      // Late replies carrying a retired context of this client are discarded when idle too:
+      // after a cancel or stall restart the old round's in-flight messages must not be applied,
+      // nor may their page acks keep driving the cancelled round to the end
+      if (data.context && data.context !== this.plugin.syncState.activeSyncContext
+        && this.plugin.syncState.retiredSyncContexts.has(data.context)) {
+        dump(`[SyncContext] Discard message ${msgAction} due to mismatched context. Expected: ${this.plugin.syncState.activeSyncContext}, Got: ${data.context}`);
+        return;
+      }
       if (this.plugin.syncState.activeSyncContext) {
         const isControlMsg = msgAction === WSAction.ClientReceiveAuth || msgAction === WSAction.ClientReceiveInfo;
-        if (!isControlMsg && data.context !== this.plugin.syncState.activeSyncContext) {
-          dump(`[SyncContext] Discard message ${msgAction} due to mismatched context. Expected: ${this.plugin.syncState.activeSyncContext}, Got: ${data.context}`);
+        // Older servers omit context on the UpdateMtime response to NoteModify.
+        // Only admit a contextless response for a pending upload in this client.
+        const isPendingMtimeAck = msgAction === WSAction.NoteSyncMtime && !data.context
+          && typeof data.data?.path === 'string'
+          && this.plugin.pendingNoteModifies.has(data.data.path);
+        if (!isControlMsg && !isPendingMtimeAck && data.context !== this.plugin.syncState.activeSyncContext) {
+          this.enqueueDeferredMessage(msgAction, data);
           return;
         }
       }
 
-      const handler = receiveOperators.get(msgAction);
-      if (handler) {
-        // WSResponse 信封 pageIndex 转换（设计稿 §4.3，唯一转换点）：线上 1-based，
+      this.dispatchReceiveMessage(msgAction, data);
+    }
+  }
+
+  /**
+   * 实时与延后回放共用的分发路径（原 handleStructuredMessage 尾段原样抽出）：vault 校验已在上游
+   * 完成，此处做 pageIndex 转换、context 合并、重传去重并调用 handler。
+   * Shared dispatch path for live and deferred replay (extracted verbatim from the former
+   * tail of handleStructuredMessage): vault filtering already happened upstream; this does
+   * the pageIndex conversion, context merge, retransmission dedup and handler invocation.
+   */
+  private dispatchReceiveMessage(msgAction: string, data: StructuredMessageData) {
+    const handler = receiveOperators.get(msgAction);
+    if (!handler) return;
+    // WSResponse 信封 pageIndex 转换（设计稿 §4.3，唯一转换点）：线上 1-based，
         // 0/undefined = 非分页消息（不并入 payload，下游按 undefined 走旧路径）；
         // n>0 = 下载第 n-1 页，转换为内部 0-based 值并入 payload.pageIndex
         // WSResponse envelope pageIndex conversion (design §4.3, the single conversion point):
@@ -441,10 +587,90 @@ export class WebSocketManager {
           if (pageIndex !== undefined) merged.pageIndex = pageIndex;
           payload = merged;
         }
-        void handler(payload, this.plugin);
+        this.receivedFileDetails ??= new Set<string>();
+        const context = this.plugin.syncState.activeSyncContext;
+        if (this.receivedFileContext !== context) {
+          this.receivedFileDetails.clear();
+          this.receivedFileContext = context;
+        }
+        // Retransmission must not enqueue the same page item again while it is
+        // waiting for a slot or already processed. Non-paged live edits bypass this.
+        const path = (payload as { path?: string })?.path;
+        const detailKey = context && pageIndex !== undefined && typeof path === 'string'
+          && [WSAction.FileSyncUpdate, WSAction.FileUpload, WSAction.FileSyncMtime,
+              WSAction.FileSyncDelete, WSAction.FileSyncRename].includes(msgAction)
+          ? JSON.stringify([context, pageIndex, msgAction, path]) : null;
+        if (detailKey && this.receivedFileDetails.has(detailKey)) return;
+        if (detailKey) this.receivedFileDetails.add(detailKey);
+        void Promise.resolve(handler(payload, this.plugin)).catch(error => {
+          if (detailKey) this.receivedFileDetails.delete(detailKey);
+          dump('Sync handler failed', msgAction, error);
+        });
         this.client.notifyActivity();
-      }
+  }
+
+  // ─── 延后队列（见类顶部字段注释 / see class-top field comment）──────────────
+
+  /** 队列上限：条数与序列化字节数，防 NoteSyncModify 带正文撑爆内存；超限丢弃新消息并 dump */
+  private static readonly DEFERRED_MAX_COUNT = 500;
+  private static readonly DEFERRED_MAX_BYTES = 8 * 1024 * 1024;
+
+  private enqueueDeferredMessage(action: string, data: StructuredMessageData): void {
+    if (!receiveOperators.has(action)) return;
+    const size = WebSocketManager.stringifySize(data);
+    if (this.deferredMessages.length >= WebSocketManager.DEFERRED_MAX_COUNT
+      || this.deferredBytes + size > WebSocketManager.DEFERRED_MAX_BYTES) {
+      dump(`[SyncContext] Deferred queue overflow (${this.deferredMessages.length} items, ${this.deferredBytes} bytes); discard incoming ${action}`);
+      this.deferredOverflowed = true;
+      return;
     }
+    this.deferredMessages.push({ action, data });
+    this.deferredBytes += size;
+    dump(`[SyncContext] Deferring message ${action} (context: ${data.context || "none"}) until the active round ends; queued: ${this.deferredMessages.length}`);
+  }
+
+  /** 轮次结束（activeSyncContext 置空/替换）时异步调度回放；不在置空调用栈里同步重入 */
+  private scheduleDeferredReplay(): void {
+    if ((this.deferredMessages.length === 0 && !this.deferredOverflowed) || this.replayScheduled) return;
+    this.replayScheduled = true;
+    window.setTimeout(() => {
+      this.replayScheduled = false;
+      this.drainDeferredMessages();
+    }, 0);
+  }
+
+  private drainDeferredMessages(): void {
+    // 队列溢出丢过消息：回放其余消息时不能再推进同步时间，否则会越过被丢弃的那条。
+    // 退回"本连接尚未完成同步"的状态，等下一轮同步按已结算的时间重新拉取
+    // Messages were dropped on overflow: replaying the rest must not advance the sync cursor past
+    // the dropped ones. Fall back to "no clean round on this connection" until the next round
+    // re-pulls from the settled cursor
+    if (this.deferredOverflowed) {
+      this.deferredOverflowed = false;
+      this.plugin.syncState.hasSyncedThisConnection = false;
+    }
+    // 回放期间新一轮同步已开始：剩余消息留队，等该轮结束的下次触发
+    // A new round started mid-replay: leave the rest queued for that round's next trigger
+    while (this.deferredMessages.length > 0 && !this.plugin.syncState.activeSyncContext) {
+      const { action, data } = this.deferredMessages.shift()!;
+      this.deferredBytes -= WebSocketManager.stringifySize(data);
+      this.handleStructuredMessage(action, data);
+    }
+  }
+
+  private static stringifySize(data: StructuredMessageData): number {
+    try { return safeStringify(data).length; } catch { return 2048; }
+  }
+
+  /** 断线清空：旧连接上的消息不该在新连接上处理；重连后增量同步按基线游标重新拉 */
+  private clearDeferredMessages(): void {
+    if (this.deferredMessages.length > 0) {
+      dump(`[SyncContext] Connection closed; dropping ${this.deferredMessages.length} deferred messages`);
+    }
+    this.deferredMessages = [];
+    this.deferredBytes = 0;
+    this.replayScheduled = false;
+    this.deferredOverflowed = false;
   }
 
   public sendClientInfo() {
@@ -453,7 +679,7 @@ export class WebSocketManager {
     }
 
     const clientName = this.plugin.getClientName();
-    const isProtobufEnabled = this.plugin.settings.protobufEnabled !== false;
+    const isProtobufEnabled = this.isProtobufEnabled();
 
     if (!isProtobufEnabled) {
       // Reset client's Protobuf flag immediately to fallback to JSON format
@@ -515,7 +741,7 @@ export class WebSocketManager {
       while (!this.plugin.fileHashManager || !this.plugin.fileHashManager.isReady()) {
         if (Date.now() - startTime > maxWaitTime) {
           dump(`FileHashManager initialization timeout after ${maxWaitTime}ms`);
-          showSyncNotice("文件哈希管理器初始化超时,同步可能不稳定");
+          showSyncNotice($("ui.notice.file_hash_manager_timeout"));
           break;
         }
         await new Promise((resolve) => window.setTimeout(resolve, 100));

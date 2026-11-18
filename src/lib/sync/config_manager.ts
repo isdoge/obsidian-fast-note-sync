@@ -1,7 +1,7 @@
 import { normalizePath } from "obsidian";
 
-import { dump, dumpError, getFileName, getDirNameOrEmpty, configAddPathExcluded, isPathInConfigSyncDirs, getConfigSyncCustomDirs, isInWhitelist, getPluginDir } from "../utils/helpers";
-import { CONFIG_PLUGIN_EXTS_TO_WATCH, CONFIG_ROOT_FILES_EXCLUDE, CONFIG_THEME_EXTS_TO_WATCH, configModify, configDelete, configAllPaths } from "./operator_config";
+import { dump, dumpError, getFileName, getDirNameOrEmpty, configAddPathExcluded, isPathInConfigSyncDirs, getConfigSyncCustomDirs, isInWhitelist, getPluginDir, configIsPathExcluded } from "../utils/helpers";
+import { CONFIG_PLUGIN_EXTS_TO_WATCH, CONFIG_ROOT_FILES_EXCLUDE, CONFIG_THEME_EXTS_TO_WATCH, configModify, configDelete, configAllPaths, isPluginConfigPathExcluded } from "./operator_config";
 import type FastSync from "../../main";
 
 
@@ -10,6 +10,8 @@ export class ConfigManager {
   private pluginDir: string = ""
   private pluginRealDir: string = ""
   private fileStates: Map<string, number> = new Map()
+  private watchedCustomDirs: Set<string> = new Set()
+  private customDirWatchCleanups: Map<string, () => Promise<void> | void> = new Map()
   private rootFilesExclude: string[] = []
   private pluginExtsToWatch: string[] = []
   private themeExtsToWatch: string[] = []
@@ -31,26 +33,104 @@ export class ConfigManager {
 
     void this.loadEnabledPlugins()
     void this.initializeFileStates()
+    void this.watchCustomDirs()
+  }
+
+  public async reloadCustomDirs() {
+    await this.watchCustomDirs()
+    await this.initializeFileStates()
+  }
+
+  public async stop() {
+    await this.clearCustomDirWatches()
+  }
+
+  private async clearCustomDirWatches() {
+    const adapter = this.plugin.app.vault.adapter as typeof this.plugin.app.vault.adapter & {
+      unwatch?: (path: string) => Promise<void> | void
+    }
+    for (const dir of Array.from(this.watchedCustomDirs)) {
+      const cleanup = this.customDirWatchCleanups.get(dir)
+      if (cleanup) {
+        this.customDirWatchCleanups.delete(dir)
+        try {
+          await cleanup()
+        } catch (e) {
+          dumpError(`ConfigManager: Failed to cleanup custom directory watcher ${dir}`, e)
+        }
+        this.watchedCustomDirs.delete(dir)
+      } else if (typeof adapter.unwatch === "function") {
+        try {
+          await adapter.unwatch(dir)
+        } catch (e) {
+          dumpError(`ConfigManager: Failed to unwatch custom directory ${dir}`, e)
+        }
+        this.watchedCustomDirs.delete(dir)
+      }
+    }
+  }
+
+  private async watchCustomDirs() {
+    await this.clearCustomDirWatches()
+    if (!this.plugin.settings.configSyncEnabled) return
+    // Obsidian 默认不监听配置目录之外的隐藏目录；该内部能力并非所有适配器都有。
+    const adapter = this.plugin.app.vault.adapter as typeof this.plugin.app.vault.adapter & {
+      watchHiddenRecursive?: (path: string) => unknown
+    }
+    if (typeof adapter.watchHiddenRecursive !== "function") return
+    const configDir = this.plugin.app.vault.configDir
+    const dirs = new Set(getConfigSyncCustomDirs(this.plugin).map(dir => normalizePath(dir)))
+    for (const dir of dirs) {
+      const parts = dir.split("/")
+      if (dir.startsWith("/") || /^[A-Za-z]:/.test(dir) || /[*?]/.test(dir)
+        || parts.some(part => part === ".." || part === ".git" || part === ".trash")
+        || !parts.some(part => part.startsWith("."))
+        || dir === configDir || dir.startsWith(configDir + "/")
+        || configIsPathExcluded(dir, this.plugin)) continue
+      // 适配器未提供 unwatch/清理句柄时跳过已注册目录，避免重复挂接相同监听器
+      if (this.watchedCustomDirs.has(dir)) continue
+      try {
+        const result = await adapter.watchHiddenRecursive(dir)
+        this.watchedCustomDirs.add(dir)
+        if (typeof result === "function") {
+          this.customDirWatchCleanups.set(dir, result as () => Promise<void> | void)
+        } else if (result && typeof result === "object") {
+          const closable = result as { close?: () => Promise<void> | void; unwatch?: () => Promise<void> | void }
+          if (typeof closable.close === "function") {
+            this.customDirWatchCleanups.set(dir, () => closable.close!())
+          } else if (typeof closable.unwatch === "function") {
+            this.customDirWatchCleanups.set(dir, () => closable.unwatch!())
+          }
+        }
+      } catch (e) {
+        dumpError(`ConfigManager: Failed to watch custom directory ${dir}`, e)
+      }
+    }
   }
 
   private async initializeFileStates() {
-    if (!this.plugin.settings.configSyncEnabled) return
+    if (!this.plugin.settings.configSyncEnabled) {
+      this.fileStates.clear()
+      return
+    }
 
     const configDir = this.plugin.app.vault.configDir
     const customDirs = getConfigSyncCustomDirs(this.plugin)
     const paths = await configAllPaths([configDir, ...customDirs], this.plugin)
 
+    const nextStates = new Map<string, number>()
     for (const relPath of paths) {
       const fullPath = normalizePath(relPath)
       try {
         const stat = await this.plugin.app.vault.adapter.stat(fullPath)
         if (stat && stat.type === "file") {
-          this.fileStates.set(fullPath, stat.mtime)
+          nextStates.set(fullPath, stat.mtime)
         }
       } catch {
         // 忽略读取不到的单个文件
       }
     }
+    this.fileStates = nextStates
     dump("ConfigManager: Initialized fileStates with", this.fileStates.size, "files")
   }
 
@@ -58,10 +138,10 @@ export class ConfigManager {
     if (!this.plugin.settings.configSyncEnabled || this.plugin.isSyncing) return
 
     const configDir = this.plugin.app.vault.configDir
-    if (path.includes("/.git") || path.includes("/.DS_Store")) return
+    if (path.includes("/.git") || path.includes("/.DS_Store") || isPluginConfigPathExcluded(path, configDir)) return
 
     // 检查路径是否属于配置同步范畴
-    if (!isPathInConfigSyncDirs(path, this.plugin)) return
+    if (!isPathInConfigSyncDirs(path, this.plugin) || configIsPathExcluded(path, this.plugin)) return
 
     // 相对目录
     const relativePath = path
@@ -93,10 +173,10 @@ export class ConfigManager {
           if (parts.length === 2 && nameDir != "" && fileName == "") {
             // 目录变动
             shouldCheck = true
-          } else if (parts.length === 3 && nameDir != "" && fileName != "") {
-            // 受监控文件变动
-            const isPluginFile = topDir === "plugins" && this.pluginExtsToWatch.some(ext => fileName.endsWith(ext))
-            const isThemeFile = topDir === "themes" && this.themeExtsToWatch.some(ext => fileName.endsWith(ext))
+          } else if (parts.length >= 3 && nameDir != "" && fileName != "") {
+            // 插件文本资源允许位于子目录；主题维持原有的顶层规则。
+            const isPluginFile = topDir === "plugins" && this.pluginExtsToWatch.some(ext => fileName.toLowerCase().endsWith(ext))
+            const isThemeFile = topDir === "themes" && parts.length === 3 && this.themeExtsToWatch.some(ext => fileName.endsWith(ext))
             if (isPluginFile || isThemeFile) shouldCheck = true
           }
         } else if (topDir === "snippets" && parts.length === 2 && fileName.endsWith(".css")) {

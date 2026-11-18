@@ -1,7 +1,9 @@
+import { blockAliasedRemoteMutation } from "./remote_path_guard";
+import { advanceLiveSyncTime } from "./sync_state";
 import { TFolder, normalizePath } from "obsidian";
 
 import { SyncEndData, FolderSyncRenameMessage } from "../utils/types";
-import { hashContent, dump, dumpError, isFolderSyncPathExcluded, waitForFolderEmpty, vaultDelete, checkAndNotifyCaseConflict } from "../utils/helpers";
+import { hashContent, dump, dumpError, isFolderSyncPathExcluded, waitForFolderEmpty, checkAndNotifyCaseConflict, normalizeServerTimestamp } from "../utils/helpers";
 import { SyncLogManager } from "./sync_log_manager";
 import type FastSync from "../../main";
 
@@ -163,7 +165,7 @@ export const receiveFolderSyncModify = async function (data: { path: string, mti
     const normalizedPath = normalizePath(data.path)
 
     try {
-        await plugin.lockManager.withLock(normalizedPath, async () => {
+        const locked = await plugin.lockManager.withLock(normalizedPath, async () => {
             plugin.addIgnoredFile(normalizedPath)
             try {
                 const existingFolder = plugin.app.vault.getAbstractFileByPath(normalizedPath)
@@ -178,13 +180,27 @@ export const receiveFolderSyncModify = async function (data: { path: string, mti
                         }
                     }
                 }
-                plugin.folderSnapshotManager.setFolderMtime(normalizedPath, data.mtime || Date.now())
+                // 服务端历史数据可能存秒级 mtime（#461），比较前先归一化为毫秒（快照与
+                // lastFolderSyncTime 同为毫秒，秒级值会被误判为早于游标而跳过创建）
+                // Legacy server rows may hold second-scale mtime (#461); normalize before use. The
+                // snapshot and lastFolderSyncTime are both milliseconds; a seconds value would
+                // compare as older than the cursor and skip folder creation
+                plugin.folderSnapshotManager.setFolderMtime(normalizedPath, normalizeServerTimestamp(data.mtime) || Date.now())
             } finally {
                 window.setTimeout(() => {
                     plugin.removeIgnoredFile(normalizedPath)
                 }, 500);
             }
         }, { maxRetries: 5, retryInterval: 100 });
+        // 抢锁失败时任务未执行：按失败处理，不能计为完成
+        // Lock not acquired means the task never ran: count it as a failure, never as completed
+        if (locked === null) throw new Error("Path lock busy")
+        // 游标推进仅在处理成功后执行（service#101：本地失败/锁忙不越过未处理条目），
+        // 且经 advanceLiveSyncTime 统一门控（轮次中/首轮未完成不落盘）
+        // Advance the cursor only after the handler succeeded (service#101: a local failure or
+        // busy lock must not skip unprocessed items), through the advanceLiveSyncTime gate
+        // (no persist mid-round or before the first clean round)
+        advanceLiveSyncTime(plugin, "lastFolderSyncTime", data.lastTime)
     } catch (e) {
         dumpError(`[FastSync] Failed to receiveFolderSyncModify: ${normalizedPath}`, e);
         if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'FolderModify')) {
@@ -192,11 +208,6 @@ export const receiveFolderSyncModify = async function (data: { path: string, mti
         }
         plugin.folderSyncTasks.failed++
     } finally {
-        // 实时更新同步时间戳，与 note 端保持一致
-        // Update sync timestamp in real time, consistent with note side
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFolderSyncTime"))) {
-            plugin.localStorageManager.setMetadata("lastFolderSyncTime", data.lastTime)
-        }
         plugin.recordSyncCompleted('folder', data.pageIndex)
     }
 }
@@ -215,9 +226,10 @@ export const receiveFolderSyncDelete = async function (data: { path: string, las
     const normalizedPath = normalizePath(data.path)
 
     try {
-        await plugin.lockManager.withLock(normalizedPath, async () => {
+        const locked = await plugin.lockManager.withLock(normalizedPath, async () => {
             const folder = plugin.app.vault.getAbstractFileByPath(normalizedPath)
             if (folder instanceof TFolder) {
+                if (blockAliasedRemoteMutation(plugin, folder, data.path, "FolderDelete")) return
                 plugin.addIgnoredFile(normalizedPath)
                 try {
                     // 必须检测并等到 目录里的所有文件数量 为 0 之后再执行
@@ -231,9 +243,24 @@ export const receiveFolderSyncDelete = async function (data: { path: string, las
                         SyncLogManager.getInstance().addLog('receive', 'FolderDeleteSkipped', `目录非空，跳过删除，等待下轮同步: ${normalizedPath}`, 'cancelled', data.path);
                         return
                     }
+                    // 等待期间父目录可能已被清理，不再使用过期的目录对象。
+                    const currentFolder = plugin.app.vault.getAbstractFileByPath(normalizedPath)
+                    if (!currentFolder) {
+                        plugin.folderSnapshotManager.removeFolder(normalizedPath)
+                        return
+                    }
+                    if (currentFolder !== folder) return
                     // 记录待删除路径
+                    if (blockAliasedRemoteMutation(plugin, folder, data.path, "FolderDelete")) return
                     plugin.lastSyncPathDeleted.add(normalizedPath)
-                    await vaultDelete(plugin.app.vault, folder, true)
+                    try {
+                        await plugin.app.fileManager.trashFile(folder)
+                    } catch (e) {
+                        const missing = (e as { code?: string })?.code === "ENOENT"
+                            || (e instanceof Error && /\bENOENT\b/.test(e.message))
+                        // 仅在确认路径已消失时将 ENOENT 视为成功，其余错误保留。
+                        if (!missing || await plugin.app.vault.adapter.exists(normalizedPath)) throw e
+                    }
                     plugin.folderSnapshotManager.removeFolder(normalizedPath)
                 } finally {
                     window.setTimeout(() => {
@@ -243,16 +270,20 @@ export const receiveFolderSyncDelete = async function (data: { path: string, las
                 }
             }
         }, { maxRetries: 10, retryInterval: 200 });
+        // 抢锁失败时任务未执行：按失败处理，不能计为完成
+        // Lock not acquired means the task never ran: count it as a failure, never as completed
+        if (locked === null) throw new Error("Path lock busy")
+        // 游标推进仅在处理成功后执行（service#101：本地失败/锁忙不越过未处理条目），
+        // 且经 advanceLiveSyncTime 统一门控（轮次中/首轮未完成不落盘）
+        // Advance the cursor only after the handler succeeded (service#101: a local failure or
+        // busy lock must not skip unprocessed items), through the advanceLiveSyncTime gate
+        // (no persist mid-round or before the first clean round)
+        advanceLiveSyncTime(plugin, "lastFolderSyncTime", data.lastTime)
     } catch (e) {
         dumpError(`[FastSync] Failed to receiveFolderSyncDelete: ${normalizedPath}`, e);
         SyncLogManager.getInstance().addLog('receive', 'FolderDelete', e instanceof Error ? e.message : String(e), 'error', data.path);
         plugin.folderSyncTasks.failed++
     } finally {
-        // 实时更新同步时间戳，与 note 端保持一致
-        // Update sync timestamp in real time, consistent with note side
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFolderSyncTime"))) {
-            plugin.localStorageManager.setMetadata("lastFolderSyncTime", data.lastTime)
-        }
         plugin.recordSyncCompleted('folder', data.pageIndex)
     }
 }
@@ -273,9 +304,11 @@ export const receiveFolderSyncRename = async function (data: FolderSyncRenameMes
     const normalizedNewPath = normalizePath(data.path)
 
     try {
-        await plugin.lockManager.withLock(normalizedNewPath, async () => {
+        const locked = await plugin.lockManager.withLock(normalizedNewPath, async () => {
             const folder = plugin.app.vault.getAbstractFileByPath(normalizedOldPath)
             if (folder instanceof TFolder) {
+                if (blockAliasedRemoteMutation(plugin, folder, data.oldPath, "FolderRename")) return
+                if (blockAliasedRemoteMutation(plugin, plugin.app.vault.getAbstractFileByPath(normalizedNewPath), data.path, "FolderRename")) return
                 plugin.addIgnoredFile(normalizedNewPath)
                 plugin.addIgnoredFile(normalizedOldPath)
 
@@ -283,14 +316,34 @@ export const receiveFolderSyncRename = async function (data: FolderSyncRenameMes
                 plugin.lastSyncPathRenamed.add(normalizedNewPath)
 
                 try {
+                    // 目标父目录可能尚不存在（改名/移动到新目录）：rename 不建目录，先按 create
+                    // 路径的同一模式确保存在，否则 vault.rename 抛 ENOENT、改名被丢弃（两端永久不一致）
+                    // The target parent folder may not exist yet (rename/move into a new dir): rename
+                    // creates no folder, so ensure it with the same pattern as the create path, or
+                    // vault.rename throws ENOENT and the rename is dropped (permanent divergence)
+                    const targetParent = normalizedNewPath.split("/").slice(0, -1).join("/")
+                    if (targetParent !== "") {
+                        const dirExists = plugin.app.vault.getFolderByPath(targetParent)
+                        if (dirExists == null) {
+                            try {
+                                await plugin.app.vault.createFolder(targetParent)
+                            } catch (e) {
+                                // 并发竞争时只有一个调用成功，另一方忽略"已存在"错误
+                                // In concurrent race only one call succeeds; ignore "already exists" error
+                                if (!plugin.app.vault.getFolderByPath(targetParent)) throw e
+                            }
+                        }
+                    }
+
                     const target = plugin.app.vault.getAbstractFileByPath(normalizedNewPath)
-                    if (target) {
-                        await vaultDelete(plugin.app.vault, target, true)
+                    if (target && target !== folder) {
+                        await plugin.app.fileManager.trashFile(target)
                     }
 
                     await plugin.app.vault.rename(folder, normalizedNewPath)
                     plugin.folderSnapshotManager.removeFolder(normalizedOldPath)
-                    plugin.folderSnapshotManager.setFolderMtime(normalizedNewPath, data.mtime || Date.now())
+                    // 同上：归一化秒级 mtime（#461）/ Same as above: normalize second-scale mtime (#461)
+                    plugin.folderSnapshotManager.setFolderMtime(normalizedNewPath, normalizeServerTimestamp(data.mtime) || Date.now())
                 } finally {
                     window.setTimeout(() => {
                         plugin.removeIgnoredFile(normalizedNewPath)
@@ -308,10 +361,20 @@ export const receiveFolderSyncRename = async function (data: FolderSyncRenameMes
                             dump(`Folder create ignored (may already exist): ${normalizedNewPath}`, e)
                         }
                     }
-                    plugin.folderSnapshotManager.setFolderMtime(normalizedNewPath, data.mtime || Date.now())
+                    // 同上：归一化秒级 mtime（#461）/ Same as above: normalize second-scale mtime (#461)
+                    plugin.folderSnapshotManager.setFolderMtime(normalizedNewPath, normalizeServerTimestamp(data.mtime) || Date.now())
                 }
             }
         }, { maxRetries: 10, retryInterval: 100 });
+        // 抢锁失败时任务未执行：按失败处理，不能计为完成
+        // Lock not acquired means the task never ran: count it as a failure, never as completed
+        if (locked === null) throw new Error("Path lock busy")
+        // 游标推进仅在处理成功后执行（service#101：本地失败/锁忙不越过未处理条目），
+        // 且经 advanceLiveSyncTime 统一门控（轮次中/首轮未完成不落盘）
+        // Advance the cursor only after the handler succeeded (service#101: a local failure or
+        // busy lock must not skip unprocessed items), through the advanceLiveSyncTime gate
+        // (no persist mid-round or before the first clean round)
+        advanceLiveSyncTime(plugin, "lastFolderSyncTime", data.lastTime)
     } catch (e) {
         dumpError(`[FastSync] Failed to receiveFolderSyncRename: ${normalizedOldPath} -> ${normalizedNewPath}`, e);
         if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'FolderRename')) {
@@ -319,11 +382,6 @@ export const receiveFolderSyncRename = async function (data: FolderSyncRenameMes
         }
         plugin.folderSyncTasks.failed++
     } finally {
-        // 实时更新同步时间戳，与 note 端保持一致
-        // Update sync timestamp in real time, consistent with note side
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFolderSyncTime"))) {
-            plugin.localStorageManager.setMetadata("lastFolderSyncTime", data.lastTime)
-        }
         plugin.recordSyncCompleted('folder', data.pageIndex)
     }
 }
@@ -342,8 +400,8 @@ export const receiveFolderSyncEnd = async function (data: unknown, plugin: FastS
     plugin.folderSyncTasks.needSyncMtime = syncData.needSyncMtimeCount || 0
     plugin.folderSyncTasks.needDelete = syncData.needDeleteCount || 0
 
-    // 无条件更新 lastFolderSyncTime，确保包含服务端本轮同步后的所有异步操作（如 SyncResourceFID）
-    // Unconditionally update lastFolderSyncTime to cover all async server-side ops after this sync round (e.g., SyncResourceFID)
-    plugin.localStorageManager.setMetadata("lastFolderSyncTime", syncData.lastTime)
+    // End 先于明细到达：暂存 lastTime，待本类型全部完成且无失败时由 settleSyncTimes 落盘
+    // End arrives before the details: stash lastTime; settleSyncTimes persists it once the type finished without failures
+    plugin.syncState.pendingSyncEndTime.set("lastFolderSyncTime", syncData.lastTime)
     plugin.syncTypeCompleteCount++
 }

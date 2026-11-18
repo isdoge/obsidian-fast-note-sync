@@ -234,6 +234,8 @@ export const stringifyRules = function (rules: SyncRule[]): string {
 export const isPathExcluded = function (path: string, plugin: FastSync): boolean {
   const { syncExcludeFolders, syncExcludeExtensions, syncExcludeWhitelist } = plugin.settings
   const normalizedPath = path.replace(/\\/g, "/")
+  // Recovery copies must never be uploaded or deleted by remote sync, even with a whitelist.
+  if (normalizedPath === '.trash' || normalizedPath.startsWith('.trash/')) return true
 
   // 0. 检查白名单 (优先级最高)
   if (syncExcludeWhitelist) {
@@ -312,6 +314,8 @@ export const isInWhitelist = function (path: string, plugin: FastSync): boolean 
  */
 export const configIsPathExcluded = function (relativePath: string, plugin: FastSync): boolean {
   const normalizedPath = relativePath.replace(/\\/g, "/")
+  // Recovery copies must never be uploaded or deleted by remote sync, even with a whitelist.
+  if (normalizedPath === '.trash' || normalizedPath.startsWith('.trash/')) return true
   const { syncExcludeFolders, syncExcludeWhitelist } = plugin.settings
 
   // 固定排除插件自身的数据库和缓存文件，无论如何都不进行同步
@@ -644,6 +648,27 @@ export const getSafeCtime = function (stat: { ctime?: number; mtime?: number }):
 
 
 /**
+ * 归一化服务端传来的 ctime/mtime 为毫秒（haierkeys/fast-note-sync-service#461）
+ * 协议约定毫秒，但历史库中存在秒级记录（服务端已迁移存量，此处做接收侧兜底）：
+ * (0, 1e11) 区间（1e11 毫秒 = 1973-03-03，早于本项目的存在时间）视为秒并乘 1000；
+ * 其余值（0、负数、已是毫秒、undefined）原样返回。阈值与服务端 timex.NormalizeMilli 一致。
+ * 只在接收服务端单条记录时调用；不修改发往服务端的时间戳。
+ * Normalize a server-sent ctime/mtime to milliseconds (haierkeys/fast-note-sync-service#461).
+ * The protocol says milliseconds, but legacy rows stored seconds (the server migrates its own
+ * data; this guards the receive side): values in (0, 1e11) — 1e11 ms is 1973-03-03, earlier
+ * than this project exists — are treated as seconds and multiplied by 1000; anything else
+ * (0, negative, already milliseconds, undefined) is returned unchanged. Threshold matches the
+ * server's timex.NormalizeMilli. Call when receiving a server record only; never touch
+ * timestamps sent to the server.
+ */
+export function normalizeServerTimestamp(ts: number): number;
+export function normalizeServerTimestamp(ts: number | undefined): number | undefined;
+export function normalizeServerTimestamp(ts: number | undefined): number | undefined {
+  if (ts === undefined) return undefined
+  return ts > 0 && ts < 100_000_000_000 ? ts * 1000 : ts
+}
+
+/**
  * 延迟执行 (让出主线程)
  */
 export const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms))
@@ -655,7 +680,12 @@ export const yieldToMain = (): Promise<void> => {
   return new Promise((resolve) => {
     if (typeof MessageChannel !== "undefined") {
       const channel = new MessageChannel()
-      channel.port1.onmessage = () => resolve()
+      channel.port1.onmessage = () => {
+        channel.port1.onmessage = null
+        channel.port1.close()
+        channel.port2.close()
+        resolve()
+      }
       channel.port2.postMessage(null)
     } else {
       window.setTimeout(resolve, 0)
@@ -721,7 +751,7 @@ export class LocalStateFileMirror {
       if (!exists) return null;
       return await this.plugin.app.vault.adapter.read(this.mirrorPath);
     } catch (error) {
-      dump(`LocalStateFileMirror: 读取镜像文件失败: ${this.mirrorPath}`, error);
+      dump(`LocalStateFileMirror: failed to read mirror file: ${this.mirrorPath}`, error);
       return null;
     }
   }
@@ -753,7 +783,7 @@ export class LocalStateFileMirror {
     const data = this.latestData;
     void this.plugin.app.vault.adapter.write(this.mirrorPath, data)
       .catch((error) => {
-        dump(`LocalStateFileMirror: 写入镜像文件失败: ${this.mirrorPath}`, error);
+        dump(`LocalStateFileMirror: failed to write mirror file: ${this.mirrorPath}`, error);
       })
       .finally(() => {
         this.isWriting = false;

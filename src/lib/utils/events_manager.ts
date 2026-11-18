@@ -17,15 +17,30 @@ export class EventManager {
   private pendingRenamePaths: Set<string> = new Set()
   private blurTimer: number | null = null
   private resumeTimer: number | null = null
+  // 注册/认证/抢锁重试定时器，stop()（含插件卸载）时统一清理
+  // Registration / auth / lock retry timers; all cleared by stop() (including plugin unload)
+  private retryTimers: Set<number> = new Set()
 
   constructor(plugin: FastSync) {
     this.plugin = plugin
   }
 
-  public registerEvents() {
+  public registerEvents(attempt: number = 0) {
     // 添加哈希表就绪检查
+    // fileHashManager 在大库上加载较慢（十万级条目耗时数秒），若此刻未就绪就 return，
+    // watcher 将永远不会注册——本 vault 整个会话的所有文件事件都被静默丢弃。
+    // 改为每秒重试、最多 30 分钟，超过才放弃（此时大概率是加载真的失败）。
     if (!this.plugin.fileHashManager || !this.plugin.fileHashManager.isReady()) {
-      dump("EventManager: 文件哈希管理器未就绪,跳过事件注册")
+      if (attempt < 1800) {
+        if (attempt === 0) {
+          dump("EventManager: fileHashManager not ready, retrying event registration")
+          // 注册成功前卸载也要停掉重试 / Stop retrying if the plugin unloads before registration succeeds
+          this.plugin.register(() => this.stop())
+        }
+        this.scheduleRetry(() => this.registerEvents(attempt + 1), 1000)
+      } else {
+        dump("EventManager: fileHashManager never became ready, vault watchers NOT registered")
+      }
       return
     }
 
@@ -68,6 +83,8 @@ export class EventManager {
   public stop() {
     this.rawEventTimers.forEach((timer) => window.clearTimeout(timer))
     this.rawEventTimers.clear()
+    this.retryTimers.forEach((timer) => window.clearTimeout(timer))
+    this.retryTimers.clear()
     this.pendingRenamePaths.clear()
     if (this.blurTimer) {
       window.clearTimeout(this.blurTimer)
@@ -144,7 +161,7 @@ export class EventManager {
   private onVisibilityChange = () => {
     if (activeDocument.visibilityState === "hidden") {
       if (this.plugin.settings.autoPauseMinimized) {
-        dump("Obsidian 已最小化，自动暂停同步")
+        dump("Obsidian minimized, auto-pausing sync")
         this.plugin.websocket?.unRegister()
       }
     } else {
@@ -157,9 +174,37 @@ export class EventManager {
     }
   }
 
+  /**
+   * WebSocket 未认证时，vault 事件不应静默丢弃——否则在断线/重连期间发生的本地修改
+   * 既不上报也无墓碑记录，下一轮全量对账会把远端旧文件反向回灌，出现"删了又复活"。
+   * 这里做内存级重试：每秒重试一次、最多 10 分钟，超时仍失败才记录并放弃。
+   */
+  private retryWhenAuthed(eventName: string, file: TAbstractFile, handler: (f: TAbstractFile) => void, attempt: number) {
+    if (attempt >= 600) {
+      dump(`EventManager: ${eventName} dropped after ${attempt} retries (websocket not authed): ${file.path}`)
+      return
+    }
+    this.scheduleRetry(() => {
+      if (!this.plugin.websocket || !this.plugin.websocket.isAuth) {
+        this.retryWhenAuthed(eventName, file, handler, attempt + 1)
+      } else {
+        handler(file)
+      }
+    }, 1000)
+  }
+
+  private scheduleRetry(fn: () => void, delay: number) {
+    const timer = window.setTimeout(() => {
+      this.retryTimers.delete(timer)
+      fn()
+    }, delay)
+    this.retryTimers.add(timer)
+  }
+
   private watchModify = (file: TAbstractFile, ctx?: unknown) => {
     // 检查 WebSocket 认证状态
     if (!this.plugin.websocket || !this.plugin.websocket.isAuth) {
+      this.retryWhenAuthed("modify", file, this.watchModify, 0)
       return
     }
     if (this.plugin.settings.manualSyncEnabled || this.plugin.settings.readonlySyncEnabled) return
@@ -186,6 +231,7 @@ export class EventManager {
   private watchDelete = (file: TAbstractFile, ctx?: unknown) => {
     // 检查 WebSocket 认证状态
     if (!this.plugin.websocket || !this.plugin.websocket.isAuth) {
+      this.retryWhenAuthed("delete", file, this.watchDelete, 0)
       return
     }
     if (this.plugin.settings.manualSyncEnabled || this.plugin.settings.readonlySyncEnabled) return
@@ -206,6 +252,7 @@ export class EventManager {
   private watchRename = (file: TAbstractFile, oldFile: string, ctx?: unknown) => {
     // 检查 WebSocket 认证状态
     if (!this.plugin.websocket || !this.plugin.websocket.isAuth) {
+      this.retryWhenAuthed("rename", file, (f) => this.watchRename(f, oldFile), 0)
       return
     }
     if (this.plugin.settings.manualSyncEnabled || this.plugin.settings.readonlySyncEnabled) return
@@ -314,7 +361,7 @@ export class EventManager {
    * @param task 待执行的任务（支持 async）
    * @param delayset 额外延迟时间
    */
-  private runWithDelay(key: string, task: () => void | Promise<void>, delayset: number = 0) {
+  private runWithDelay(key: string, task: () => void | Promise<void>, delayset: number = 0, lockRequeue: number = 0) {
     // 如果已有相同 key 的定时器，先清除
     if (this.rawEventTimers.has(key)) {
       window.clearTimeout(this.rawEventTimers.get(key))
@@ -324,16 +371,31 @@ export class EventManager {
     let delay = this.plugin.settings.syncUpdateDelay || 0
     delay = delay + delayset
 
-    if (delay <= 0) {
-      // 立即执行也需要加锁，以防与其他异步任务冲突
-      // 如果获取锁失败，尝试重试 3 次，每次 50ms
+    // withLock 返回 null 表示抢锁失败且任务被丢弃——此时延迟 1s 重新入队，
+    // 最多 60 次（约 1 分钟窗口），避免同步风暴期间的 vault 事件被静默吞掉。
+    // 任务正常执行时返回的是 task() 的返回值（通常为 undefined），不会误判。
+    const runLocked = (maxRetries: number, retryInterval: number) => {
       void this.plugin.lockManager.withLock(
         key,
         async () => {
           await task()
         },
-        { maxRetries: 3, retryInterval: 50 },
-      )
+        { maxRetries, retryInterval },
+      ).then((result) => {
+        if (result === null) {
+          if (lockRequeue < 60) {
+            this.scheduleRetry(() => this.runWithDelay(key, task, delayset, lockRequeue + 1), 1000)
+          } else {
+            dump(`EventManager: task dropped after ${lockRequeue} lock requeues: ${key}`)
+          }
+        }
+      })
+    }
+
+    if (delay <= 0) {
+      // 立即执行也需要加锁，以防与其他异步任务冲突
+      // 如果获取锁失败，尝试重试 3 次，每次 50ms
+      runLocked(3, 50)
       return
     }
 
@@ -343,13 +405,7 @@ export class EventManager {
 
         // 执行任务时加锁，并带重试逻辑
         // 这里的重试是为了应对可能正好有远程同步在写该文件的情况
-        await this.plugin.lockManager.withLock(
-          key,
-          async () => {
-            await task()
-          },
-          { maxRetries: 5, retryInterval: 100 },
-        )
+        runLocked(5, 100)
       })()
     }, delay)
 

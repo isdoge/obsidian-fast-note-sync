@@ -1,4 +1,5 @@
 import { hashContentAsync, dump, isPathExcluded, showSyncNotice, isLargeBinarySyncRisk, describeBinarySyncLimit, logMemorySnapshot, hashFileAsync, debounce, LocalStateFileMirror } from "../utils/helpers";
+import { $ } from "../../i18n/lang";
 import type FastSync from "../../main";
 
 
@@ -68,49 +69,60 @@ export class FileHashManager {
    * 镜像也没有才真正重建 (移动端 localStorage 被系统清除时避免每次启动全量重建 + 弹通知)
    */
   async initialize(): Promise<void> {
-    dump("FileHashManager: 开始初始化");
+    dump("FileHashManager: starting init");
 
-    // 1. 尝试加载本地最新计算哈希缓存表 (hashMap)
+    // 1. 先恢复云端确认同步基准表 (syncHashMap)。
+    // Restore the acknowledged baseline first: restoring the computed cache below may call
+    // saveToStorage(), which also persists syncHashMap. Saving before this step overwrote the
+    // saved baseline (localStorage and syncHashMap.json) with the constructor-empty map, so a
+    // restart after iOS evicted localStorage lost every acknowledgement.
+    let hasRestoredSync = this.loadSyncFromStorage();
+    if (hasRestoredSync) {
+      dump(`FileHashManager: loaded sync baseline from localStorage (${this.syncHashMap.size} files)`);
+    }
+    if (!hasRestoredSync || this.syncHashMap.size === 0) {
+      // An empty localStorage baseline must not win over a populated mirror.
+      const mirroredSync = await this.syncMirror.read();
+      if (mirroredSync && this.parseAndLoadSync(mirroredSync) && this.syncHashMap.size > 0) {
+        dump(`FileHashManager: restored sync baseline from file mirror (${this.syncHashMap.size} files)`);
+        this.saveSyncToStorage();
+        hasRestoredSync = true;
+      }
+    }
+
+    // 2. 恢复本地最新计算哈希缓存表 (hashMap)
     const loaded = this.loadFromStorage();
     let hasRestoredMap = false;
 
     if (loaded) {
-      dump(`FileHashManager: 从 localStorage 加载本地哈希缓存成功,共 ${this.hashMap.size} 个文件`);
+      dump(`FileHashManager: loaded local hash cache from localStorage (${this.hashMap.size} files)`);
       hasRestoredMap = true;
     } else {
       const mirrored = await this.mirror.read();
       if (mirrored && this.parseAndLoad(mirrored)) {
-        dump("FileHashManager: 从文件镜像恢复本地哈希缓存成功");
+        dump("FileHashManager: restored local hash cache from file mirror");
         this.saveToStorage();
         hasRestoredMap = true;
       }
     }
 
     if (!hasRestoredMap) {
-      dump("FileHashManager: localStorage 与文件镜像均无本地缓存,开始构建哈希映射");
+      dump("FileHashManager: no local cache in localStorage or file mirror, building hash map");
       await this.buildFileHashMap();
-    }
-
-    // 2. 尝试加载云端确认同步基准表 (syncHashMap)
-    const loadedSync = this.loadSyncFromStorage();
-    let hasRestoredSync = false;
-
-    if (loadedSync) {
-      dump(`FileHashManager: 从 localStorage 加载同步基准成功,共 ${this.syncHashMap.size} 个文件`);
-      hasRestoredSync = true;
-    } else {
-      const mirroredSync = await this.syncMirror.read();
-      if (mirroredSync && this.parseAndLoadSync(mirroredSync)) {
-        dump("FileHashManager: 从文件镜像恢复同步基准成功");
-        this.saveSyncToStorage();
-        hasRestoredSync = true;
-      }
     }
 
     // 3. 数据平滑迁移：全新用户或旧版插件升级用户 (syncHashMap 尚未创建但 hashMap 已有历史数据)
     if (!hasRestoredSync) {
-      dump("FileHashManager: 同步基准表无数据，正在使用本地哈希缓存进行平滑继承迁移...");
+      dump("FileHashManager: sync baseline is empty, migrating from local hash cache...");
       for (const [path, cache] of this.hashMap.entries()) {
+        // #205：迁移是给"从未同步过"的文件伪造基线，而空文件恰恰是探测拦截的反例——
+        // 新设备上 Obsidian 自动创建的空白日记若被伪造成基线，首次同步会绕过探测，
+        // 把空内容上传覆盖服务端当天日记。空文件不伪造基线，留给探测逻辑处理
+        // #205: the migration fabricates a baseline for never-synced files, but an empty file is
+        // exactly the case the #205 probe must intercept — if Obsidian's auto-created empty daily
+        // note got a fabricated baseline on a new device, the first sync would bypass the probe
+        // and overwrite the server copy. Empty files get no fabricated baseline; the probe handles them
+        if (cache.size === 0) continue;
         this.syncHashMap.set(path, cache.hash);
       }
       this.saveSyncToStorage();
@@ -125,7 +137,7 @@ export class FileHashManager {
       if (!data) return false;
       return this.parseAndLoadSync(data);
     } catch (error) {
-      dump("FileHashManager: 从 localStorage 加载同步基准失败", error);
+      dump("FileHashManager: failed to load sync baseline from localStorage", error);
       return false;
     }
   }
@@ -136,7 +148,7 @@ export class FileHashManager {
       this.syncHashMap = new Map(Object.entries(parsed));
       return true;
     } catch (error) {
-      dump("FileHashManager: 解析同步基准哈希数据失败", error);
+      dump("FileHashManager: failed to parse sync baseline hash data", error);
       return false;
     }
   }
@@ -149,7 +161,7 @@ export class FileHashManager {
   }
 
   private async buildFileHashMap(): Promise<void> {
-    const notice = showSyncNotice("正在初始化文件哈希映射...", 0);
+    const notice = showSyncNotice($("ui.notice.file_hash_init_start"), 0);
 
     try {
       const files = this.plugin.app.vault.getFiles();
@@ -157,7 +169,7 @@ export class FileHashManager {
       const totalFiles = files.length;
       let processedFiles = 0;
 
-      dump(`FileHashManager: 开始遍历 ${totalFiles} 个文件`);
+      dump(`FileHashManager: scanning ${totalFiles} files`);
 
       // --- PERF: bounded concurrency for cold-build read+hash ---
       // 冷建路径原先完全串行 read+hash，参照 operator.ts 扫描阶段的 6 路有限并发改造
@@ -208,8 +220,8 @@ export class FileHashManager {
           } catch (error) {
             // 单个文件哈希计算失败不应中断整个构建过程
             const msg = error instanceof Error ? error.message : String(error);
-            dump(`FileHashManager: 计算哈希失败，跳过文件: ${file.path}`, error);
-            console.warn(`[FastNoteSync] 跳过文件 ${file.path}: ${msg}`);
+            dump(`FileHashManager: hash failed, skipping file: ${file.path}`, error);
+            console.warn(`[FastNoteSync] skipping file ${file.path}: ${msg}`);
           }
         });
 
@@ -217,7 +229,7 @@ export class FileHashManager {
 
         // 每处理 50 个文件更新一次进度 (Update progress every 50 files)
         if (processedFiles % 50 === 0) {
-          notice.setMessage(`正在初始化文件哈希映射... (${processedFiles}/${totalFiles})`);
+          notice.setMessage($("ui.notice.file_hash_init_progress", { done: processedFiles, total: totalFiles }));
           // 让出主线程,避免阻塞 UI
           await new Promise(resolve => window.setTimeout(resolve, 0));
         }
@@ -231,15 +243,15 @@ export class FileHashManager {
       // 保存到 localStorage
       this.saveToStorage();
 
-      notice.setMessage(`文件哈希映射初始化完成! 共处理 ${totalFiles} 个文件`);
+      notice.setMessage($("ui.notice.file_hash_init_done", { total: totalFiles }));
       window.setTimeout(() => notice.hide(), 3000);
 
-      dump(`FileHashManager: 构建完成,共 ${totalFiles} 个文件`);
+      dump(`FileHashManager: build complete, ${totalFiles} files`);
     } catch (error) {
       notice.hide();
       const msg = error instanceof Error ? error.message : String(error);
-      showSyncNotice(`文件哈希映射初始化失败: ${msg}`);
-      dump("FileHashManager: 构建失败", error);
+      showSyncNotice($("ui.notice.file_hash_init_failed", { msg }));
+      dump("FileHashManager: build failed", error);
       throw error;
     }
   }
@@ -261,6 +273,18 @@ export class FileHashManager {
    */
   getPathHash(path: string): string | null {
     return this.syncHashMap.get(path) || null;
+  }
+
+  /**
+   * 内容仍是同步基准时，返回缓存记录的同步时 mtime（没有则 undefined）。
+   * 打开 canvas 等只改写 mtime 不改内容时，用它代替被刷新的本地 mtime 上报（#256）
+   * While the content is still the sync baseline, return the mtime cached at sync time (undefined if
+   * none); reported instead of a refreshed local mtime when e.g. opening a canvas rewrites only the mtime (#256)
+   */
+  getSyncedMtime(path: string): number | undefined {
+    const cache = this.hashMap.get(path);
+    const base = this.syncHashMap.get(path);
+    return cache && base !== undefined && cache.hash === base && cache.mtime > 0 ? cache.mtime : undefined;
   }
 
   /**
@@ -335,7 +359,7 @@ export class FileHashManager {
         }
 
         if (data) {
-          dump("FileHashManager: 发现旧版哈希表数据，执行迁移");
+          dump("FileHashManager: legacy hash map data found, migrating");
           this.plugin.app.saveLocalStorage(this.storageKey, data);
         } else {
           return false;
@@ -344,7 +368,7 @@ export class FileHashManager {
 
       return this.parseAndLoad(data);
     } catch (error) {
-      dump("FileHashManager: 从 localStorage 加载失败", error);
+      dump("FileHashManager: failed to load from localStorage", error);
       return false;
     }
   }
@@ -378,7 +402,7 @@ export class FileHashManager {
 
       return true;
     } catch (error) {
-      dump("FileHashManager: 解析哈希表数据失败", error);
+      dump("FileHashManager: failed to parse hash map data", error);
       return false;
     }
   }
@@ -392,16 +416,16 @@ export class FileHashManager {
       const obj = Object.fromEntries(this.hashMap);
       data = JSON.stringify(obj);
     } catch (error) {
-      dump("FileHashManager: 序列化哈希表失败", error);
+      dump("FileHashManager: failed to serialize hash map", error);
       return;
     }
 
     try {
       this.plugin.app.saveLocalStorage(this.storageKey, data);
     } catch (error) {
-      dump("FileHashManager: 保存到 localStorage 失败", error);
+      dump("FileHashManager: failed to save to localStorage", error);
       const msg = error instanceof Error ? error.message : String(error);
-      showSyncNotice(`保存文件哈希映射失败: ${msg}`);
+      showSyncNotice($("ui.notice.file_hash_save_failed", { msg }));
     }
 
     // 即使 localStorage 写入失败 (如配额)，镜像写入也照常进行
@@ -417,14 +441,14 @@ export class FileHashManager {
       const obj = Object.fromEntries(this.syncHashMap);
       data = JSON.stringify(obj);
     } catch (error) {
-      dump("FileHashManager: 序列化同步基准哈希表失败", error);
+      dump("FileHashManager: failed to serialize sync baseline hash map", error);
       return;
     }
 
     try {
       this.plugin.app.saveLocalStorage(this.syncStorageKey, data);
     } catch (error) {
-      dump("FileHashManager: 保存同步基准哈希表到 localStorage 失败", error);
+      dump("FileHashManager: failed to save sync baseline hash map to localStorage", error);
     }
 
     this.syncMirror.scheduleWrite(data);
@@ -439,7 +463,7 @@ export class FileHashManager {
    * 用于命令面板
    */
   async rebuildHashMap(): Promise<void> {
-    dump("FileHashManager: 手动重建哈希映射");
+    dump("FileHashManager: manual hash map rebuild");
     this.clearAll();
     await this.buildFileHashMap();
     // 重新扫描完成后，将本地最新计算的哈希复制写入同步基准，作为当前最新的同步对齐基准
@@ -509,7 +533,7 @@ export class FileHashManager {
     }
 
     if (deletedCount > 0) {
-      dump(`FileHashManager: 清理了 ${deletedCount} 个已排除文件的哈希`);
+      dump(`FileHashManager: cleaned up ${deletedCount} hashes of excluded files`);
       this.scheduleSave();
     }
   }

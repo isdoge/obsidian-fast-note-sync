@@ -10,78 +10,130 @@ import { LucideIcon } from "./note-history/lucide-icon";
 import { $, getLocale } from "../i18n/lang";
 
 
-async function getClipboardContent(plugin: FastSync): Promise<void> {
-  const clipboardReadTipSave = async (api: string, apiToken: string, Vault: string, tip: string) => {
-    if (plugin.settings.api != api || plugin.settings.apiToken != apiToken) {
-      plugin.wsSettingChange = true
-    }
-    plugin.settings.api = api
-    plugin.settings.apiToken = apiToken
-    plugin.settings.vault = Vault
-    plugin.clipboardReadTip = tip
-
-    plugin.localStorageManager.clearSyncTime()
-    await plugin.saveAndReloadServices()
-    plugin.settingTab.refresh()
-
-    window.setTimeout(() => {
-      plugin.clipboardReadTip = ""
-      plugin.settingTab.refresh()
-    }, 2000)
-  }
-
-  //
-  const clipboardReadTipTipSave = async (tip: string) => {
-    plugin.clipboardReadTip = tip
-
-    await plugin.saveAndReloadServices()
-    plugin.settingTab.refresh()
-
-    window.setTimeout(() => {
-      plugin.clipboardReadTip = ""
-      plugin.settingTab.refresh()
-    }, 2000)
-  }
-
-  try {
-    // 检查浏览器是否支持 Clipboard API
-    if (!navigator.clipboard) {
-      return
-    }
-
-    // 获取剪贴板文本内容
-    const text = await navigator.clipboard.readText()
-
-    // 检查是否为 JSON 格式
-    const parsedData = JSON.parse(text) as Record<string, unknown>;
-    // 检查是否为对象且包含 api 和 apiToken
-    if (typeof parsedData === "object" && parsedData !== null) {
-      const hasApi = "api" in parsedData
-      const hasApiToken = "apiToken" in parsedData
-      const vault = "vault" in parsedData
-
-      if (hasApi && hasApiToken && vault) {
-        void clipboardReadTipSave(parsedData.api as string, parsedData.apiToken as string, parsedData.vault as string, $("setting.remote.paste_success"))
-        return
-      }
-    }
-    void clipboardReadTipTipSave($("setting.remote.no_config"))
-    return
-  } catch (err) {
-    dump(err)
-    void clipboardReadTipTipSave($("setting.remote.no_config"))
-    return
-  }
+export interface RemoteAuthConfig {
+  api: string;
+  apiToken: string;
+  vault: string;
 }
 
-const handleClipboardClick = (plugin: FastSync) => {
-  getClipboardContent(plugin).catch(err => { dump(err); });
-};
+export type ClipboardImportResult =
+  | { status: "success"; config: RemoteAuthConfig; message: string; allowManualInput: false }
+  | { status: "clipboard_unavailable"; message: string; allowManualInput: true }
+  | { status: "clipboard_read_failed"; message: string; allowManualInput: true }
+  | { status: "invalid_config"; message: string; allowManualInput: false };
+
+export function parseRemoteConfigText(rawText: string): RemoteAuthConfig | null {
+  const withoutBom = rawText.charCodeAt(0) === 0xfeff ? rawText.slice(1) : rawText;
+  const normalized = withoutBom.trim();
+  if (!normalized) {
+    return null;
+  }
+
+  let parsedData: unknown;
+  try {
+    parsedData = JSON.parse(normalized);
+  } catch {
+    return null;
+  }
+
+  if (typeof parsedData !== "object" || parsedData === null || Array.isArray(parsedData)) {
+    return null;
+  }
+
+  const record = parsedData as Record<string, unknown>;
+  if (!("api" in record) || !("apiToken" in record) || !("vault" in record)) {
+    return null;
+  }
+  if (typeof record.api !== "string" || typeof record.apiToken !== "string" || typeof record.vault !== "string") {
+    return null;
+  }
+  if (!record.api.trim() || !record.apiToken.trim()) {
+    return null;
+  }
+
+  return {
+    api: record.api,
+    apiToken: record.apiToken,
+    vault: record.vault,
+  };
+}
+
+async function applyRemoteConfig(plugin: FastSync, config: RemoteAuthConfig): Promise<void> {
+  if (plugin.settings.api != config.api || plugin.settings.apiToken != config.apiToken) {
+    plugin.wsSettingChange = true;
+  }
+  plugin.settings.api = config.api;
+  plugin.settings.apiToken = config.apiToken;
+  plugin.settings.vault = config.vault;
+  plugin.clipboardReadTip = $("setting.remote.paste_success");
+
+  plugin.localStorageManager.clearSyncTime();
+  await plugin.saveAndReloadServices();
+  plugin.settingTab.refresh();
+
+  window.setTimeout(() => {
+    plugin.clipboardReadTip = "";
+    plugin.settingTab.refresh();
+  }, 2000);
+}
+
+export async function importRemoteConfigFromText(plugin: FastSync, text: string): Promise<ClipboardImportResult> {
+  const config = parseRemoteConfigText(text);
+  if (!config) {
+    return {
+      status: "invalid_config",
+      message: $("setting.remote.invalid_config"),
+      allowManualInput: false,
+    };
+  }
+
+  await applyRemoteConfig(plugin, config);
+  return {
+    status: "success",
+    config,
+    message: $("setting.remote.paste_success"),
+    allowManualInput: false,
+  };
+}
+
+export async function pasteRemoteConfigFromClipboard(
+  plugin: FastSync,
+  clipboard: { readText?: () => Promise<string> } | null | undefined = typeof navigator !== "undefined"
+    ? navigator.clipboard
+    : undefined,
+): Promise<ClipboardImportResult> {
+  if (!clipboard || typeof clipboard.readText !== "function") {
+    return {
+      status: "clipboard_unavailable",
+      message: $("setting.remote.clipboard_unavailable"),
+      allowManualInput: true,
+    };
+  }
+
+  let text: string;
+  try {
+    text = await clipboard.readText();
+  } catch (err) {
+    dump(err);
+    return {
+      status: "clipboard_read_failed",
+      message: $("setting.remote.clipboard_read_failed"),
+      allowManualInput: true,
+    };
+  }
+
+  return importRemoteConfigFromText(plugin, text);
+}
 
 export const SettingsView = ({ plugin }: { plugin: FastSync }) => {
   const [isConnected, setIsConnected] = useState<boolean>(plugin.websocket.isConnected());
   const [userInfo, setUserInfo] = useState<UserDTO | null>(null);
   const [loadingUserInfo, setLoadingUserInfo] = useState<boolean>(false);
+  const [pasteTip, setPasteTip] = useState<{ message: string; isError: boolean } | null>(() =>
+    plugin.clipboardReadTip ? { message: plugin.clipboardReadTip, isError: false } : null
+  );
+  const [showManualPaste, setShowManualPaste] = useState<boolean>(false);
+  const [manualConfigText, setManualConfigText] = useState<string>("");
   const iconRef = useRef<HTMLSpanElement>(null);
   const isMounted = useRef(true);
 
@@ -168,6 +220,51 @@ export const SettingsView = ({ plugin }: { plugin: FastSync }) => {
     );
   };
 
+  const handleClipboardClick = async () => {
+    plugin.clipboardReadTip = "";
+    try {
+      const result = await pasteRemoteConfigFromClipboard(plugin);
+      if (!isMounted.current) return;
+      if (result.status === "success") {
+        setShowManualPaste(false);
+        setManualConfigText("");
+        setPasteTip({ message: result.message, isError: false });
+      } else {
+        if (result.allowManualInput) {
+          setShowManualPaste(true);
+        }
+        setPasteTip({ message: result.message, isError: true });
+      }
+    } catch (err) {
+      dump(err);
+    }
+  };
+
+  const handleManualApply = async () => {
+    plugin.clipboardReadTip = "";
+    try {
+      const result = await importRemoteConfigFromText(plugin, manualConfigText);
+      if (!isMounted.current) return;
+      if (result.status === "success") {
+        setShowManualPaste(false);
+        setManualConfigText("");
+        setPasteTip({ message: result.message, isError: false });
+      } else {
+        setPasteTip({ message: result.message, isError: true });
+      }
+    } catch (err) {
+      dump(err);
+    }
+  };
+
+  const handleManualCancel = () => {
+    setShowManualPaste(false);
+    setManualConfigText("");
+    setPasteTip(null);
+  };
+
+  const activeTip = pasteTip ?? (plugin.clipboardReadTip ? { message: plugin.clipboardReadTip, isError: false } : null);
+
   return (
     <div className="fns-remote-config-container">
       <div className="fns-setup-group-card">
@@ -175,10 +272,45 @@ export const SettingsView = ({ plugin }: { plugin: FastSync }) => {
           {renderMarkdownTable($("setting.remote.setup_table"))}
 
           <div className="fns-action-group">
-            <button className="fns-premium-btn" onClick={() => handleClipboardClick(plugin)}>
+            <button type="button" className="fns-premium-btn" onClick={() => { void handleClipboardClick(); }}>
               <span className="fns-btn-icon">📋</span>
               {$("setting.remote.paste_config")}
             </button>
+
+            {activeTip && (
+              <div className={`fns-paste-toast${activeTip.isError ? " is-error" : ""}`}>{activeTip.message}</div>
+            )}
+
+            {showManualPaste && (
+              <div className="fns-manual-paste-panel">
+                <label className="fns-manual-paste-field">
+                  <span className="fns-manual-paste-hint">{$("setting.remote.manual_paste_hint")}</span>
+                  <textarea
+                    className="fns-manual-paste-textarea"
+                    rows={4}
+                    value={manualConfigText}
+                    onChange={(e) => setManualConfigText(e.target.value)}
+                    placeholder={$("setting.remote.manual_paste_placeholder")}
+                  />
+                </label>
+                <div className="fns-manual-paste-actions">
+                  <button
+                    type="button"
+                    className="fns-manual-paste-btn mod-cta"
+                    onClick={() => { void handleManualApply(); }}
+                  >
+                    {$("setting.remote.manual_paste_apply")}
+                  </button>
+                  <button
+                    type="button"
+                    className="fns-manual-paste-btn"
+                    onClick={handleManualCancel}
+                  >
+                    {$("ui.button.cancel")}
+                  </button>
+                </div>
+              </div>
+            )}
 
             <div className={`fns-status-pill ${isConnected ? 'is-connected' : 'is-disconnected'}`}>
               <div className="fns-status-dot" />
@@ -193,10 +325,6 @@ export const SettingsView = ({ plugin }: { plugin: FastSync }) => {
                 </div>
               )}
             </div>
-
-            {plugin.clipboardReadTip && (
-              <div className="fns-paste-toast">{plugin.clipboardReadTip}</div>
-            )}
           </div>
         </div>
       </div>
@@ -271,7 +399,6 @@ const SupportList = ({ plugin }: { plugin: FastSync }) => {
 
   const getSupportLink = () => {
     const locale = getLocale();
-    const source = plugin.settings.updateSource || "github";
 
     const fileNameMap: Record<string, string> = {
       "zh-cn": "Support.zh-CN.md",
@@ -281,9 +408,7 @@ const SupportList = ({ plugin }: { plugin: FastSync }) => {
     };
     const fileName = fileNameMap[locale] || "Support.en.md";
 
-    const baseUrl = source === "cnb"
-      ? "https://cnb.cool/haierkeys/fast-note-sync-service/-/blob/master/docs/"
-      : "https://github.com/haierkeys/fast-note-sync-service/blob/master/docs/";
+    const baseUrl = "https://github.com/isdoge/fast-note-sync-service/blob/master/docs/";
 
     return baseUrl + fileName;
   };

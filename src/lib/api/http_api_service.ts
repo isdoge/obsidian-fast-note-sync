@@ -3,7 +3,7 @@
 import { requestUrl } from "obsidian";
 import { hashContent, addRandomParam, showSyncNotice, dump, dumpError, nativeFetch, isAllowedRedirect } from "../utils/helpers";
 import { CLIENT_TYPE } from "../utils/types";
-import { getLocale } from "../../i18n/lang";
+import { $, getLocale } from "../../i18n/lang";
 import type FastSync from "../../main";
 
 
@@ -405,7 +405,7 @@ export class HttpApiService {
             };
         } catch (e) {
             if (e instanceof Error && e.message.includes('fetch')) {
-                throw new Error("无法连接到服务器，请检查网络连接");
+                throw new Error($("ui.status.no_connection"));
             }
             throw e;
         }
@@ -457,7 +457,7 @@ export class HttpApiService {
             return true;
         } catch (e) {
             dumpError("restoreNoteVersion error:", e);
-            showSyncNotice("恢复版本请求失败");
+            showSyncNotice($("ui.notice.restore_version_failed"));
             return false;
         }
     }
@@ -466,7 +466,7 @@ export class HttpApiService {
      * 获取服务端文件信息
      * 用于在删除本地文件前核对状态
      */
-    async getFileInfo(path: string): Promise<FileInfoResponse> {
+    async getFileInfo(path: string): Promise<FileInfoResponse | null> {
         const params = new URLSearchParams({
             vault: this.plugin.settings.vault,
             path: path,
@@ -479,6 +479,16 @@ export class HttpApiService {
         const { status, json } = await this.request(endpoint, {
             method: "GET"
         });
+
+        // 服务端没有该附件的记录：HTTP 200 + 业务码 0（details 为 "record not found"），或未找到类业务码。
+        // 这是"服务端不存在"，不是请求失败，返回 null 交调用方处理（haierkeys/fast-note-sync-service#512）
+        // The server has no record of this attachment: HTTP 200 with code 0 (details "record not
+        // found") or a not-found code. That is "missing on the server", not a failed request: return null
+        const missing = json as (ApiResponse<unknown> & { details?: unknown }) | null;
+        if (status === 200 && missing && (missing.code === 430 || missing.code === 455
+            || (missing.code === 0 && typeof missing.details === "string" && /record not found/i.test(missing.details)))) {
+            return null;
+        }
 
         if (status !== 200 || !this.isSuccess(json)) {
             const res = json as ApiResponse<unknown>;
@@ -582,7 +592,7 @@ export class HttpApiService {
             return true;
         } catch (e) {
             dumpError("restoreNote error:", e);
-            showSyncNotice("恢复笔记失败");
+            showSyncNotice($("ui.notice.restore_note_failed"));
             return false;
         }
     }
@@ -612,7 +622,7 @@ export class HttpApiService {
             return true;
         } catch (e) {
             dumpError("restoreFile error:", e);
-            showSyncNotice("恢复文件失败");
+            showSyncNotice($("ui.notice.restore_file_failed"));
             return false;
         }
     }
@@ -641,7 +651,7 @@ export class HttpApiService {
             return true;
         } catch (e) {
             dumpError("deleteFile error:", e);
-            showSyncNotice("删除文件失败");
+            showSyncNotice($("ui.notice.delete_file_failed"));
             return false;
         }
     }
@@ -665,14 +675,14 @@ export class HttpApiService {
 
             if (status !== 200 || !this.isSuccess(json)) {
                 const res = json as ApiResponse<unknown>;
-                const msg = res?.message || (path ? "永久删除失败" : "清空回收站失败");
+                const msg = res?.message || (path ? $("ui.notice.permanent_delete_failed") : $("ui.notice.clear_recycle_bin_failed"));
                 showSyncNotice(msg);
                 return false;
             }
             return true;
         } catch (e) {
             dumpError("clearRecycleBin error:", e);
-            showSyncNotice("请求失败，请检查网络");
+            showSyncNotice($("ui.status.no_connection"));
             return false;
         }
     }
@@ -703,7 +713,7 @@ export class HttpApiService {
             return res.data;
         } catch (e) {
             dumpError("createShare error:", e);
-            showSyncNotice("创建分享失败");
+            showSyncNotice($("ui.notice.create_share_failed"));
             return null;
         }
     }
@@ -760,7 +770,7 @@ export class HttpApiService {
             return true;
         } catch (e) {
             dumpError("updateSharePassword error:", e);
-            showSyncNotice("设置密码失败");
+            showSyncNotice($("ui.notice.set_password_failed"));
             return false;
         }
     }
@@ -794,7 +804,7 @@ export class HttpApiService {
             return res.data || null;
         } catch (e) {
             dumpError("createShortLink error:", e);
-            showSyncNotice("生成短链接失败");
+            showSyncNotice($("ui.notice.generate_short_link_failed"));
             return null;
         }
     }
@@ -823,7 +833,7 @@ export class HttpApiService {
             return true;
         } catch (e) {
             dumpError("cancelShare error:", e);
-            showSyncNotice("取消分享失败");
+            showSyncNotice($("ui.notice.cancel_share_failed"));
             return false;
         }
     }

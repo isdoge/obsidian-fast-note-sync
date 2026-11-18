@@ -1,10 +1,111 @@
+import { blockAliasedRemoteMutation } from "./remote_path_guard";
+import { advanceLiveSyncTime } from "./sync_state";
+import { firstKeepWithoutBaseline } from "./remote_delete_guard";
 import { TFile, TAbstractFile, normalizePath } from "obsidian";
 
 import { ReceiveMessage, ReceiveMtimeMessage, ReceivePathMessage, SyncEndData } from "../utils/types";
-import { hashContent, hashContentAsync, dump, dumpError, isPathExcluded, getSafeCtime, vaultDelete, checkAndNotifyCaseConflict, getPluginDir } from "../utils/helpers";
+import { hashContent, hashContentAsync, dump, dumpError, isPathExcluded, getSafeCtime, checkAndNotifyCaseConflict, getPluginDir, showSyncNotice, normalizeServerTimestamp } from "../utils/helpers";
 import { SyncLogManager } from "./sync_log_manager";
 import type FastSync from "../../main";
+import { $ } from "../../i18n/lang";
 
+// 同一插件会话中每条失败路径只通知一次；重试仍逐次保留同步错误日志。
+const notifiedNoteFailures = new WeakMap<FastSync, Set<string>>();
+
+// #205：正在通过 NoteRePush 探测服务端是否已有该笔记的路径集合（挂在 plugin 实例上，
+// 每个插件实例独立；断线重连后由 websocket_manager onClose 统一清空，探测随下一轮事件重发）。
+// #205: paths currently being probed via NoteRePush for whether the server already has the note
+// (per plugin instance; cleared on disconnect by websocket_manager onClose, the probe is re-issued
+// by the next vault event).
+const emptyNoteProbing = new WeakMap<FastSync, Set<string>>();
+// #205：探测结论为"服务端没有该笔记"的路径集合。下一次 noteModify（#277 保留分支的重传）
+// 检查到本标记时跳过拦截直接上传，打断"探测→NoteSyncDelete→重传→再探测"的循环；
+// 上传发起后标记即清除（一次性），Ack 后 hashManager 建立基线，后续编辑走正常路径。
+// #205: paths whose probe verdict was "server doesn't have this note". The next noteModify
+// (the #277 keep-branch re-upload) skips the interception and uploads directly, breaking the
+// probe -> NoteSyncDelete -> re-upload -> probe loop; the mark is one-shot (cleared once the
+// upload is issued), and after the Ack the hashManager baseline makes later edits normal.
+const emptyNoteConfirmedAbsent = new WeakMap<FastSync, Set<string>>();
+
+function emptyNoteProbeSet(plugin: FastSync): Set<string> {
+  let set = emptyNoteProbing.get(plugin);
+  if (!set) {
+    set = new Set<string>();
+    emptyNoteProbing.set(plugin, set);
+  }
+  return set;
+}
+
+function emptyNoteConfirmedAbsentSet(plugin: FastSync): Set<string> {
+  let set = emptyNoteConfirmedAbsent.get(plugin);
+  if (!set) {
+    set = new Set<string>();
+    emptyNoteConfirmedAbsent.set(plugin, set);
+  }
+  return set;
+}
+
+/**
+ * #205：本地空白笔记（如 Obsidian 自动创建的当日日记）在从未同步过（无同步基线）时，
+ * 直接上传会覆盖服务端已有内容。满足三条件（内容为空 / 无基线 / 非冲突路径）时拦截上传，
+ * 改发 NoteRePush 探测：服务端有 → 回 NoteSyncModify 覆盖本地空文件；没有 → 回
+ * NoteSyncDelete，由 receiveNoteSyncDelete 的 #277 保留分支重传空文件完成新建。
+ * 服务端证据：ws_note.go NoteRePush（存在且非删除回 NoteSyncModify，否则回 NoteSyncDelete）。
+ * 返回 true 表示已拦截（调用方不再上传）。
+ *
+ * #205: uploading a never-synced empty local note (e.g. Obsidian's auto-created daily note)
+ * would overwrite the server copy. When all three conditions hold (empty content / no sync
+ * baseline / not a conflicted path), hold the upload and probe with NoteRePush instead:
+ * server has it -> NoteSyncModify overwrites the local empty file; server doesn't ->
+ * NoteSyncDelete, and receiveNoteSyncDelete's #277 keep-branch re-uploads the empty file as a
+ * genuine create. Server evidence: ws_note.go NoteRePush (NoteSyncModify when present and not
+ * deleted, NoteSyncDelete otherwise). Returns true when the upload was intercepted.
+ */
+function probeEmptyNoteInsteadOfUpload(plugin: FastSync, path: string, content: string, baseHash: string | null): boolean {
+  if (content.trim().length !== 0) return false
+  if (baseHash !== null) return false
+  if (plugin.syncState.conflictedPaths.has(path)) return false
+  // 探测已确认服务端没有该笔记：本次上传就是探测结论的落地，直接放行
+  // Probe already confirmed the server doesn't have this note: this upload lands the verdict
+  const confirmedAbsent = emptyNoteConfirmedAbsentSet(plugin)
+  if (confirmedAbsent.has(path)) {
+    confirmedAbsent.delete(path)
+    return false
+  }
+  const probing = emptyNoteProbeSet(plugin)
+  if (probing.has(path)) return true
+  probing.add(path)
+  dump(`Empty unsynced note, probing server instead of uploading: ${path}`)
+  SyncLogManager.getInstance().addLog('send', 'NoteEmptyProbe',
+    `本地空白笔记尚未同步，先探测服务端是否已有该笔记: ${path}`, 'cancelled', path)
+  void plugin.websocket.SendMessage("NoteRePush", {
+    vault: plugin.settings.vault,
+    path: path,
+    pathHash: hashContent(path),
+  })
+  return true
+}
+
+/** #205：探测结论到达（NoteSyncModify / NoteSyncDelete 处理入口）时清除在途标记 */
+/** #205: clear the in-flight probe mark when its verdict arrives (NoteSyncModify / NoteSyncDelete) */
+function consumeEmptyNoteProbe(plugin: FastSync, path: string): void {
+  emptyNoteProbeSet(plugin).delete(path)
+}
+
+/**
+ * #205：连接断开时清空在途探测与"已确认缺失"标记（由 websocket_manager onClose 调用）。
+ * 断线后探测结论不会再到达；在途标记若不清空，重连后同路径的 noteModify 会被
+ * 误判为"探测已在途"而静默拦截。"已确认缺失"标记保留至下一次上传落地，断线同样作废
+ * （服务端状态可能已变，重新探测更安全）。
+ * #205: clear in-flight probe and confirmed-absent marks on disconnect (called from
+ * websocket_manager onClose). No verdict can arrive after the drop; a stale in-flight mark
+ * would silently intercept the same path's noteModify after reconnect. The confirmed-absent
+ * mark is voided too — the server state may have changed, re-probing is safer.
+ */
+export function clearEmptyNoteProbes(plugin: FastSync): void {
+  emptyNoteProbing.get(plugin)?.clear();
+  emptyNoteConfirmedAbsent.get(plugin)?.clear();
+}
 
 /**
  * 笔记修改事件处理
@@ -15,6 +116,13 @@ export const noteModify = async function (file: TAbstractFile, plugin: FastSync,
   if (!file.path.endsWith(".md")) return
   if (eventEnter && plugin.isIgnoredFile(file.path)) return
   if (isPathExcluded(file.path, plugin)) return
+  // 冲突未解决的路径暂停上传，否则本端旧稿会覆盖其他端的新内容（#276）；解决冲突时由冲突合并窗口自行推送
+  // Uploads of an unresolved conflict are paused, or this device's stale copy overwrites newer content
+  // from other devices (#276); the conflict resolve modal pushes the merged result itself
+  if (plugin.syncState.conflictedPaths.has(file.path)) {
+    dump(`Note modify paused, unresolved conflict: ${file.path}`)
+    return
+  }
 
   await plugin.lockManager.withLock(file.path, async () => {
     plugin.addIgnoredFile(file.path)
@@ -41,6 +149,10 @@ export const noteModify = async function (file: TAbstractFile, plugin: FastSync,
 
       if (content === null) content = await plugin.app.vault.read(file)
 
+      // #205：空白 + 从未同步 + 非冲突 → 不上传，先探测服务端是否已有该笔记
+      // #205: empty + never synced + not conflicted -> hold the upload, probe the server first
+      if (probeEmptyNoteInsteadOfUpload(plugin, file.path, content, baseHash)) return
+
       const data = {
         vault: plugin.settings.vault,
         ctime: getSafeCtime(file.stat),
@@ -61,7 +173,7 @@ export const noteModify = async function (file: TAbstractFile, plugin: FastSync,
         plugin.pendingNoteModifies.set(file.path, contentHash)
         plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies)
       }
-      await plugin.concurrencyLimiter.waitForSlot(file.path)
+      if (!await plugin.concurrencyLimiter.waitForSlot(file.path)) return
       void plugin.websocket.SendMessage("NoteModify", data)
       dump(`Note modify send`, data.path, data.contentHash, data.mtime, data.pathHash)
     } finally {
@@ -98,7 +210,7 @@ export const noteDelete = async function (file: TAbstractFile, plugin: FastSync,
         path: file.path,
         pathHash: hashContent(file.path),
       }
-      await plugin.concurrencyLimiter.waitForSlot(file.path)
+      if (!await plugin.concurrencyLimiter.waitForSlot(file.path)) return
       void plugin.websocket.SendMessage("NoteDelete", data, undefined, () => {
         // 消息真正写入 TCP 缓冲区后加入 pending set，等待 NoteDeleteAck 再删 hash
         // Add to pending set only after message is actually buffered; remove hash only on NoteDeleteAck
@@ -129,7 +241,7 @@ export const noteDeleteByPath = async function (filePath: string, plugin: FastSy
     plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies)
     plugin.addIgnoredFile(filePath)
     try {
-      await plugin.concurrencyLimiter.waitForSlot(filePath)
+      if (!await plugin.concurrencyLimiter.waitForSlot(filePath)) return
       void plugin.websocket.SendMessage("NoteDelete", {
         vault: plugin.settings.vault,
         path: filePath,
@@ -204,7 +316,7 @@ export const noteRename = async function (file: TAbstractFile, oldfile: string, 
       // 将重命名信息存入 Map（key 为 newPath），等待服务端 NoteRenameAck 按 path 精确匹配后再更新 hashManager
       // Store rename info in Map (keyed by newPath), update hashManager only after server NoteRenameAck matches by path
       plugin.pendingNoteRenames.set(file.path, { oldPath: oldfile, newPath: file.path, contentHash })
-      await plugin.concurrencyLimiter.waitForSlot(file.path, true)
+      if (!await plugin.concurrencyLimiter.waitForSlot(file.path, true)) return
       void plugin.websocket.SendMessage("NoteRename", data)
       dump(`Note rename send`, data.path, data.pathHash)
     } finally {
@@ -222,12 +334,21 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
     plugin.recordSyncCompleted('note', data.pageIndex)
     return
   }
-  dump(`Receive note modify:`, data.path, data.contentHash, data.mtime, data.pathHash)
+  // 服务端历史数据可能存秒级 mtime/ctime（#461），落盘/比较前先归一化为毫秒
+  // Legacy server rows may hold second-scale mtime/ctime (#461); normalize to milliseconds
+  // before writing to disk or comparing
+  const mtime = normalizeServerTimestamp(data.mtime)
+  const ctime = normalizeServerTimestamp(data.ctime)
+  dump(`Receive note modify:`, data.path, data.contentHash, mtime, data.pathHash)
 
   const normalizedPath = normalizePath(data.path)
+  // #205：NoteSyncModify 可能是空白笔记探测的结论（服务端已有该笔记），清除在途探测标记
+  // #205: this NoteSyncModify may be the verdict of an empty-note probe (server has the note);
+  // clear the in-flight probe mark
+  consumeEmptyNoteProbe(plugin, data.path)
 
   try {
-    await plugin.lockManager.withLock(normalizedPath, async () => {
+    const locked = await plugin.lockManager.withLock(normalizedPath, async () => {
       const file = plugin.app.vault.getFileByPath(normalizedPath)
       plugin.addIgnoredFile(normalizedPath)
       try {
@@ -235,6 +356,16 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
           // Fail-safe：写盘前检查本地是否有未推送的编辑，避免服务端推送盲覆盖用户刚做的改动
           // Fail-safe: before overwriting, check for unsynced local edits so a server push
           // doesn't blindly clobber changes the user just made
+          const localContentHashNow = await hashContentAsync(await plugin.app.vault.read(file));
+          const remoteContentHashNow = await hashContentAsync(data.content);
+          const contentsMatch = localContentHashNow === remoteContentHashNow;
+          const baseHashNow = plugin.fileHashManager.getPathHash(normalizedPath);
+          // A replay of the unchanged server baseline is not a two-sided edit.
+          if (!contentsMatch && baseHashNow !== null && remoteContentHashNow === baseHashNow) {
+            plugin.pendingNoteModifies.set(normalizedPath, localContentHashNow);
+            plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies);
+            return;
+          }
           const hasPendingLocalEdit = plugin.pendingNoteModifies.has(data.path)
           let hasDivergedSinceLastSync = false
           if (!hasPendingLocalEdit) {
@@ -254,7 +385,7 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
             }
           }
 
-          if (hasPendingLocalEdit || hasDivergedSinceLastSync || plugin.syncState.conflictedPaths.has(normalizedPath)) {
+          if (!contentsMatch && (hasPendingLocalEdit || hasDivergedSinceLastSync || plugin.syncState.conflictedPaths.has(normalizedPath))) {
             dump(`[FastSync] Skip overwrite, local unsynced edit detected: ${normalizedPath}`)
 
             // 如果存在未同步的本地修改或已在冲突列表中，将服务端最新推送的内容写入/更新到远端备份文件 xxx.remote.md
@@ -295,7 +426,7 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
             return
           }
 
-          await plugin.app.vault.modify(file, data.content, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
+          await plugin.app.vault.modify(file, data.content, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
         } else {
           const folder = normalizedPath.split("/").slice(0, -1).join("/")
           if (folder != "") {
@@ -310,18 +441,16 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
               }
             }
           }
-          await plugin.app.vault.create(normalizedPath, data.content, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
+          await plugin.app.vault.create(normalizedPath, data.content, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
         }
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
-          plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
-        }
+        advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
 
         // 服务端推送笔记更新,更新哈希表(使用内容哈希)
         // 注意：由于是服务端推送，我们信任服务端返回的 mtime，并尝试获取本地文件大小
         const updatedFile = plugin.app.vault.getFileByPath(normalizedPath);
-        plugin.fileHashManager.setFileHash(data.path, data.contentHash, data.mtime, updatedFile?.stat.size || 0)
+        plugin.fileHashManager.setFileHash(data.path, data.contentHash, mtime || 0, updatedFile?.stat.size || 0)
         // 记录同步后的 mtime 用于拦截
-        plugin.lastSyncMtime.set(data.path, data.mtime)
+        plugin.lastSyncMtime.set(data.path, mtime || 0)
         // 服务端版本已覆盖本地，清理 pending 避免增量过滤器旁路导致该笔记无限重传
         // Server version overrides local; clear pending to avoid incremental filter bypass loop
         plugin.pendingNoteModifies.delete(data.path)
@@ -335,10 +464,23 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
         }, 500);
       }
     }, { maxRetries: 5, retryInterval: 100 });
+    // 抢锁失败时任务未执行：按失败处理，不能计为完成
+    // Lock not acquired means the task never ran: count it as a failure, never as completed
+    if (locked === null) throw new Error("Path lock busy")
   } catch (e) {
     dumpError(`[FastSync] Failed to receiveNoteSyncModify: ${normalizedPath}`, e);
     if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'NoteModify')) {
-      SyncLogManager.getInstance().addLog('receive', 'NoteModify', e instanceof Error ? e.message : String(e), 'error', data.path);
+      const message = e instanceof Error ? e.message : String(e);
+      SyncLogManager.getInstance().addLog('receive', 'NoteModify', message, 'error', data.path);
+      let notifiedPaths = notifiedNoteFailures.get(plugin);
+      if (!notifiedPaths) {
+        notifiedPaths = new Set();
+        notifiedNoteFailures.set(plugin, notifiedPaths);
+      }
+      if (!notifiedPaths.has(data.path)) {
+        notifiedPaths.add(data.path);
+        showSyncNotice(`${$('ui.status.failed')}: ${data.path}\n${message}`, 15000);
+      }
     }
     plugin.noteSyncTasks.failed++
   } finally {
@@ -370,6 +512,13 @@ export const receiveNoteUpload = async function (data: ReceivePathMessage, plugi
     plugin.recordSyncCompleted('note', data.pageIndex)
     return
   }
+  // 冲突未解决：不响应服务端的上传请求，避免旧稿覆盖服务端（#276）
+  // Unresolved conflict: do not answer the server's upload request, so the stale copy never overwrites the server (#276)
+  if (plugin.syncState.conflictedPaths.has(file.path)) {
+    SyncLogManager.getInstance().addLog('send', 'NoteModifyConflict', `冲突未解决，暂停上传: ${file.path}`, 'cancelled', data.path)
+    plugin.recordSyncCompleted('note', data.pageIndex)
+    return
+  }
 
   // NeedPush 驱动的上传-回执往返：Ack（receiveNoteModifyAck）本身不带 pageIndex，
   // 在此按 path 记下所属页，供 Ack 到达时查表归账（见 sync_state.ts pendingNotePushPageIndex 注释）
@@ -387,6 +536,16 @@ export const receiveNoteUpload = async function (data: ReceivePathMessage, plugi
   let contentHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size);
   const content = await plugin.app.vault.read(file);
   if (contentHash === null) contentHash = await hashContentAsync(content);
+
+  // #205：空白 + 从未同步 + 非冲突 → 不响应 NeedPush 上传，先探测服务端是否已有该笔记；
+  // 该页条目立即记为完成，探测结论（Modify/Delete）作为非分页项到达，不阻塞翻页
+  // #205: empty + never synced + not conflicted -> do not answer the NeedPush upload, probe the
+  // server first; the page item is counted complete right away, and the probe verdict
+  // (Modify/Delete) arrives as a non-paginated item, never blocking the page flow
+  if (probeEmptyNoteInsteadOfUpload(plugin, file.path, content, baseHash)) {
+    plugin.recordSyncCompleted('note', data.pageIndex)
+    return
+  }
 
   if (content.length === 0) {
     dump(`Empty note upload: ${data.path}`);
@@ -409,7 +568,10 @@ export const receiveNoteUpload = async function (data: ReceivePathMessage, plugi
   // Overwrites any stale pending entry left by a previously interrupted noteModify.
   plugin.pendingNoteModifies.set(file.path, contentHash)
   plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies)
-  await plugin.concurrencyLimiter.waitForSlot(file.path)
+  if (!await plugin.concurrencyLimiter.waitForSlot(file.path)) {
+    plugin.removeIgnoredFile(file.path)
+    return
+  }
   void plugin.websocket.SendMessage("NoteModify", sendData, undefined, () => {
     plugin.removeIgnoredFile(file.path)
   }, (data as ReceivePathMessage & { context?: string }).context)
@@ -421,41 +583,50 @@ export const receiveNoteUpload = async function (data: ReceivePathMessage, plugi
  */
 export const receiveNoteSyncMtime = async function (data: ReceiveMtimeMessage, plugin: FastSync) {
   if (plugin.settings.syncEnabled == false) return
+  const pushPageIndex = plugin.syncState.pendingNotePushPageIndex.get(data.path);
+  const completionPageIndex = pushPageIndex ?? data.pageIndex;
+  plugin.syncState.pendingNotePushPageIndex.delete(data.path);
+  plugin.concurrencyLimiter.releaseSlot(data.path);
   if (isPathExcluded(data.path, plugin)) {
-    plugin.recordSyncCompleted('note', data.pageIndex)
+    plugin.recordSyncCompleted('note', completionPageIndex)
     return
   }
-  dump(`Receive note sync mtime:`, data.path, data.mtime)
+  // 服务端历史数据可能存秒级 mtime/ctime（#461），落盘/比较前先归一化为毫秒
+  // Legacy server rows may hold second-scale mtime/ctime (#461); normalize to milliseconds
+  const mtime = normalizeServerTimestamp(data.mtime)
+  const ctime = normalizeServerTimestamp(data.ctime)
+  dump(`Receive note sync mtime:`, data.path, mtime)
 
   const normalizedPath = normalizePath(data.path)
 
   try {
-    await plugin.lockManager.withLock(normalizedPath, async () => {
+    const locked = await plugin.lockManager.withLock(normalizedPath, async () => {
       const file = plugin.app.vault.getFileByPath(normalizedPath)
       if (file) {
         const content: string = await plugin.app.vault.read(file)
         plugin.addIgnoredFile(normalizedPath)
         try {
-          await plugin.app.vault.modify(file, content, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
+          await plugin.app.vault.modify(file, content, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
           // 记录 mtime
-          plugin.lastSyncMtime.set(data.path, data.mtime)
+          plugin.lastSyncMtime.set(data.path, mtime || 0)
           // 服务端走 UpdateMtime 说明内容 hash 与客户端发送的一致，提交 pending hash 到 hashManager
           // Server UpdateMtime means content hash matches what client sent; commit pending hash to hashManager
           const pendingHash = plugin.pendingNoteModifies.get(data.path)
           if (pendingHash !== undefined) {
-            plugin.fileHashManager.setFileHash(data.path, pendingHash, data.mtime, file.stat.size)
+            plugin.fileHashManager.setFileHash(data.path, pendingHash, mtime || 0, file.stat.size)
             plugin.pendingNoteModifies.delete(data.path)
             plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies)
           }
           // 更新同步时间
-          if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
-            plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
-          }
+          advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
         } finally {
           plugin.removeIgnoredFile(normalizedPath)
         }
       }
     }, { maxRetries: 5, retryInterval: 100 });
+    // 抢锁失败时任务未执行：按失败处理，不能计为完成
+    // Lock not acquired means the task never ran: count it as a failure, never as completed
+    if (locked === null) throw new Error("Path lock busy")
   } catch (e) {
     dumpError(`[FastSync] Failed to receiveNoteSyncMtime: ${normalizedPath}`, e);
     if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'NoteMtime')) {
@@ -463,7 +634,7 @@ export const receiveNoteSyncMtime = async function (data: ReceiveMtimeMessage, p
     }
     plugin.noteSyncTasks.failed++
   } finally {
-    plugin.recordSyncCompleted('note', data.pageIndex)
+    plugin.recordSyncCompleted('note', completionPageIndex)
   }
 }
 
@@ -478,16 +649,59 @@ export const receiveNoteSyncDelete = async function (data: ReceiveMessage, plugi
   }
   dump(`Receive note delete:`, data.path, data.mtime, data.pathHash)
   const normalizedPath = normalizePath(data.path)
+  let keptLocal: TFile | null = null
+  // #205：NoteSyncDelete 可能是空白笔记探测的结论（服务端没有该笔记）。先取走在途标记，
+  // 再把"探测在途"并入下面的未同步改动判定——本地空白文件不能被误删，须走保留分支重传
+  // #205: this NoteSyncDelete may be the verdict of an empty-note probe (server doesn't have the
+  // note). Take the in-flight mark first, then fold "probe in flight" into the unsynced-edit check
+  // below — the local empty file must not be deleted, it goes through the keep-branch and re-uploads
+  const wasEmptyNoteProbing = emptyNoteProbeSet(plugin).has(data.path)
+  if (wasEmptyNoteProbing) {
+    consumeEmptyNoteProbe(plugin, data.path)
+    // 探测结论：服务端没有该笔记 → 允许下一次（本函数末尾的）重传直接上传空文件
+    // Probe verdict: server doesn't have the note -> let the re-upload below send the empty file directly
+    emptyNoteConfirmedAbsentSet(plugin).add(data.path)
+  }
 
   try {
-    await plugin.lockManager.withLock(normalizedPath, async () => {
+    const locked = await plugin.lockManager.withLock(normalizedPath, async () => {
       const file = plugin.app.vault.getFileByPath(normalizedPath)
       if (file instanceof TFile) {
+        if (blockAliasedRemoteMutation(plugin, file, data.path, "NoteDelete")) return
+        // 本地有未同步的改动时不执行远端删除：保留本地并重新上传（#277）。只读端以服务端为准，照常删除
+        // Unsynced local edits win over a remote delete: keep the note and upload it again (#277).
+        // A read-only device mirrors the server and still deletes
+        if (!plugin.settings.readonlySyncEnabled) {
+          const baseHash = plugin.fileHashManager.getPathHash(normalizedPath)
+          let changed = plugin.pendingNoteModifies.has(normalizedPath) || wasEmptyNoteProbing
+          if (!changed && baseHash !== null) {
+            const localHash = plugin.fileHashManager.getValidHash(normalizedPath, file.stat.mtime, file.stat.size)
+              ?? await hashContentAsync(await plugin.app.vault.read(file))
+            changed = localHash !== baseHash
+          }
+          // 无同步基线：服务端从未确认过这份内容（离线新建、外部工具写入），不能按远端删除处理。
+          // 本连接内首次：保留并重新上传；已重传过：只保留（haierkeys/fast-note-sync-service#514 #391）
+          // No sync baseline: the server never confirmed this content (created offline, written by an
+          // external tool), so a remote delete must not remove it. First time on this connection: keep
+          // and upload again; already re-uploaded: keep only
+          if (!changed && baseHash === null) {
+            if (!firstKeepWithoutBaseline(plugin, normalizedPath)) {
+              SyncLogManager.getInstance().addLog('receive', 'NoteDeleteConflict', `本地文件尚未同步且已重新上传，等待服务端确认，保留本地: ${normalizedPath}`, 'cancelled', data.path)
+              return
+            }
+            changed = true
+          }
+          if (changed) {
+            SyncLogManager.getInstance().addLog('receive', 'NoteDeleteConflict', `本地存在未同步的改动，保留本地并重新上传: ${normalizedPath}`, 'cancelled', data.path)
+            keptLocal = file
+            return
+          }
+        }
         plugin.addIgnoredFile(normalizedPath)
         // 记录待删除路径，用于拦截本地删除事件
         plugin.lastSyncPathDeleted.add(normalizedPath)
         try {
-          await vaultDelete(plugin.app.vault, file)
+          await plugin.app.fileManager.trashFile(file)
           // 服务端推送删除,从哈希表中移除
           plugin.fileHashManager.removeFileHash(normalizedPath)
           plugin.lastSyncMtime.delete(normalizedPath)
@@ -496,9 +710,7 @@ export const receiveNoteSyncDelete = async function (data: ReceiveMessage, plugi
           plugin.pendingNoteModifies.delete(normalizedPath)
           plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies)
           // 更新同步时间
-          if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
-            plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
-          }
+          advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
         } finally {
           // 延时 500ms 清理拦截集合，确保本地事件已被处理
           window.setTimeout(() => {
@@ -508,6 +720,9 @@ export const receiveNoteSyncDelete = async function (data: ReceiveMessage, plugi
         }
       }
     }, { maxRetries: 5, retryInterval: 100 });
+    // 抢锁失败时任务未执行：按失败处理，不能计为完成
+    // Lock not acquired means the task never ran: count it as a failure, never as completed
+    if (locked === null) throw new Error("Path lock busy")
   } catch (e) {
     dumpError(`[FastSync] Failed to receiveNoteSyncDelete: ${normalizedPath}`, e);
     SyncLogManager.getInstance().addLog('receive', 'NoteDelete', e instanceof Error ? e.message : String(e), 'error', data.path);
@@ -515,6 +730,7 @@ export const receiveNoteSyncDelete = async function (data: ReceiveMessage, plugi
   } finally {
     plugin.recordSyncCompleted('note', data.pageIndex)
   }
+  if (keptLocal) void noteModify(keptLocal, plugin)
 }
 
 /**
@@ -531,9 +747,9 @@ export const receiveNoteSyncEnd = async function (data: unknown, plugin: FastSyn
   plugin.noteSyncTasks.needSyncMtime = syncData.needSyncMtimeCount || 0
   plugin.noteSyncTasks.needDelete = syncData.needDeleteCount || 0
 
-  // 无条件更新 lastNoteSyncTime，确保包含服务端本轮同步后的所有异步操作（如 SyncResourceFID）
-  // Unconditionally update lastNoteSyncTime to cover all async server-side ops after this sync round (e.g., SyncResourceFID)
-  plugin.localStorageManager.setMetadata("lastNoteSyncTime", syncData.lastTime)
+  // End 先于明细到达：暂存 lastTime，待本类型全部完成且无失败时由 settleSyncTimes 落盘
+  // End arrives before the details: stash lastTime; settleSyncTimes persists it once the type finished without failures
+  plugin.syncState.pendingSyncEndTime.set("lastNoteSyncTime", syncData.lastTime)
   plugin.syncTypeCompleteCount++
 }
 
@@ -547,6 +763,11 @@ export const receiveNoteSyncRename = async function (data: { path: string, oldPa
     return
   }
 
+  // 服务端历史数据可能存秒级 mtime/ctime（#461），落盘/比较前先归一化为毫秒
+  // Legacy server rows may hold second-scale mtime/ctime (#461); normalize to milliseconds
+  const mtime = normalizeServerTimestamp(data.mtime)
+  const ctime = normalizeServerTimestamp(data.ctime)
+
   dump(`Receive note rename:`, data.oldPath, "->", data.path)
 
   const normalizedOldPath = normalizePath(data.oldPath)
@@ -554,9 +775,11 @@ export const receiveNoteSyncRename = async function (data: { path: string, oldPa
 
   try {
     // 对于重命名，我们需要确新路径不被占用。旧路径通常正在被移动，所以锁定新路径。
-    await plugin.lockManager.withLock(normalizedNewPath, async () => {
+    const locked = await plugin.lockManager.withLock(normalizedNewPath, async () => {
       const file = plugin.app.vault.getFileByPath(normalizedOldPath)
       if (file instanceof TFile) {
+        if (blockAliasedRemoteMutation(plugin, file, data.oldPath, "NoteRename")) return
+        if (blockAliasedRemoteMutation(plugin, plugin.app.vault.getFileByPath(normalizedNewPath), data.path, "NoteRename")) return
         plugin.addIgnoredFile(normalizedNewPath)
         plugin.addIgnoredFile(normalizedOldPath)
 
@@ -564,22 +787,41 @@ export const receiveNoteSyncRename = async function (data: { path: string, oldPa
         plugin.lastSyncPathRenamed.add(normalizedNewPath)
 
         try {
+          // 目标父目录可能尚不存在（改名/移动到新目录）：rename 不建目录，先按 create 路径的
+          // 同一模式确保存在，否则 vault.rename 抛 ENOENT、改名被丢弃（两端永久不一致）
+          // The target parent folder may not exist yet (rename/move into a new dir): rename
+          // creates no folder, so ensure it with the same pattern as the create path, or
+          // vault.rename throws ENOENT and the rename is dropped (permanent divergence)
+          const targetFolder = normalizedNewPath.split("/").slice(0, -1).join("/")
+          if (targetFolder !== "") {
+            const dirExists = plugin.app.vault.getFolderByPath(targetFolder)
+            if (dirExists == null) {
+              try {
+                await plugin.app.vault.createFolder(targetFolder)
+              } catch (e) {
+                // 并发竞争时只有一个调用成功，另一方忽略"已存在"错误
+                // In concurrent race only one call succeeds; ignore "already exists" error
+                if (!plugin.app.vault.getFolderByPath(targetFolder)) throw e
+              }
+            }
+          }
+
           // 如果目标路径已存在文件，先尝试删除
           const targetFile = plugin.app.vault.getFileByPath(normalizedNewPath)
-          if (targetFile) {
-            await vaultDelete(plugin.app.vault, targetFile)
+          if (targetFile && targetFile !== file) {
+            await plugin.app.fileManager.trashFile(targetFile)
           }
 
           await plugin.app.vault.rename(file, normalizedNewPath)
 
           // 更新元数据
-          if (data.mtime) {
+          if (mtime) {
             const renamedFile = plugin.app.vault.getFileByPath(normalizedNewPath)
             if (renamedFile instanceof TFile) {
               const content = await plugin.app.vault.read(renamedFile)
               const options: { ctime?: number; mtime?: number } = {};
-              if (data.ctime && data.ctime > 0) options.ctime = data.ctime;
-              if (data.mtime && data.mtime > 0) options.mtime = data.mtime;
+              if (ctime && ctime > 0) options.ctime = ctime;
+              if (mtime && mtime > 0) options.mtime = mtime;
               await plugin.app.vault.modify(renamedFile, content, options);
             }
           }
@@ -587,12 +829,10 @@ export const receiveNoteSyncRename = async function (data: { path: string, oldPa
           // 更新哈希表：移除旧路径，添加新路径
           plugin.fileHashManager.removeFileHash(data.oldPath)
           const renamedFile = plugin.app.vault.getFileByPath(normalizedNewPath)
-          plugin.fileHashManager.setFileHash(data.path, data.contentHash, data.mtime || (renamedFile instanceof TFile ? renamedFile.stat.mtime : 0), renamedFile instanceof TFile ? renamedFile.stat.size : 0)
+          plugin.fileHashManager.setFileHash(data.path, data.contentHash, mtime || (renamedFile instanceof TFile ? renamedFile.stat.mtime : 0), renamedFile instanceof TFile ? renamedFile.stat.size : 0)
 
           // 更新同步时间
-          if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
-            plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
-          }
+          advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
         } finally {
           window.setTimeout(() => {
             plugin.removeIgnoredFile(normalizedNewPath)
@@ -620,13 +860,20 @@ export const receiveNoteSyncRename = async function (data: { path: string, oldPa
           pathHash: data.pathHash,
         }
         void plugin.websocket.SendMessage("NoteRePush", rePushData)
+        // 本地还没有这个文件时不能先写同步基线：重推的应答若没到（断线、被丢弃），下一轮扫描
+        // 会把"有基线、本地不存在"当成本地删除，把服务端的笔记删掉。基线等内容真正落盘时再写
+        // Do not record a sync baseline while the file does not exist locally: if the re-push
+        // reply never arrives (disconnect, dropped), the next scan treats "baseline but no local
+        // file" as a local delete and removes the note on the server. The baseline is written
+        // once the content actually lands
         if (targetFile instanceof TFile) {
           plugin.fileHashManager.setFileHash(data.path, data.contentHash, targetFile.stat.mtime, targetFile.stat.size)
-        } else {
-          plugin.fileHashManager.setFileHash(data.path, data.contentHash)
         }
       }
     }, { maxRetries: 10, retryInterval: 100 });
+    // 抢锁失败时任务未执行：按失败处理，不能计为完成
+    // Lock not acquired means the task never ran: count it as a failure, never as completed
+    if (locked === null) throw new Error("Path lock busy")
   } catch (e) {
     dumpError(`[FastSync] Failed to receiveNoteSyncRename: ${normalizedOldPath} -> ${normalizedNewPath}`, e);
     if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'NoteRename')) {
@@ -655,9 +902,7 @@ export const receiveNoteModifyAck = function (data: { lastTime?: number; path?: 
       dump(`NoteModifyAck received for non-pending path: ${data.path}`)
     }
   }
-  if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
-    plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
-  }
+  advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
   if (data.path) {
     plugin.concurrencyLimiter.releaseSlot(data.path)
   }
@@ -693,9 +938,7 @@ export const receiveNoteRenameAck = function (data: { lastTime?: number; path?: 
     const file = plugin.app.vault.getFileByPath(normalizePath(pending.newPath))
     plugin.fileHashManager.setFileHash(pending.newPath, pending.contentHash, file?.stat.mtime || 0, file?.stat.size || 0)
   }
-  if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
-    plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
-  }
+  advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
   plugin.concurrencyLimiter.releaseFifoSlot()
 }
 
@@ -711,7 +954,5 @@ export const receiveNoteDeleteAck = function (data: { lastTime?: number; path?: 
   if (data.path) {
     plugin.concurrencyLimiter.releaseSlot(data.path)
   }
-  if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
-    plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
-  }
+  advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
 }

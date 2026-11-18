@@ -467,7 +467,7 @@ export default class FastSync extends Plugin {
         }
       });
     } catch (e) {
-      console.warn(`Fast Note Sync: Protocol handler ${ssoAction} registration skipped or already exists. / 协议处理器注册跳过或已存在:`, e);
+      console.warn(`Fast Note Sync: Protocol handler ${ssoAction} registration skipped or already exists:`, e);
     }
 
     // 提前创建 MenuManager 并初始化 ribbon，必须在 onLayoutReady 之前完成，
@@ -490,7 +490,7 @@ export default class FastSync extends Plugin {
       this.versionManager.validateAndRefreshTags();
 
       // 0. 清理残留的临时下载目录 (Cleanup residual temp download dirs)
-      void clearAllTempChunks(this)
+      void clearAllTempChunks(this).catch(e => dumpError("Failed to clear temp chunks:", e))
 
       // 1. 初始化统计和日志 (UI)
       void SyncLogManager.getInstance().init(this)
@@ -814,10 +814,33 @@ export default class FastSync extends Plugin {
     }
   }
 
+  private applyingExternalSettings = false
+  private externalSettingsDirty = false
+
   async onExternalSettingsChange() {
     dump("onExternalSettingsChange")
-    await this.loadSettings()
-    await this.saveSettings()
+    // Saving unconditionally rewrote data.json (and the token cache) on every external change.
+    // With iCloud or config sync touching data.json, that write could raise another external
+    // change, producing a continuous save loop. Save only when the loaded settings differ.
+    // A change arriving while one is being applied is not dropped: it is applied once more
+    // afterwards. The rerun saves only if the file still differs, so the loop stays bounded.
+    if (this.applyingExternalSettings) {
+      this.externalSettingsDirty = true
+      return
+    }
+    this.applyingExternalSettings = true
+    try {
+      do {
+        this.externalSettingsDirty = false
+        const before = JSON.stringify(this.settings)
+        await this.loadSettings()
+        if (JSON.stringify(this.settings) !== before) {
+          await this.saveSettings()
+        }
+      } while (this.externalSettingsDirty)
+    } finally {
+      this.applyingExternalSettings = false
+    }
   }
 
   async saveSettings() {
@@ -890,6 +913,10 @@ export default class FastSync extends Plugin {
       this.runWsApi = this.settings.api ? this.settings.api.replace(/^http/, "ws") : "";
     }
 
+    if (forceRegister && (setItem === "configSyncOtherDirs" || setItem === "configSyncEnabled")) {
+      void this.configManager?.reloadCustomDirs()
+    }
+
     if (forceRegister && this.settings.api && this.settings.apiToken) {
       const runRegister = () => {
         if (this.wsSettingChange) {
@@ -909,7 +936,7 @@ export default class FastSync extends Plugin {
           this.syncTimer = window.setTimeout(() => {
             if (setItem == "syncEnabled" && this.settings.syncEnabled) {
               void handleSync(this, false, "note")
-            } else if (setItem == "configSyncEnabled" && this.settings.configSyncEnabled) {
+            } else if ((setItem == "configSyncEnabled" || setItem == "configSyncOtherDirs") && this.settings.configSyncEnabled) {
               void handleSync(this, false, "config")
             }
             this.syncTimer = null
@@ -935,6 +962,7 @@ export default class FastSync extends Plugin {
       this.lastSyncPathRenamed = new Set()
       this.fileDownloadSessions = new Map()
     } else {
+      void this.configManager?.stop()
       this.websocket?.unRegister()
       this.ignoredFiles = new Set()
       this.ignoredConfigFiles = new Set()

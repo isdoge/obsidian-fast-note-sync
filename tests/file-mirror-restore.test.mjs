@@ -78,6 +78,8 @@ const fhmRequireStub = (id) => {
   switch (id) {
     case "../utils/helpers":
       return helpers;
+    case "../../i18n/lang":
+      return { $: (key) => key };
     case "../../main":
       return {};
     default:

@@ -1,25 +1,156 @@
+import { blockAliasedRemoteMutation } from "./remote_path_guard";
+import { firstKeepWithoutBaseline } from "./remote_delete_guard";
 import { TFile, TAbstractFile, normalizePath, Platform } from "obsidian";
 
 import { ReceiveFileSyncUpdateMessage, FileUploadMessage, FileSyncChunkDownloadMessage, FileDownloadSession, ReceiveMtimeMessage, ReceivePathMessage, SyncEndData } from "../utils/types";
-import { hashContent, hashArrayBuffer, getPluginDir, dump, dumpError, sleep, isPathExcluded, getSafeCtime, isLargeBinarySyncRisk, describeBinarySyncLimit, showSyncNotice, checkAndNotifyCaseConflict, logMemorySnapshot, hashFileAsync, vaultDelete } from "../utils/helpers";
+import { hashContent, hashArrayBuffer, getPluginDir, dump, dumpError, sleep, isPathExcluded, getSafeCtime, isLargeBinarySyncRisk, describeBinarySyncLimit, showSyncNotice, checkAndNotifyCaseConflict, logMemorySnapshot, hashFileAsync, vaultDelete, normalizeServerTimestamp } from "../utils/helpers";
 import { FileCloudPreview } from "../storage/file_cloud_preview";
 import { SyncLogManager } from "./sync_log_manager";
+import { advanceLiveSyncTime } from "./sync_state";
 import { HttpApiService } from "../api/http_api_service";
 import type FastSync from "../../main";
 
+
+// Download commit guard. A download may only overwrite the local path if, at commit time, it is
+// still the newest request for that path in the current connection and the local file has not
+// changed, been deleted or gained pending local work since the request was sent. Only file
+// stats are captured (after the concurrency slot is held), so no file is read ahead of time.
+const downloadOwners = new WeakMap<FastSync, Map<string, object>>()
+const downloadEpochs = new WeakMap<FastSync, number>()
+
+export function invalidateFileDownloads(plugin: FastSync): void {
+  downloadEpochs.set(plugin, (downloadEpochs.get(plugin) || 0) + 1)
+  downloadOwners.delete(plugin)
+  // 旧连接的会话不会再收到分片：直接丢弃，不计页、不计失败；否则重连后 120s 看门狗会把它们记到新一轮的页上
+  // Sessions of the closed connection never receive chunks again: drop them without page or failure
+  // accounting, otherwise the watchdog would book them onto the next round's pages after reconnect
+  for (const session of plugin.fileDownloadSessions.values()) {
+    releaseSessionMemory(session)
+    session.chunks?.clear()
+    const id = session.sessionId || session.tempDir?.split("/").pop()
+    if (session.tempDir && id) {
+      void clearTempChunksDir(plugin, id).catch(e => dumpError(`Temp chunk cleanup failed for session ${id}`, e))
+    }
+  }
+  plugin.fileDownloadSessions.clear()
+}
+
+// 会话属于已断开的连接（epoch 已过期）：其迟到的完成/失败不能记到当前一轮
+// The session belongs to a closed connection (stale epoch): its late completion/failure must not count in the current round
+function isStaleDownload(plugin: FastSync, session: FileDownloadSession): boolean {
+  return !!session.commitGuard && session.commitGuard.epoch !== (downloadEpochs.get(plugin) || 0)
+}
+
+function captureDownloadGuard(plugin: FastSync, path: string): NonNullable<FileDownloadSession["commitGuard"]> {
+  const owners = downloadOwners.get(plugin) || new Map<string, object>()
+  downloadOwners.set(plugin, owners)
+  const owner = {}
+  owners.set(path, owner)
+  const file = plugin.app.vault.getFileByPath(normalizePath(path))
+  return { owner, epoch: downloadEpochs.get(plugin) || 0, file, mtime: file?.stat.mtime, size: file?.stat.size }
+}
+
+function releaseDownloadOwner(plugin: FastSync, session: FileDownloadSession): void {
+  const owners = downloadOwners.get(plugin)
+  if (session.commitGuard && owners?.get(session.path) === session.commitGuard.owner) owners.delete(session.path)
+}
+
+function assertDownloadCommittable(plugin: FastSync, session: FileDownloadSession): void {
+  const guard = session.commitGuard
+  if (!guard) return
+  if (isPluginUnloading || plugin.settings.syncEnabled === false ||
+    plugin.fileDownloadSessions.get(session.sessionId) !== session ||
+    downloadOwners.get(plugin)?.get(session.path) !== guard.owner ||
+    (downloadEpochs.get(plugin) || 0) !== guard.epoch) {
+    throw new Error("Download superseded by a newer request, cancellation or reconnect")
+  }
+  if (plugin.pendingUploadHashes.has(session.path) || plugin.pendingDeleteFilePaths.has(session.path) ||
+    plugin.pendingFileDeleteAcks.has(session.path)) {
+    throw new Error("Download skipped: local change pending upload or deletion")
+  }
+  const current = plugin.app.vault.getFileByPath(normalizePath(session.path))
+  if (current !== guard.file || current?.stat.mtime !== guard.mtime || current?.stat.size !== guard.size) {
+    throw new Error("Download skipped: local file changed during download")
+  }
+}
 
 // 下载内存缓冲控制 (20MB 阈值防止 OOM)
 let currentDownloadBufferBytes = 0
 const MAX_DOWNLOAD_BUFFER_BYTES = 20 * 1024 * 1024
 
 // 上传中的文件追踪，用于删除时取消上传
-const activeUploadsMap = new Map<string, { cancelled: boolean }>()
+const activeUploadsMap = new Map<string, { cancelled: boolean; checkpointKey?: string }>()
 
 // 全局中止信号，用于插件卸载时
 export let isPluginUnloading = false;
 
 // 会话 ID 到文件路径的映射，用于处理 463 会话不存在错误
 const sessionIdToPathMap = new Map<string, string>()
+const pathToSessionIdMap = new Map<string, string>()
+const uploadAckTimers = new Map<string, number>()
+const uploadRetries = new Map<string, number>()
+const uploadContexts = new Map<string, string | null>()
+
+function clearUploadTracking(path: string): void {
+  const timer = uploadAckTimers.get(path)
+  if (timer !== undefined) window.clearTimeout(timer)
+  uploadAckTimers.delete(path)
+  const active = activeUploadsMap.get(path)
+  if (active) active.cancelled = true
+  activeUploadsMap.delete(path)
+  const id = pathToSessionIdMap.get(path)
+  if (id) sessionIdToPathMap.delete(id)
+  pathToSessionIdMap.delete(path)
+}
+
+/** Cancel an upload superseded by a local delete or rename and settle its sync-page item. */
+function cancelActiveUpload(path: string, plugin: FastSync): boolean {
+  const active = activeUploadsMap.get(path)
+  if (!active) return false
+
+  active.cancelled = true
+  const checkpointKey = active.checkpointKey
+  const pageIndex = plugin.syncState.pendingFilePushPageIndex.get(path)
+  plugin.syncState.pendingFilePushPageIndex.delete(path)
+  clearUploadTracking(path)
+  uploadRetries.delete(path)
+  uploadContexts.delete(path)
+  if (checkpointKey) {
+    try { plugin.app.saveLocalStorage(checkpointKey, null) } catch { /* ignore */ }
+  }
+  plugin.concurrencyLimiter.releaseSlot(path)
+  if (pageIndex !== undefined) plugin.recordSyncCompleted('file', pageIndex)
+  return true
+}
+
+function armUploadAckTimeout(path: string, plugin: FastSync): void {
+  const previous = uploadAckTimers.get(path)
+  if (previous !== undefined) window.clearTimeout(previous)
+  uploadAckTimers.set(path, window.setTimeout(() => recoverUpload(path, plugin), 60000))
+}
+
+function recoverUpload(path: string, plugin: FastSync): void {
+  const context = uploadContexts.get(path)
+  clearUploadTracking(path)
+  plugin.concurrencyLimiter.releaseSlot(path)
+  if (isPluginUnloading || !plugin.websocket.isOpen || context !== plugin.syncState.activeSyncContext) return
+  const attempts = (uploadRetries.get(path) || 0) + 1
+  uploadRetries.set(path, attempts)
+  const file = plugin.app.vault.getFileByPath(path)
+  if (attempts > 2 || !file) {
+    plugin.fileSyncTasks.failed++
+    const page = plugin.syncState.pendingFilePushPageIndex.get(path)
+    plugin.syncState.pendingFilePushPageIndex.delete(path)
+    plugin.recordSyncCompleted('file', page)
+    SyncLogManager.getInstance().addLog('receive', 'FileUpload', 'Upload acknowledgement unavailable after bounded retries', 'error', path)
+    return
+  }
+  // Recheck current local content; never reuse an expired session or stale bytes.
+  void fileModify(file, plugin, false, true).catch(error => {
+    dumpError('Upload recovery failed', error)
+    recoverUpload(path, plugin)
+  })
+}
 
 // 大文件跳过同步通知去重：本会话内已提示过的 "path|size"，避免同一文件每轮同步重复弹 toast
 const sessionLargeFileNotified = new Set<string>()
@@ -102,8 +233,19 @@ const formatDownloadError = (e: unknown) => {
 // completion detection / page ACK unchanged), so failures aren't surfaced as success in the status bar
 const cleanupFileDownloadSession = async (plugin: FastSync, session: FileDownloadSession, failed = false) => {
   releaseSessionMemory(session)
+  releaseDownloadOwner(plugin, session)
   plugin.fileDownloadSessions.delete(session.sessionId)
-  if (session.tempDir) await clearTempChunksDir(plugin, session.sessionId)
+  // 清理临时目录失败不能中断记账：否则会话已移除，但失败计数、页完成与名额释放都会丢失
+  // A temp-dir cleanup failure must not abort bookkeeping; otherwise the session is gone but
+  // the failure count, page completion and slot release are all lost
+  if (session.tempDir) {
+    try {
+      await clearTempChunksDir(plugin, session.sessionId)
+    } catch (e) {
+      dumpError(`Temp chunk cleanup failed for session ${session.sessionId}`, e)
+    }
+  }
+  if (isStaleDownload(plugin, session)) return
   if (failed) plugin.fileSyncTasks.failed++
   plugin.recordSyncCompleted('file', session.pageIndex)
 }
@@ -121,9 +263,36 @@ const failFileDownloadSession = async (plugin: FastSync, session: FileDownloadSe
     message
   });
   await cleanupFileDownloadSession(plugin, session, true)
-  if (releaseSlot) {
+  if (releaseSlot && !isStaleDownload(plugin, session)) {
     plugin.concurrencyLimiter.releaseSlot(`download_${session.path}`)
   }
+}
+
+// 下载会话看门狗：服务端下载会话会过期（download-session-timeout），分片不再到达时客户端会话
+// 会永久占住并发名额，并让 checkSyncCompletion 的 fileDownloadSessions.size === 0 永远不成立。
+// 超过闲置期仍无响应/分片的会话按失败处理，释放名额并归账所属页；下一轮同步会重新下载。
+// Download watchdog: when the server-side download session expires and chunks stop arriving, the
+// client session would hold its concurrency slot forever and keep checkSyncCompletion from ever
+// finishing. Fail sessions idle past the limit, releasing the slot and page; the next round retries.
+export const DOWNLOAD_SESSION_IDLE_MS = 120000
+let lastDownloadSweepAt = 0
+export const sweepStalledDownloadSessions = async (plugin: FastSync, idleMs = DOWNLOAD_SESSION_IDLE_MS, now = Date.now()) => {
+  if (now - lastDownloadSweepAt < 10000) return 0
+  lastDownloadSweepAt = now
+  const stalled: Array<[string, FileDownloadSession]> = []
+  for (const [key, session] of plugin.fileDownloadSessions) {
+    // 已进入提交阶段的会话由提交流程自行记账 / Sessions already committing do their own accounting
+    if (session.committing) continue
+    if (session.lastActivityAt !== undefined && now - session.lastActivityAt > idleMs) stalled.push([key, session])
+  }
+  for (const [key, session] of stalled) {
+    plugin.fileDownloadSessions.delete(key)
+    // 临时会话 sessionId 为空：用其自身临时目录名清理，绝不能以空 id 删除整个 temp-chunks 目录
+    // Temp sessions have an empty sessionId: clean up by their own temp dir name, never the whole temp-chunks base
+    const sessionId = session.sessionId || session.tempDir?.split("/").pop() || key
+    await failFileDownloadSession(plugin, { ...session, sessionId }, `No download data received for ${Math.round(idleMs / 1000)}s`)
+  }
+  return stalled.length
 }
 
 const storeMemoryChunk = (session: FileDownloadSession, chunkIndex: number, chunkData: ArrayBuffer) => {
@@ -164,18 +333,66 @@ const fallbackFileDownloadSessionToMemory = async (plugin: FastSync, session: Fi
  * 清理所有残留的临时目录
  */
 export const clearAllTempChunks = async (plugin: FastSync) => {
+  const adapter = plugin.app.vault.adapter
   const path = getTempChunksDir(plugin)
-  if (await plugin.app.vault.adapter.exists(path)) {
-    dump(`Cleaning all temp chunks: ${path}`)
-    await plugin.app.vault.adapter.rmdir(path, true)
+
+  const removeEntries = async (dirPath: string) => {
+    if (typeof adapter.list !== "function") return
+    try {
+      const entries = await adapter.list(dirPath)
+      for (const file of entries.files || []) {
+        try {
+          await adapter.remove(file)
+        } catch (err) {
+          dumpError(`Failed to remove temp chunk file: ${file}`, err)
+        }
+      }
+      for (const folder of entries.folders || []) {
+        await removeEntries(folder)
+        try {
+          await adapter.rmdir(folder, true)
+        } catch (err) {
+          dumpError(`Failed to remove temp chunk folder: ${folder}`, err)
+        }
+      }
+    } catch (err) {
+      dumpError(`Failed to list temp chunk dir: ${dirPath}`, err)
+    }
   }
+
+  try {
+    if (await adapter.exists(path)) {
+      dump(`Cleaning all temp chunks: ${path}`)
+      try {
+        await adapter.rmdir(path, true)
+      } catch (e) {
+        dumpError(`Failed to remove temp chunks dir: ${path}`, e)
+        await removeEntries(path)
+      }
+    }
+  } catch (e) {
+    dumpError(`Failed to clean temp chunks: ${path}`, e)
+  }
+
   // 确保基础目录在清理后立即存在 (Ensure base dir exists immediately after cleanup)
-  if (!(await plugin.app.vault.adapter.exists(path))) {
-    await plugin.app.vault.adapter.mkdir(path)
+  try {
+    if (!(await adapter.exists(path))) {
+      await adapter.mkdir(path)
+    }
+  } catch (e) {
+    dumpError(`Failed to ensure temp chunks dir exists: ${path}`, e)
   }
 }
 
 export const clearUploadQueue = () => {
+  for (const timer of uploadAckTimers.values()) window.clearTimeout(timer)
+  for (const state of activeUploadsMap.values()) state.cancelled = true
+  uploadAckTimers.clear()
+  uploadContexts.clear()
+  uploadRetries.clear()
+  activeUploadsMap.clear()
+  sessionIdToPathMap.clear()
+  pathToSessionIdMap.clear()
 }
 
 /**
@@ -183,6 +400,7 @@ export const clearUploadQueue = () => {
  */
 export const abortAllFileOperations = () => {
   isPluginUnloading = true;
+  clearUploadQueue();
   for (const upload of activeUploadsMap.values()) {
     upload.cancelled = true;
   }
@@ -201,7 +419,7 @@ export const BINARY_PREFIX_FILE_SYNC = "00"
 /**
  * 文件（非笔记）修改事件处理
  */
-export const fileModify = async function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false) {
+export const fileModify = async function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false, forceCheck = false) {
   if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
   if (!(file instanceof TFile)) return
   if (file.path.endsWith(".md")) return
@@ -224,13 +442,23 @@ export const fileModify = async function (file: TAbstractFile, plugin: FastSync,
       let contentHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size);
 
       if (contentHash !== null) {
-        if (contentHash === baseHash && (lastSyncMtime !== undefined && lastSyncMtime === file.stat.mtime)) {
+        if (!forceCheck && contentHash === baseHash && (lastSyncMtime !== undefined && lastSyncMtime === file.stat.mtime)) {
           dump(`File modify intercepted (cache match): ${file.path}`)
           return
         }
       } else {
         contentHash = await hashFileAsync(plugin.app, file.path);
         logMemorySnapshot(`after modify hash ${file.path}`)
+      }
+
+      // 内容与上次同步一致、只有 mtime 变了（如打开 canvas 时 Obsidian 原样写回）：没有可上传的改动。
+      // 若照常上传，较新的 mtime 会让服务端用本地旧内容覆盖其它端的新版本（#256）
+      // Content equals the last synced version and only the mtime moved (e.g. Obsidian rewrites a canvas
+      // unchanged when opening it): nothing to upload. Uploading anyway lets the newer mtime overwrite
+      // another device's newer version on the server with this stale content (#256)
+      if (!forceCheck && contentHash === baseHash && !plugin.pendingUploadHashes.has(file.path)) {
+        dump(`File modify skipped (content unchanged since last sync): ${file.path}`)
+        return
       }
 
       const data = {
@@ -251,7 +479,9 @@ export const fileModify = async function (file: TAbstractFile, plugin: FastSync,
       plugin.pendingFileDeleteAcks.delete(file.path)
       plugin.pendingUploadHashes.set(file.path, contentHash)
       plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes)
-      await plugin.concurrencyLimiter.waitForSlot(file.path)
+      if (!await plugin.concurrencyLimiter.waitForSlot(file.path)) return
+      uploadContexts.set(file.path, plugin.syncState.activeSyncContext)
+      armUploadAckTimeout(file.path, plugin)
       void plugin.websocket.SendMessage("FileUploadCheck", data)
       dump(`File modify check sent`, data.path, data.contentHash)
     } finally {
@@ -280,7 +510,7 @@ export const fileDelete = async function (file: TAbstractFile, plugin: FastSync,
   await plugin.lockManager.withLock(file.path, async () => {
     // 如果该文件正在上传或在队列中，则标记为取消，且不再发送服务端删除消息
     if (activeUploadsMap.has(file.path)) {
-      activeUploadsMap.get(file.path)!.cancelled = true;
+      cancelActiveUpload(file.path, plugin)
       dump(`Upload cancelled due to file deletion: ${file.path}`);
       // 仅清理本地状态
       plugin.fileHashManager.removeFileHash(file.path)
@@ -301,7 +531,7 @@ export const fileDelete = async function (file: TAbstractFile, plugin: FastSync,
         path: file.path,
         pathHash: hashContent(file.path),
       }
-      await plugin.concurrencyLimiter.waitForSlot(file.path)
+      if (!await plugin.concurrencyLimiter.waitForSlot(file.path)) return
       void plugin.websocket.SendMessage("FileDelete", data, undefined, () => {
         // 消息真正写入 TCP 缓冲区后加入 pending set，等待 FileDeleteAck 再删 hash
         // Add to pending set only after message is actually buffered; remove hash only on FileDeleteAck
@@ -329,7 +559,7 @@ export const fileDeleteByPath = async function (filePath: string, plugin: FastSy
     // 如果该文件正在上传或在队列中，则标记为取消，且不再发送服务端删除消息
     // If the file is being uploaded or in the queue, cancel and skip server delete
     if (activeUploadsMap.has(filePath)) {
-      activeUploadsMap.get(filePath)!.cancelled = true;
+      cancelActiveUpload(filePath, plugin)
       plugin.fileHashManager.removeFileHash(filePath)
       plugin.pendingUploadHashes.delete(filePath)
       plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes)
@@ -343,7 +573,7 @@ export const fileDeleteByPath = async function (filePath: string, plugin: FastSy
 
     plugin.addIgnoredFile(filePath)
     try {
-      await plugin.concurrencyLimiter.waitForSlot(filePath)
+      if (!await plugin.concurrencyLimiter.waitForSlot(filePath)) return
       void plugin.websocket.SendMessage("FileDelete", {
         vault: plugin.settings.vault,
         path: filePath,
@@ -405,7 +635,7 @@ export const fileRename = async function (file: TAbstractFile, oldfile: string, 
 
       // 如果旧文件正在上传，则取消上传且不发送删除消息
       if (activeUploadsMap.has(oldfile)) {
-        activeUploadsMap.get(oldfile)!.cancelled = true;
+        cancelActiveUpload(oldfile, plugin)
         // 重新上传
         void fileModify(file, plugin)
         dump(`Upload cancelled due to file rename: ${oldfile}`);
@@ -434,7 +664,7 @@ export const fileRename = async function (file: TAbstractFile, oldfile: string, 
         // 将重命名推入待确认队列，等待服务端 FileRenameAck 后再更新 hashManager
         // Push rename to pending queue; hashManager will be updated after server FileRenameAck
         plugin.pendingFileRenames.push({ oldPath: oldfile, newPath: file.path, contentHash })
-        await plugin.concurrencyLimiter.waitForSlot(file.path, true)
+        if (!await plugin.concurrencyLimiter.waitForSlot(file.path, true)) return
         void plugin.websocket.SendMessage("FileRename", data)
       }
     } finally {
@@ -460,7 +690,10 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
     return
   }
   dump(`Receive file need upload (queued): `, data.path, data.sessionId)
+  const previousSession = pathToSessionIdMap.get(data.path)
+  if (previousSession) sessionIdToPathMap.delete(previousSession)
   sessionIdToPathMap.set(data.sessionId, data.path)
+  pathToSessionIdMap.set(data.path, data.sessionId)
 
   const file = plugin.app.vault.getFileByPath(normalizePath(data.path))
   if (!file) {
@@ -492,14 +725,18 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
 
   const runUpload = async () => {
     // 标记该路径进入活跃上传状态
-    activeUploadsMap.set(data.path, { cancelled: false });
-    await plugin.concurrencyLimiter.waitForSlot(data.path, false, 10) // 优先级设为 10，优先处理上传
+    if (!await plugin.concurrencyLimiter.waitForSlot(data.path, false, 10)) return;
+    const vaultName = plugin.app.vault.getName()
+    const checkpointKey = `fns-${vaultName}-uploadSession-${data.pathHash}`
+    const previousTimer = uploadAckTimers.get(data.path)
+    if (previousTimer !== undefined) window.clearTimeout(previousTimer)
+    uploadAckTimers.delete(data.path)
+    const uploadState = { cancelled: false, checkpointKey };
+    activeUploadsMap.set(data.path, uploadState);
+    uploadContexts.set(data.path, plugin.syncState.activeSyncContext);
 
     // 断点续传 checkpoint key，提升到 try 外以便 catch 块中也能清除
     // Resume checkpoint key hoisted outside try so the catch block can also remove it
-    const vaultName = plugin.app.vault.getName()
-    const checkpointKey = `fns-${vaultName}-uploadSession-${data.pathHash}`
-
     try {
       // 延迟到任务排到时才读取文件内容, 减少内存积压
       let content: ArrayBuffer | null = null;
@@ -510,6 +747,8 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
         dump(`Failed to read file for upload: ${data.path}`, e)
       }
       if (!content) {
+        clearUploadTracking(data.path)
+        plugin.fileSyncTasks.failed++
         plugin.totalChunksToUpload -= actualTotalChunks
         plugin.concurrencyLimiter.releaseSlot(data.path)
         plugin.recordSyncCompleted('file', data.pageIndex)
@@ -522,8 +761,11 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
       // Temporarily store hash in pending map, update hashManager only after server FileUploadAck
       plugin.pendingUploadHashes.set(data.path, contentHash)
       plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes)
-      // 记录当前文件的 mtime/size 到缓存，以便后续利用
-      plugin.fileHashManager.setFileHash(data.path, contentHash, file.stat.mtime, file.stat.size)
+      // 记录当前文件的 mtime/size 到缓存，以便后续利用。只写缓存：同步基线要等 FileUploadAck，
+      // 否则上传中断后基线会声称服务端已有这份内容（haierkeys/fast-note-sync-service#512）
+      // Cache only: the sync baseline waits for FileUploadAck, or an interrupted upload leaves a
+      // baseline claiming the server already has this content
+      plugin.fileHashManager.setFileHashes([[data.path, contentHash]], () => file.stat)
 
       // 使用外层计算好的 actualTotalChunks
 
@@ -590,7 +832,7 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
           BINARY_PREFIX_FILE_SYNC,
           () => {
             // before: 检查是否已被取消(例如由于文件在上传过程中被删除)
-            if (isPluginUnloading || activeUploadsMap.get(data.path)?.cancelled) {
+            if (isPluginUnloading || uploadState.cancelled) {
               dump(`Upload aborted for ${data.path} (cancelled before send)`);
               return true; // 返回 true 表示应该取消发送
             }
@@ -644,10 +886,21 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
             status: 'pending',
             message: '连接已断开，等待重连后续传'
           });
+          plugin.concurrencyLimiter.releaseSlot(data.path);
           return;
         }
 
         // 如果被取消,立即退出循环并释放槽位
+        if (uploadState.cancelled) {
+          // Deletion/recovery settled the old task. A delayed send callback may
+          // have written its checkpoint after cleanup; clear it unless a newer
+          // session for this path now owns that checkpoint.
+          const currentSessionId = pathToSessionIdMap.get(data.path)
+          if (!currentSessionId || currentSessionId === data.sessionId) {
+            try { plugin.app.saveLocalStorage(checkpointKey, null) } catch { /* ignore */ }
+          }
+          return; // The cancellation owner already released or replaced this slot.
+        }
         if (sendResult === 'cancelled' || isPluginUnloading) {
           // 取消时清除 checkpoint，避免使用已失效的会话
           // Clear checkpoint on cancel to avoid stale session reuse
@@ -663,6 +916,7 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
 
       // 手动置空辅助 GC
       content = null;
+      if (!uploadState.cancelled && sessionIdToPathMap.has(data.sessionId)) armUploadAckTimeout(data.path, plugin);
 
       // 上传完成后，如果开启了附件云预览 - 上传后删除，则删除本地附件
       if (plugin.settings.cloudPreviewEnabled && plugin.settings.cloudPreviewAutoDeleteLocal) {
@@ -683,10 +937,17 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
             const serverInfo = await apiService.getFileInfo(file.path);
 
             if (serverInfo) {
-              // 核对 path、size、mtime 是否一致
+              // 核对 path、size、mtime 是否一致；还要求服务端内容哈希就是本次上传的内容，
+              // 大小和时间相同的旧记录不能当作"已收到"（haierkeys/fast-note-sync-service#512）；
+              // 服务端历史数据可能存秒级 mtime（#461），比较前归一化为毫秒
+              // Besides path, size and mtime the server must hold the content just uploaded; an older
+              // record with the same size and mtime does not prove the upload arrived
+              // (haierkeys/fast-note-sync-service#512); legacy rows may hold second-scale mtime
+              // (#461), normalize before comparing
               if (serverInfo.path === file.path &&
                 serverInfo.size === file.stat.size &&
-                serverInfo.mtime === file.stat.mtime) {
+                normalizeServerTimestamp(serverInfo.mtime) === file.stat.mtime &&
+                serverInfo.contentHash === contentHash) {
                 dump(`Cloud Preview: Auto delete verified file: ${file.path}`);
                 plugin.addIgnoredFile(file.path);
                 try {
@@ -708,13 +969,15 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
       dump(`Upload process error for ${data.path}`, e);
       // 异常退出时清除 checkpoint，避免下次用无效的 sessionId 继续
       try { plugin.app.saveLocalStorage(checkpointKey, null) } catch { /* ignore */ }
+      clearUploadTracking(data.path)
+      plugin.fileSyncTasks.failed++
       plugin.totalChunksToUpload -= actualTotalChunks
       plugin.concurrencyLimiter.releaseSlot(data.path);
       plugin.recordSyncCompleted('file', data.pageIndex)
     } finally {
       // 任务结束（完成或取消/失败），移除活跃标记
-      activeUploadsMap.delete(data.path);
-      sessionIdToPathMap.delete(data.sessionId);
+      // Keep the session mapping until ACK/error, which arrives after the send loop.
+      if (activeUploadsMap.get(data.path) === uploadState) activeUploadsMap.delete(data.path);
     }
   }
 
@@ -742,8 +1005,8 @@ export const receiveFileSyncUpdate = async function (data: ReceiveFileSyncUpdate
     return
   }
 
-  // 如果开启了云预览，且是初始化同步阶段，由于云预览可以按需加载，跳过所有附件下载
-  if (plugin.localStorageManager.getMetadata("isInitSync") && plugin.settings.cloudPreviewEnabled) {
+  // 按需预览从首次同步起生效，不能依赖首次同步已经成功完成。
+  if (plugin.settings.cloudPreviewEnabled) {
     if (plugin.settings.cloudPreviewTypeRestricted) {
       // 开启了类型限制：仅跳过受限类型 (图片、视频、音频、PDF)
       const ext = data.path.substring(data.path.lastIndexOf(".")).toLowerCase();
@@ -762,9 +1025,16 @@ export const receiveFileSyncUpdate = async function (data: ReceiveFileSyncUpdate
 
   // 等待并发槽位，防止大量并发下载导致内存耗尽
   const slotKey = `download_${data.path}`
-  await plugin.concurrencyLimiter.waitForSlot(slotKey, false, -10) // 优先级设为 -10，延后处理下载
+  if (!await plugin.concurrencyLimiter.waitForSlot(slotKey, false, -10)) return;
 
   try {
+    // 等待并发槽位时用户可能开启云预览，旧排队任务也必须遵守当前设置。
+    if (plugin.settings.cloudPreviewEnabled && (!plugin.settings.cloudPreviewTypeRestricted ||
+      FileCloudPreview.isRestrictedType(data.path.substring(data.path.lastIndexOf(".")).toLowerCase()))) {
+      plugin.concurrencyLimiter.releaseSlot(slotKey);
+      plugin.recordSyncCompleted('file', data.pageIndex);
+      return;
+    }
     // 下载内存缓冲控制：如果当前内存中待写盘的分块过多，由于下载是异步触发的，此处等待
     while (currentDownloadBufferBytes > MAX_DOWNLOAD_BUFFER_BYTES) {
       await sleep(200);
@@ -772,17 +1042,21 @@ export const receiveFileSyncUpdate = async function (data: ReceiveFileSyncUpdate
 
     dump(`Receive file sync update(download): `, data.path)
     const tempKey = `temp_${data.path}`
+    // 服务端历史数据可能存秒级 mtime/ctime（#461），落盘/比较前先归一化为毫秒
+    // Legacy server rows may hold second-scale mtime/ctime (#461); normalize to milliseconds
     const tempSession: FileDownloadSession = {
+      commitGuard: captureDownloadGuard(plugin, data.path),
       path: data.path,
       contentHash: data.contentHash,
-      ctime: data.ctime,
-      mtime: data.mtime,
+      ctime: normalizeServerTimestamp(data.ctime),
+      mtime: normalizeServerTimestamp(data.mtime),
       lastTime: data.lastTime,
       sessionId: "",
       totalChunks: 0,
       size: data.size,
       pageIndex: data.pageIndex,
       initialSlotKey: slotKey,
+      lastActivityAt: Date.now(),
       ...createDownloadStorage(plugin, `init_${data.pathHash}`, data.size),
     }
     plugin.fileDownloadSessions.set(tempKey, tempSession)
@@ -794,12 +1068,7 @@ export const receiveFileSyncUpdate = async function (data: ReceiveFileSyncUpdate
     }
     void plugin.websocket.SendMessage("FileChunkDownload", requestData)
     plugin.totalFilesToDownload++
-
-    // 更新同步时间
-    // Update sync time
-    if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
-      plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
-    }
+    // lastFileSyncTime advances when the download commits, so a failed download stays eligible.
   } catch (e) {
     plugin.concurrencyLimiter.releaseSlot(slotKey)
     throw e;
@@ -817,39 +1086,56 @@ export const receiveFileSyncDelete = async function (data: ReceivePathMessage, p
     return
   }
 
-  if (plugin.localStorageManager.getMetadata("isInitSync") && plugin.settings.cloudPreviewEnabled) {
-    if (plugin.settings.cloudPreviewTypeRestricted) {
-      const ext = data.path.substring(data.path.lastIndexOf(".")).toLowerCase();
-      if (FileCloudPreview.isRestrictedType(ext)) {
-        dump(`Cloud Preview: Skipping restricted file delete: ${data.path}`);
-        plugin.recordSyncCompleted('file', data.pageIndex);
-        return;
-      }
-    } else {
-      dump(`Cloud Preview: Skipping all file deletes: ${data.path}`);
-      plugin.recordSyncCompleted('file', data.pageIndex);
-      return;
-    }
-  }
+  // Cloud preview only avoids downloading attachments. A server deletion must still remove a
+  // local copy; skipping it left deleted attachments on the device to be uploaded again.
 
   dump(`Receive file delete: `, data.path)
   const normalizedPath = normalizePath(data.path)
+  let keptLocal: TFile | null = null
 
   await plugin.lockManager.withLock(normalizedPath, async () => {
     const file = plugin.app.vault.getFileByPath(normalizedPath)
     if (file instanceof TFile) {
+      if (blockAliasedRemoteMutation(plugin, file, data.path, "FileDelete")) return
+      // 本地有未同步的改动时不执行远端删除：保留本地并重新上传（#277）。只读端以服务端为准，照常删除；
+      // 超大附件不读内容，统计信息与已同步记录不符即视为有改动
+      // Unsynced local edits win over a remote delete: keep the file and upload it again (#277).
+      // A read-only device still deletes; large attachments are not read, a stat mismatch counts as changed
+      if (!plugin.settings.readonlySyncEnabled) {
+        const baseHash = plugin.fileHashManager.getPathHash(normalizedPath)
+        let changed = plugin.pendingUploadHashes.has(normalizedPath)
+        if (!changed && baseHash !== null) {
+          let localHash = plugin.fileHashManager.getValidHash(normalizedPath, file.stat.mtime, file.stat.size)
+          if (localHash === null && !isLargeBinarySyncRisk(file.stat.size, plugin)) localHash = await hashFileAsync(plugin.app, normalizedPath)
+          changed = localHash !== baseHash
+        }
+        // 无同步基线：服务端从未确认过这份内容，不能按远端删除处理。本连接内首次：保留并重新上传；
+        // 已重传过：只保留（haierkeys/fast-note-sync-service#514 #391）
+        // No sync baseline: the server never confirmed this content, so a remote delete must not remove
+        // it. First time on this connection: keep and upload again; already re-uploaded: keep only
+        if (!changed && baseHash === null) {
+          if (!firstKeepWithoutBaseline(plugin, normalizedPath)) {
+            SyncLogManager.getInstance().addLog('receive', 'FileDeleteConflict', `本地文件尚未同步且已重新上传，等待服务端确认，保留本地: ${normalizedPath}`, 'cancelled', data.path)
+            return
+          }
+          changed = true
+        }
+        if (changed) {
+          SyncLogManager.getInstance().addLog('receive', 'FileDeleteConflict', `本地存在未同步的改动，保留本地并重新上传: ${normalizedPath}`, 'cancelled', data.path)
+          keptLocal = file
+          return
+        }
+      }
       plugin.addIgnoredFile(normalizedPath)
       // 记录待删除路径
       plugin.lastSyncPathDeleted.add(normalizedPath)
       try {
-        await vaultDelete(plugin.app.vault, file)
+        await plugin.app.fileManager.trashFile(file)
         // 服务端推送删除,从哈希表中移除
         plugin.fileHashManager.removeFileHash(normalizedPath)
         plugin.lastSyncMtime.delete(normalizedPath)
         // 更新同步时间
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
-          plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
-        }
+        advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
       } finally {
         // 延时 500ms 清理
         window.setTimeout(() => {
@@ -858,13 +1144,18 @@ export const receiveFileSyncDelete = async function (data: ReceivePathMessage, p
         }, 500);
       }
     }
-  }, { maxRetries: 5, retryInterval: 100 }).catch(e => {
+  }, { maxRetries: 5, retryInterval: 100 }).then(locked => {
+    // 抢锁失败时任务未执行：按失败处理，不能计为完成
+    // Lock not acquired means the task never ran: count it as a failure, never as completed
+    if (locked === null) throw new Error("Path lock busy")
+  }).catch(e => {
     dumpError(`[FastSync] Failed to receiveFileSyncDelete: ${normalizedPath}`, e);
     SyncLogManager.getInstance().addLog('receive', 'FileDelete', e instanceof Error ? e.message : String(e), 'error', data.path);
     plugin.fileSyncTasks.failed++
   });
 
   plugin.recordSyncCompleted('file', data.pageIndex)
+  if (keptLocal) void fileModify(keptLocal, plugin)
 }
 
 /**
@@ -872,28 +1163,27 @@ export const receiveFileSyncDelete = async function (data: ReceivePathMessage, p
  */
 export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, plugin: FastSync) {
   if (plugin.settings.syncEnabled == false) return
+  const pendingPage = plugin.syncState.pendingFilePushPageIndex.get(data.path)
+  const completionPage = pendingPage ?? data.pageIndex
+  clearUploadTracking(data.path)
+  uploadContexts.delete(data.path)
+  uploadRetries.delete(data.path)
+  plugin.syncState.pendingFilePushPageIndex.delete(data.path)
+  plugin.concurrencyLimiter.releaseSlot(data.path)
 
   if (isPathExcluded(data.path, plugin)) {
-    plugin.recordSyncCompleted('file', data.pageIndex);
+    plugin.recordSyncCompleted('file', completionPage);
     return
   }
 
-  if (plugin.localStorageManager.getMetadata("isInitSync") && plugin.settings.cloudPreviewEnabled) {
-    if (plugin.settings.cloudPreviewTypeRestricted) {
-      const ext = data.path.substring(data.path.lastIndexOf(".")).toLowerCase();
-      if (FileCloudPreview.isRestrictedType(ext)) {
-        dump(`Cloud Preview: Skipping restricted file mtime update: ${data.path}`);
-        plugin.recordSyncCompleted('file', data.pageIndex);
-        return;
-      }
-    } else {
-      dump(`Cloud Preview: Skipping all file mtime updates: ${data.path}`);
-      plugin.recordSyncCompleted('file', data.pageIndex);
-      return;
-    }
-  }
+  // Cloud preview does not skip mtime updates: the handler only touches files that already
+  // exist locally, and skipping left their mtime stale so every round re-checked them.
 
-  dump(`Receive file sync mtime: `, data.path, data.mtime)
+  // 服务端历史数据可能存秒级 mtime/ctime（#461），落盘/比较前先归一化为毫秒
+  // Legacy server rows may hold second-scale mtime/ctime (#461); normalize to milliseconds
+  const mtime = normalizeServerTimestamp(data.mtime)
+  const ctime = normalizeServerTimestamp(data.ctime)
+  dump(`Receive file sync mtime: `, data.path, mtime)
   const normalizedPath = normalizePath(data.path)
 
   await plugin.lockManager.withLock(normalizedPath, async () => {
@@ -901,29 +1191,29 @@ export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, p
     if (file) {
       if (isLargeBinarySyncRisk(file.stat.size, plugin)) {
         dump(`Skip binary mtime rewrite for large attachment (${describeBinarySyncLimit()} limit): ${normalizedPath}`, file.stat.size)
-        plugin.lastSyncMtime.set(data.path, data.mtime)
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
-          plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
-        }
+        plugin.lastSyncMtime.set(data.path, mtime || 0)
+        advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
         return
       }
       const content = await plugin.app.vault.readBinary(file)
       plugin.addIgnoredFile(normalizedPath)
       try {
-        await plugin.app.vault.modifyBinary(file, content, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
+        await plugin.app.vault.modifyBinary(file, content, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
         // 记录 mtime
-        plugin.lastSyncMtime.set(data.path, data.mtime)
+        plugin.lastSyncMtime.set(data.path, mtime || 0)
         // 更新同步时间
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
-          plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
-        }
+        advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
       } finally {
         window.setTimeout(() => {
           plugin.removeIgnoredFile(normalizedPath)
         }, 500);
       }
     }
-  }, { maxRetries: 5, retryInterval: 100 }).catch(e => {
+  }, { maxRetries: 5, retryInterval: 100 }).then(locked => {
+    // 抢锁失败时任务未执行：按失败处理，不能计为完成
+    // Lock not acquired means the task never ran: count it as a failure, never as completed
+    if (locked === null) throw new Error("Path lock busy")
+  }).catch(e => {
     dumpError(`[FastSync] Failed to receiveFileSyncMtime: ${normalizedPath}`, e);
     if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'FileMtime')) {
       SyncLogManager.getInstance().addLog('receive', 'FileMtime', e instanceof Error ? e.message : String(e), 'error', data.path);
@@ -934,7 +1224,7 @@ export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, p
   // FileSyncMtime 表示文件已在服务端存在（无需上传），释放 fileModify 中获取的并发槽位
   // FileSyncMtime indicates file already exists on server (no upload needed), release slot acquired by fileModify
   if (data.path) plugin.concurrencyLimiter.releaseSlot(data.path)
-  plugin.recordSyncCompleted('file', data.pageIndex)
+  plugin.recordSyncCompleted('file', completionPage)
 }
 
 /**
@@ -959,39 +1249,31 @@ export const receiveFileSyncChunkDownload = async function (data: FileSyncChunkD
 
   const tempKey = `temp_${data.path}`
   const tempSession = plugin.fileDownloadSessions.get(tempKey)
-  let session: FileDownloadSession
-
-  if (tempSession) {
-    session = {
-      path: data.path,
-      contentHash: data.contentHash,
-      ctime: data.ctime,
-      mtime: data.mtime,
-      lastTime: tempSession.lastTime,
-      sessionId: data.sessionId,
-      totalChunks: data.totalChunks,
-      size: data.size,
-      pageIndex: tempSession.pageIndex,
-      initialSlotKey: tempSession.initialSlotKey,
-      ...createDownloadStorage(plugin, data.sessionId, data.size),
-    }
-    plugin.fileDownloadSessions.set(data.sessionId, session)
-    plugin.fileDownloadSessions.delete(tempKey)
-  } else {
-    session = {
-      path: data.path,
-      contentHash: data.contentHash,
-      ctime: data.ctime,
-      mtime: data.mtime,
-      lastTime: 0,
-      sessionId: data.sessionId,
-      totalChunks: data.totalChunks,
-      size: data.size,
-      initialSlotKey: `download_${data.path}`,
-      ...createDownloadStorage(plugin, data.sessionId, data.size),
-    }
-    plugin.fileDownloadSessions.set(data.sessionId, session)
+  // A reply without a pending request (e.g. one sent before a reconnect) must not write to disk.
+  // The reply's metadata describes the server's current version and is used as is.
+  if (!tempSession) {
+    dump(`Ignore unsolicited file chunk download reply: ${data.path}`)
+    return
   }
+  // 服务端历史数据可能存秒级 mtime/ctime（#461），落盘/比较前先归一化为毫秒
+  // Legacy server rows may hold second-scale mtime/ctime (#461); normalize to milliseconds
+  const session: FileDownloadSession = {
+    commitGuard: tempSession.commitGuard,
+    path: data.path,
+    contentHash: data.contentHash,
+    ctime: normalizeServerTimestamp(data.ctime),
+    mtime: normalizeServerTimestamp(data.mtime),
+    lastTime: tempSession.lastTime,
+    sessionId: data.sessionId,
+    totalChunks: data.totalChunks,
+    size: data.size,
+    pageIndex: tempSession.pageIndex,
+    initialSlotKey: tempSession.initialSlotKey,
+    lastActivityAt: Date.now(),
+    ...createDownloadStorage(plugin, data.sessionId, data.size),
+  }
+  plugin.fileDownloadSessions.set(data.sessionId, session)
+  plugin.fileDownloadSessions.delete(tempKey)
 
   // 确保临时目录存在 (Ensure temp directory exists)
   // 并发下多个下载会话可能同时 mkdir 同一目录而抛错：catch 后复验是否已存在（并发创建属正常，吞掉）；
@@ -1053,9 +1335,9 @@ export const receiveFileSyncEnd = async function (data: unknown, plugin: FastSyn
   plugin.fileSyncTasks.needSyncMtime = syncData.needSyncMtimeCount || 0
   plugin.fileSyncTasks.needDelete = syncData.needDeleteCount || 0
 
-  // 无条件更新 lastFileSyncTime，确保包含服务端本轮同步后的所有异步操作（如 SyncResourceFID）
-  // Unconditionally update lastFileSyncTime to cover all async server-side ops after this sync round (e.g., SyncResourceFID)
-  plugin.localStorageManager.setMetadata("lastFileSyncTime", syncData.lastTime)
+  // End 先于明细到达：暂存 lastTime，待本类型全部完成且无失败时由 settleSyncTimes 落盘
+  // End arrives before the details: stash lastTime; settleSyncTimes persists it once the type finished without failures
+  plugin.syncState.pendingSyncEndTime.set("lastFileSyncTime", syncData.lastTime)
   plugin.syncTypeCompleteCount++
 }
 
@@ -1084,6 +1366,17 @@ export const checkAndUploadAttachments = async function (plugin: FastSync) {
       // 如果没有数据，说明服务端不存在
       if (!res) {
         dump(`Cloud Preview: File missing on server, starting upload: ${file.path}`);
+        await fileModify(file, plugin, false);
+        uploadCount++;
+      } else if (file.stat.mtime > (normalizeServerTimestamp(res.mtime) ?? 0)) {
+        // 服务端已有但本地更新：云预览附件不参与常规扫描，离线期间的修改只能在这里补传。
+        // 是否真有改动由 fileModify 判断，内容与同步基线一致（只是 mtime 变了，#256）不会上传；
+        // 服务端历史数据可能存秒级 mtime（#461），比较前归一化为毫秒
+        // The server has it but the local copy is newer: cloud preview attachments skip the regular
+        // scan, so an edit made while offline can only be uploaded here. fileModify decides whether
+        // anything changed; content equal to the sync baseline (mtime only, #256) is not uploaded;
+        // legacy server rows may hold second-scale mtime (#461), normalize before comparing
+        dump(`Cloud Preview: Local copy newer than server, checking upload: ${file.path}`);
         await fileModify(file, plugin, false);
         uploadCount++;
       }
@@ -1133,6 +1426,7 @@ export const handleFileChunkDownload = async function (buf: ArrayBuffer | Blob, 
     });
     return
   }
+  session.lastActivityAt = Date.now()
 
   try {
     if (chunkIndex >= session.totalChunks) {
@@ -1192,7 +1486,7 @@ export const handleFileChunkDownload = async function (buf: ArrayBuffer | Blob, 
     });
 
 
-    if (completedCount === session.totalChunks) {
+    if (completedCount === session.totalChunks && !session.committing) {
       await handleFileChunkDownloadComplete(session, plugin)
     }
   } catch (e) {
@@ -1212,6 +1506,11 @@ export const receiveFileSyncRename = async function (data: { oldPath: string; pa
   }
 
   dump(`Receive file rename:`, data.oldPath, "->", data.path)
+
+  // 服务端历史数据可能存秒级 mtime/ctime（#461），落盘/比较前先归一化为毫秒
+  // Legacy server rows may hold second-scale mtime/ctime (#461); normalize to milliseconds
+  const mtime = normalizeServerTimestamp(data.mtime)
+  const ctime = normalizeServerTimestamp(data.ctime)
 
   const normalizedOldPath = normalizePath(data.oldPath)
   const normalizedNewPath = normalizePath(data.path)
@@ -1241,6 +1540,8 @@ export const receiveFileSyncRename = async function (data: { oldPath: string; pa
   await plugin.lockManager.withLock(normalizedNewPath, async () => {
     const file = plugin.app.vault.getFileByPath(normalizedOldPath)
     if (file instanceof TFile) {
+      if (blockAliasedRemoteMutation(plugin, file, data.oldPath, "FileRename")) return
+      if (blockAliasedRemoteMutation(plugin, plugin.app.vault.getFileByPath(normalizedNewPath), data.path, "FileRename")) return
       plugin.addIgnoredFile(normalizedNewPath)
       plugin.addIgnoredFile(normalizedOldPath)
 
@@ -1248,21 +1549,40 @@ export const receiveFileSyncRename = async function (data: { oldPath: string; pa
       plugin.lastSyncPathRenamed.add(normalizedNewPath)
 
       try {
+        // 目标父目录可能尚不存在（改名/移动到新目录）：rename 不建目录，先按 create 路径的
+        // 同一模式确保存在，否则 vault.rename 抛 ENOENT、改名被丢弃（两端永久不一致）
+        // The target parent folder may not exist yet (rename/move into a new dir): rename
+        // creates no folder, so ensure it with the same pattern as the create path, or
+        // vault.rename throws ENOENT and the rename is dropped (permanent divergence)
+        const targetFolder = normalizedNewPath.split("/").slice(0, -1).join("/")
+        if (targetFolder !== "") {
+          const dirExists = plugin.app.vault.getFolderByPath(targetFolder)
+          if (dirExists == null) {
+            try {
+              await plugin.app.vault.createFolder(targetFolder)
+            } catch (e) {
+              // 并发竞争时只有一个调用成功，另一方忽略"已存在"错误
+              // In concurrent race only one call succeeds; ignore "already exists" error
+              if (!plugin.app.vault.getFolderByPath(targetFolder)) throw e
+            }
+          }
+        }
+
         const targetFile = plugin.app.vault.getFileByPath(normalizedNewPath)
-        if (targetFile) {
-          await vaultDelete(plugin.app.vault, targetFile)
+        if (targetFile && targetFile !== file) {
+          await plugin.app.fileManager.trashFile(targetFile)
         }
 
         await plugin.app.vault.rename(file, normalizedNewPath)
 
-        if (data.mtime) {
+        if (mtime) {
           const renamedFile = plugin.app.vault.getFileByPath(normalizedNewPath)
           if (renamedFile instanceof TFile) {
             if (isLargeBinarySyncRisk(renamedFile.stat.size, plugin)) {
               dump(`Skip renamed binary mtime rewrite for large attachment (${describeBinarySyncLimit()} limit): ${normalizedNewPath}`, renamedFile.stat.size)
             } else {
               const content = await plugin.app.vault.readBinary(renamedFile)
-              await plugin.app.vault.modifyBinary(renamedFile, content, { ...((data.ctime ?? 0) > 0 && { ctime: data.ctime }), ...((data.mtime ?? 0) > 0 && { mtime: data.mtime }) })
+              await plugin.app.vault.modifyBinary(renamedFile, content, { ...((ctime ?? 0) > 0 && { ctime }), ...((mtime ?? 0) > 0 && { mtime }) })
             }
           }
         }
@@ -1272,9 +1592,7 @@ export const receiveFileSyncRename = async function (data: { oldPath: string; pa
         plugin.fileHashManager.setFileHash(data.path, data.contentHash || "", renamedFile instanceof TFile ? renamedFile.stat.mtime : 0, renamedFile instanceof TFile ? renamedFile.stat.size : 0)
 
         // 更新同步时间
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
-          plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
-        }
+        advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
       } finally {
         window.setTimeout(() => {
           plugin.removeIgnoredFile(normalizedNewPath)
@@ -1315,7 +1633,11 @@ export const receiveFileSyncRename = async function (data: { oldPath: string; pa
         plugin.fileHashManager.setFileHash(data.path, data.contentHash, targetFile instanceof TFile ? targetFile.stat.mtime : 0, targetFile instanceof TFile ? targetFile.stat.size : 0)
       }
     }
-  }, { maxRetries: 10, retryInterval: 100 }).catch(e => {
+  }, { maxRetries: 10, retryInterval: 100 }).then(locked => {
+    // 抢锁失败时任务未执行：按失败处理，不能计为完成
+    // Lock not acquired means the task never ran: count it as a failure, never as completed
+    if (locked === null) throw new Error("Path lock busy")
+  }).catch(e => {
     dumpError(`[FastSync] Failed to receiveFileSyncRename: ${normalizedOldPath} -> ${normalizedNewPath}`, e);
     if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'FileRename')) {
       SyncLogManager.getInstance().addLog('receive', 'FileRename', e instanceof Error ? e.message : String(e), 'error', data.path);
@@ -1331,6 +1653,7 @@ export const receiveFileSyncRename = async function (data: { oldPath: string; pa
  */
 const handleFileChunkDownloadComplete = async function (session: FileDownloadSession, plugin: FastSync) {
   const slotKey = session.initialSlotKey || `download_${session.path}`;
+  session.committing = true
   try {
     if (isLargeBinarySyncRisk(session.size, plugin)) {
       dump(`Skip assembling large downloaded attachment (${describeBinarySyncLimit()} limit): ${session.path}`, session.size)
@@ -1340,7 +1663,10 @@ const handleFileChunkDownloadComplete = async function (session: FileDownloadSes
     // 逐片读入后立即写入目标缓冲区并释放分片引用，避免 chunks 数组与整份 buffer 同时驻留内存 (2x 峰值)
     // Write each chunk into the target buffer as it is read, then drop the reference immediately,
     // instead of accumulating a chunks array alongside the full assembled buffer (avoids the 2x peak).
-    const completeFile = new Uint8Array(session.size)
+    // let 而非 const：服务端元数据陈旧时会把它替换为按实际字节数截断后的缓冲区（见下方 size mismatch 分支）
+    // let instead of const: replaced with a truncated-to-actual-bytes buffer when the server metadata
+    // is stale (see the size mismatch branch below).
+    let completeFile = new Uint8Array(session.size)
     let offset = 0
     for (let i = 0; i < session.totalChunks; i++) {
       let chunk: ArrayBuffer | undefined;
@@ -1366,12 +1692,46 @@ const handleFileChunkDownloadComplete = async function (session: FileDownloadSes
     }
 
     if (offset !== session.size) {
-      await failFileDownloadSession(plugin, session, `Downloaded file size mismatch: got ${offset}, expected ${session.size}`, false)
-      return
+      // 服务端 size 元数据可能陈旧：此时服务端下发的字节就是真实内容，而 session.size /
+      // session.contentHash 仍是旧值（实测两个字段同时陈旧）。若无条件按截断失败，
+      // 客户端会在每一轮完整同步重复同一次下载，pending 永远无法收敛。
+      //
+      // 判据：把已组装的字节与本地已有文件用同一种哈希比较 —— 相等说明不是传输截断，
+      // 而是服务端元数据陈旧，此时接受实际字节；不相等仍走原有失败分支，
+      // 因此真正的传输截断不会被掩盖。
+      //
+      // The server's size metadata can be stale: the bytes it just sent are the real content,
+      // while session.size / session.contentHash still hold the old values (observed together).
+      // Failing unconditionally makes the client retry the same download on every full sync
+      // round, so pending never converges.
+      //
+      // Criterion: hash the assembled bytes and the local existing file with the same function.
+      // Equal means this is not a truncated transfer but stale server metadata, so the actual
+      // bytes are accepted; otherwise the original failure branch runs, so genuine truncation
+      // is still caught.
+      let staleServerMetadata = false
+      try {
+        const localHash = await hashFileAsync(plugin.app, normalizePath(session.path))
+        const receivedHash = await hashArrayBuffer(completeFile.buffer.slice(0, offset))
+        staleServerMetadata = !!localHash && localHash !== "0" && localHash === receivedHash
+      } catch {
+        staleServerMetadata = false
+      }
+      if (!staleServerMetadata) {
+        await failFileDownloadSession(plugin, session, `Downloaded file size mismatch: got ${offset}, expected ${session.size}`, false)
+        return
+      }
+      dump(`Stale server metadata, accepting actual bytes: ${session.path} declared=${session.size} actual=${offset}`)
+      // 缓冲区按实际字节数截断，避免写文件时把声明长度带来的尾部补零一起写进去
+      // Truncate the buffer to the actual byte count so trailing zero-fill implied by the
+      // declared size is never written out.
+      completeFile = new Uint8Array(completeFile.buffer.slice(0, offset))
+      session.size = offset
     }
 
     const normalizedPath = normalizePath(session.path)
-    await plugin.lockManager.withLock(normalizedPath, async () => {
+    const committed = await plugin.lockManager.withLock(normalizedPath, async () => {
+      assertDownloadCommittable(plugin, session)
       plugin.addIgnoredFile(normalizedPath)
       try {
         const file = plugin.app.vault.getFileByPath(normalizedPath)
@@ -1391,6 +1751,8 @@ const handleFileChunkDownloadComplete = async function (session: FileDownloadSes
               }
             }
           }
+          // Folder creation yields; a local create or cancellation may have won meanwhile.
+          assertDownloadCommittable(plugin, session)
           await plugin.app.vault.createBinary(normalizedPath, completeFile.buffer, { ...(session.ctime > 0 && { ctime: session.ctime }), ...(session.mtime > 0 && { mtime: session.mtime }) })
         }
       } finally {
@@ -1399,9 +1761,7 @@ const handleFileChunkDownloadComplete = async function (session: FileDownloadSes
         }, 500);
       }
 
-      if (Number(plugin.localStorageManager.getMetadata("lastFileSyncTime")) < session.lastTime) {
-        plugin.localStorageManager.setMetadata("lastFileSyncTime", session.lastTime)
-      }
+      advanceLiveSyncTime(plugin, "lastFileSyncTime", session.lastTime)
 
       // 下载完成后自动计算哈希并更新缓存 (如果服务器传了内容哈希就直接使用，否则重新计算以兼容旧版本)
       let contentHash = session.contentHash
@@ -1415,15 +1775,19 @@ const handleFileChunkDownloadComplete = async function (session: FileDownloadSes
       // 记录同步后的 mtime
       plugin.lastSyncMtime.set(session.path, session.mtime)
       dump(`Download complete and hash updated for: ${session.path}`, contentHash)
+      return true
     }, { maxRetries: 5, retryInterval: 100 });
+    // 抢锁失败时任务未执行，文件未写入：按失败处理，不能计为完成
+    // Lock not acquired means nothing was written: treat as a failure, never as completed
+    if (!committed) throw new Error("Download not committed: path lock busy")
 
     // 释放内存计数
     releaseSessionMemory(session)
 
     plugin.fileDownloadSessions.delete(session.sessionId)
     if (session.tempDir) await clearTempChunksDir(plugin, session.sessionId)
+    releaseDownloadOwner(plugin, session)
     plugin.downloadedFilesCount++
-    plugin.progressTracker.recordDownloadComplete('file');
     plugin.recordSyncCompleted('file', session.pageIndex)
   } catch (e) {
     dumpError(`Error completing file download for ${session.path}`, e)
@@ -1440,25 +1804,37 @@ const handleFileChunkDownloadComplete = async function (session: FileDownloadSes
     }
     await cleanupFileDownloadSession(plugin, session, true)
   } finally {
-    plugin.concurrencyLimiter.releaseSlot(slotKey)
+    if (!isStaleDownload(plugin, session)) plugin.concurrencyLimiter.releaseSlot(slotKey)
   }
 }
 
-// 收到 FileRenameAck，服务端确认后更新 hashManager（FIFO 出队）并更新 lastFileSyncTime
-// Receive FileRenameAck, update hashManager after server confirmation (FIFO dequeue) and update lastFileSyncTime
-export const receiveFileRenameAck = function (data: { lastTime?: number }, plugin: FastSync) {
-  // 服务端确认重命名成功，FIFO 出队并更新 hashManager
-  // Server confirmed rename success, dequeue FIFO and update hashManager
-  const pending = plugin.pendingFileRenames.shift()
+// 收到 FileRenameAck，按 data.path（服务端下发的新路径）精确匹配待确认条目并更新 hashManager；
+// 老服务端不下发 path 时回退 FIFO；匹配不到时不误删队列其它项，仅记日志（haierkeys/fast-note-sync-service#312）
+// Receive FileRenameAck, match the pending entry precisely by data.path (the new path the server
+// echoes) and update hashManager; falls back to FIFO for legacy servers that omit path; a miss
+// never removes another entry, it just logs (haierkeys/fast-note-sync-service#312)
+export const receiveFileRenameAck = function (data: { lastTime?: number; path?: string }, plugin: FastSync) {
+  let pending: { oldPath: string; newPath: string; contentHash: string } | undefined
+  if (data.path) {
+    const index = plugin.pendingFileRenames.findIndex(entry => entry.newPath === data.path)
+    if (index !== -1) {
+      pending = plugin.pendingFileRenames[index]
+      plugin.pendingFileRenames.splice(index, 1)
+    } else {
+      dump(`FileRenameAck: no pending rename matches path ${data.path}, leaving the queue intact`)
+    }
+  } else {
+    // 老服务端未下发 path，回退 FIFO 出队
+    // Legacy server omits path, fall back to FIFO dequeue
+    pending = plugin.pendingFileRenames.shift()
+  }
   if (pending) {
     const file = plugin.app.vault.getFileByPath(normalizePath(pending.newPath))
     plugin.fileHashManager.setFileHash(pending.newPath, pending.contentHash, file?.stat.mtime || 0, file?.stat.size || 0)
     plugin.fileHashManager.removeFileHash(pending.oldPath)
   }
-  if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
-    plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
-    dump(`FileRenameAck: lastFileSyncTime updated to`, data.lastTime)
-  }
+  advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
+  dump(`FileRenameAck: lastFileSyncTime updated to`, data.lastTime)
   plugin.concurrencyLimiter.releaseFifoSlot()
 }
 
@@ -1468,6 +1844,9 @@ export const receiveFileUploadAck = function (data: { lastTime?: number; path?: 
   // 服务端确认上传成功，将 pending hash 转移到正式 hashManager
   // Server confirmed upload success, move pending hash to formal hashManager
   if (data.path) {
+    clearUploadTracking(data.path)
+    uploadRetries.delete(data.path)
+    uploadContexts.delete(data.path)
     const contentHash = plugin.pendingUploadHashes.get(data.path)
     if (contentHash !== undefined) {
       const file = plugin.app.vault.getFileByPath(normalizePath(data.path))
@@ -1482,10 +1861,8 @@ export const receiveFileUploadAck = function (data: { lastTime?: number; path?: 
     const vaultName = plugin.app.vault.getName()
     try { plugin.app.saveLocalStorage(`fns-${vaultName}-uploadSession-${data.pathHash}`, null) } catch { /* ignore */ }
   }
-  if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
-    plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
-    dump(`FileUploadAck: lastFileSyncTime updated to`, data.lastTime)
-  }
+  advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
+  dump(`FileUploadAck: lastFileSyncTime updated to`, data.lastTime)
   if (data.path) {
     plugin.concurrencyLimiter.releaseSlot(data.path)
   }
@@ -1504,9 +1881,7 @@ export const receiveFileDeleteAck = function (data: { lastTime?: number; path?: 
     plugin.fileHashManager.removeFileHash(data.path)
     plugin.pendingFileDeleteAcks.delete(data.path)
   }
-  if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
-    plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
-  }
+  advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
   if (data.path) {
     plugin.concurrencyLimiter.releaseSlot(data.path)
   }
@@ -1517,14 +1892,5 @@ export const receiveFileDeleteAck = function (data: { lastTime?: number; path?: 
  */
 export const receiveFileUploadSessionNotFound = function (sessionId: string, plugin: FastSync) {
   const path = sessionIdToPathMap.get(sessionId)
-  if (path) {
-    const active = activeUploadsMap.get(path)
-    if (active) {
-      active.cancelled = true
-    }
-    plugin.concurrencyLimiter.releaseSlot(path)
-    plugin.fileSyncTasks.failed++
-    plugin.fileSyncTasks.completed++
-    dump(`FileUploadSessionNotFound: Cleaned active state and completed task for path: ${path} (${sessionId})`)
-  }
+  if (path) recoverUpload(path, plugin)
 }

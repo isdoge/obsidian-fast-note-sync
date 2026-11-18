@@ -1,5 +1,6 @@
 import { moment } from "obsidian";
 import { dump, dumpError, isWsUrl, showSyncNotice } from "../utils/helpers";
+import { $ } from "../../i18n/lang";
 
 const safeMoment = moment as unknown as (inp?: unknown) => { format(format: string): string };
 
@@ -41,7 +42,7 @@ export interface WebSocketClientOptions {
   onActivity?: () => void;
 
   serializeMessage?: (action: string, payload: unknown) => Uint8Array;
-  deserializeMessage?: (data: Uint8Array) => { action: string; [key: string]: unknown };
+  deserializeMessage?: (data: Uint8Array) => { action: string; [key: string]: unknown } | null;
 }
 
 export class WebSocketClient {
@@ -255,15 +256,17 @@ export class WebSocketClient {
                 const view = new Uint8Array(rest);
                 if (this.options.deserializeMessage) {
                   const result = this.options.deserializeMessage(view);
-                  
-                  // Only upgrade to Protobuf if the setting is enabled locally
-                  // 仅在本地设置启用时才升级为 Protobuf
-                  if (result.action === "ClientInfo" && this.plugin.settings?.protobufEnabled !== false) {
-                    this.useProtobuf = true;
-                    dump("WS Client upgraded to Protobuf successfully");
+
+                  if (result) {
+                    // Only upgrade to Protobuf if the setting is enabled locally
+                    // 仅在本地设置启用时才升级为 Protobuf
+                    if (result.action === "ClientInfo" && this.plugin.settings?.protobufEnabled !== false) {
+                      this.useProtobuf = true;
+                      dump("WS Client upgraded to Protobuf successfully");
+                    }
+
+                    this.options.onMessage?.(this, result.action, result);
                   }
-                  
-                  this.options.onMessage?.(this, result.action, result);
                 }
               } catch (err) {
                 dumpError("Failed to decode incoming Protobuf message:", err);
@@ -340,7 +343,7 @@ export class WebSocketClient {
 
       if (this.timeConnect === 16 && !this.hasNotifiedReconnectFailure) {
         this.hasNotifiedReconnectFailure = true;
-        showSyncNotice("同步连接持续失败，将继续在后台重试");
+        showSyncNotice($("ui.notice.connection_retrying"));
       }
 
       // Delay backoff: first 3 times 1s, then exponential growth up to 30 min
@@ -393,7 +396,12 @@ export class WebSocketClient {
       return;
     }
 
-    if (this.useProtobuf && this.options.serializeMessage) {
+    // useProtobuf 是连接级状态，复位依赖 ClientInfo 往返；设置刚被关闭的窗口期内仍需
+    // 直接走 JSON 文本帧，不能依赖 serializeMessage 抛异常后的兜底（会产生误导性错误日志）。
+    // useProtobuf is per-connection and resets via the ClientInfo round-trip; while the setting
+    // was just disabled, send JSON text frames directly instead of relying on a thrown
+    // serializeMessage falling back (which logs a misleading error).
+    if (this.useProtobuf && this.options.serializeMessage && this.plugin.settings?.protobufEnabled !== false) {
       try {
         let payloadObj: unknown = data;
         if (typeof data === "string") {

@@ -1,7 +1,8 @@
 import { normalizePath, App } from "obsidian";
 
-import { hashContent, dump, dumpError, configIsPathExcluded, getSafeCtime, isPathInConfigSyncDirs, showSyncNotice, isInWhitelist, hashFileAsync, checkAndNotifyCaseConflict } from "../utils/helpers";
+import { hashContent, dump, dumpError, configIsPathExcluded, getSafeCtime, isPathInConfigSyncDirs, showSyncNotice, isInWhitelist, hashFileAsync, checkAndNotifyCaseConflict, isLargeBinarySyncRisk, normalizeServerTimestamp } from "../utils/helpers";
 import { SyncLogManager } from "./sync_log_manager";
+import { advanceLiveSyncTime } from "./sync_state";
 import { ReceiveMessage, ReceiveMtimeMessage, ReceivePathMessage, SyncEndData } from "../utils/types";
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
@@ -11,8 +12,18 @@ import { $ } from "../../i18n/lang";
  * 排除监听文件的常量（针对 .obsidian 根目录）
  */
 export const CONFIG_ROOT_FILES_EXCLUDE = ["workspace.json", "workspace-mobile.json"]
-export const CONFIG_PLUGIN_EXTS_TO_WATCH = [".json", ".js", ".css"]
+// 配置通道按 UTF-8 文本传输，仅扩展文本资源，不能直接纳入图片等二进制文件。
+export const CONFIG_PLUGIN_EXTS_TO_WATCH = [".json", ".js", ".css", ".dict", ".dic", ".aff", ".txt"]
+const CONFIG_PLUGIN_DIRS_EXCLUDE = new Set(["node_modules", ".git", ".cache", "cache", "caches", ".trash", ".tmp", "tmp", "temp"])
+
+export const isPluginConfigPathExcluded = (path: string, configDir: string): boolean => {
+    const prefix = `${configDir}/plugins/`
+    return path.startsWith(prefix) && path.slice(prefix.length).split("/").slice(1)
+        .some(part => CONFIG_PLUGIN_DIRS_EXCLUDE.has(part.toLowerCase()))
+}
 export const CONFIG_THEME_EXTS_TO_WATCH = [".css", ".json"]
+// 插件目录中决定插件代码与版本的文件 / Files in a plugin folder that make up its code and version
+const PLUGIN_CODE_FILES = ["main.js", "manifest.json", "styles.css"]
 
 
 /**
@@ -33,9 +44,109 @@ export const cleanupConfigReloadTimer = function (): void {
         reloadTimer = null
     }
     pendingConfigUpdates.clear()
+    downgradeBlockedPlugins.clear()
+    pluginCodeBackups.clear()
 }
 
-export const configModify = async function (path: string, plugin: FastSync, eventEnter: boolean = false, content?: string) {
+// 插件降级守卫（#294）：服务端的 manifest.json 版本低于本地时不覆盖本地插件代码，
+// 已在本轮先写入的 main.js / styles.css 用写入前的备份还原，并把本地较新的版本重新上传。
+// Plugin downgrade guard (#294): a server manifest.json older than the local one never replaces the
+// local plugin code; main.js / styles.css already written this round are restored from their
+// pre-write backup, and the newer local files are uploaded again.
+const downgradeBlockedPlugins = new Set<string>()
+const pluginCodeBackups = new Map<string, ArrayBuffer>()
+
+function parseVersion(v: unknown): number[] | null {
+    if (typeof v !== "string") return null
+    const m = v.trim().match(/^v?(\d+(?:\.\d+)*)/)
+    return m ? m[1].split(".").map(Number) : null
+}
+
+/** remote 严格低于 local（无法解析时视为不低）/ remote strictly older than local (unparsable: not older) */
+export const isVersionLower = function (remote: unknown, local: unknown): boolean {
+    const r = parseVersion(remote), l = parseVersion(local)
+    if (!r || !l) return false
+    for (let i = 0; i < Math.max(r.length, l.length); i++) {
+        const a = r[i] ?? 0, b = l[i] ?? 0
+        if (a !== b) return a < b
+    }
+    return false
+}
+
+const readManifestVersion = async function (path: string, plugin: FastSync): Promise<unknown> {
+    try {
+        if (!(await plugin.app.vault.adapter.exists(path))) return undefined
+        return (JSON.parse(await plugin.app.vault.adapter.read(path)) as { version?: unknown }).version
+    } catch {
+        return undefined
+    }
+}
+
+// 重新上传本地文件：强制上传，绕过内容未变的拦截（只读端由 configModify 自行拦下）
+// Upload the local file again: force upload to bypass unchanged-content interception
+// (configModify itself still refuses on a read-only device)
+const reuploadLocalConfig = function (path: string, plugin: FastSync) {
+    plugin.lastSyncMtime.delete(path)
+    void configModify(path, plugin, false, undefined, true)
+}
+
+/**
+ * 返回 true 表示本次服务端写入被降级守卫拦下 / Returns true when the server write is blocked by the downgrade guard
+ */
+const guardPluginDowngrade = async function (data: ReceiveMessage, plugin: FastSync): Promise<boolean> {
+    const configDir = plugin.app.vault.configDir
+    const parts = data.path.split("/")
+    if (parts.length !== 4 || parts[0] !== configDir || parts[1] !== "plugins" || !PLUGIN_CODE_FILES.includes(parts[3])) return false
+    const id = parts[2]
+    const adapter = plugin.app.vault.adapter
+
+    if (parts[3] === "manifest.json") {
+        let remoteVersion: unknown
+        try {
+            remoteVersion = (JSON.parse(data.content) as { version?: unknown }).version
+        } catch {
+            return false
+        }
+        const localVersion = await readManifestVersion(normalizePath(data.path), plugin)
+        if (!isVersionLower(remoteVersion, localVersion)) {
+            downgradeBlockedPlugins.delete(id)
+            return false
+        }
+        downgradeBlockedPlugins.add(id)
+        for (const f of PLUGIN_CODE_FILES) {
+            const p = `${configDir}/plugins/${id}/${f}`
+            const backup = pluginCodeBackups.get(p)
+            if (!backup) continue
+            pluginCodeBackups.delete(p)
+            plugin.addIgnoredConfigFile(p)
+            try {
+                await adapter.writeBinary(normalizePath(p), backup)
+                const stat = await adapter.stat(normalizePath(p))
+                if (stat && plugin.configManager) plugin.configManager.updateFileState(normalizePath(p), stat.mtime)
+            } finally {
+                plugin.removeIgnoredConfigFile(p)
+            }
+            reuploadLocalConfig(p, plugin)
+        }
+        reuploadLocalConfig(data.path, plugin)
+        SyncLogManager.getInstance().addLog('receive', 'ConfigDowngradeSkipped', `服务端插件版本 ${String(remoteVersion)} 低于本地 ${String(localVersion)}，保留本地并重新上传: ${id}`, 'cancelled', data.path)
+        showSyncNotice($("ui.status.plugin_downgrade_blocked", { id, remote: String(remoteVersion), local: String(localVersion) }), 10000)
+        return true
+    }
+
+    if (downgradeBlockedPlugins.has(id)) {
+        SyncLogManager.getInstance().addLog('receive', 'ConfigDowngradeSkipped', `插件 ${id} 的服务端版本较旧，跳过覆盖并重新上传本地文件`, 'cancelled', data.path)
+        reuploadLocalConfig(data.path, plugin)
+        return true
+    }
+    // 写入前备份本地文件，供同一轮稍后到达的较旧 manifest.json 还原 / Back up before overwriting, so a
+    // downgraded manifest.json arriving later in the round can restore it
+    const localPath = normalizePath(data.path)
+    if (await adapter.exists(localPath)) pluginCodeBackups.set(data.path, await adapter.readBinary(localPath))
+    return false
+}
+
+export const configModify = async function (path: string, plugin: FastSync, eventEnter: boolean = false, content?: string, forceUpload: boolean = false) {
     if (plugin.settings.configSyncEnabled == false || plugin.settings.readonlySyncEnabled) return
     if (!isPathInConfigSyncDirs(path, plugin)) return
     if (eventEnter && plugin.ignoredConfigFiles.has(path)) return
@@ -50,6 +161,7 @@ export const configModify = async function (path: string, plugin: FastSync, even
     let contentHash = ""
     let mtime = 0
     let ctime = 0
+    let size = -1
 
     if (content !== undefined) {
         // 直接使用传入的内容（通常是 LocalStorage）
@@ -64,15 +176,20 @@ export const configModify = async function (path: string, plugin: FastSync, even
             if (exists) {
                 const stat = await plugin.app.vault.adapter.stat(filePath)
                 if (stat) {
+                    if (isLargeBinarySyncRisk(stat.size, plugin)) {
+                        plugin.removeIgnoredConfigFile(path)
+                        return
+                    }
                     contentHash = await hashFileAsync(plugin.app, filePath)
                     const contentBuf = await plugin.app.vault.adapter.readBinary(filePath)
                     contentStr = new TextDecoder().decode(contentBuf)
                     mtime = stat.mtime
                     ctime = getSafeCtime(stat)
+                    size = stat.size
                 }
             }
         } catch (error) {
-            dumpError("读取配置文件出错:", error)
+            dumpError("Failed to read config file:", error)
         }
     }
 
@@ -82,18 +199,24 @@ export const configModify = async function (path: string, plugin: FastSync, even
     }
 
     // --- 新增：哈希校验 ---
-    // 如果当前内容哈希与已记录的哈希一致，则说明无需发送
-    // 这通常发生在接收到服务端更新并写入本地后，文件系统事件触发的回调中
+    // 如果当前内容哈希与已记录的哈希一致，说明文件内容并未改变（例如仅 mtime 被 Obsidian 刷新）：
+    // 只更新本地记录的 mtime，不重新上传，避免多端同时在线时来回同步（#114）
     const savedHash = plugin.configHashManager?.getPathHash(path)
-    const lastSyncMtime = plugin.lastSyncMtime.get(path)
+    const lastSyncMtime = plugin.lastSyncMtime?.get(path)
 
-    if (savedHash === contentHash && (lastSyncMtime !== undefined && lastSyncMtime === mtime)) {
+    if (!forceUpload && savedHash === contentHash && !plugin.pendingConfigModifies?.has(path)) {
         plugin.removeIgnoredConfigFile(path)
-        // 顺便更新一下 ConfigManager 的状态，防止下次误判
+        if (lastSyncMtime !== mtime) {
+            plugin.lastSyncMtime?.set(path, mtime)
+        }
+        // 顺便更新一下 ConfigManager 与 ConfigHashManager 的文件状态，防止下次重复触发
         if (plugin.configManager) {
             plugin.configManager.updateFileState(normalizePath(path), mtime)
         }
-        dump(`Config modify intercepted (hash & mtime match): ${path}`)
+        if (content === undefined && size >= 0 && plugin.configHashManager?.isReady?.()) {
+            plugin.configHashManager.setFileHash?.(path, contentHash, mtime, size)
+        }
+        dump(`Config modify intercepted (content unchanged): ${path}`)
         return
     }
 
@@ -111,7 +234,10 @@ export const configModify = async function (path: string, plugin: FastSync, even
     plugin.pendingConfigDeleteAcks.delete(path)
     plugin.pendingConfigModifies.set(path, contentHash)
     plugin.localStorageManager.savePending('pendingConfigModifies', plugin.pendingConfigModifies)
-    await plugin.concurrencyLimiter.waitForSlot(path)
+    if (!await plugin.concurrencyLimiter.waitForSlot(path)) {
+        plugin.removeIgnoredConfigFile(path)
+        return
+    }
     void plugin.websocket.SendMessage("SettingModify", data)
 
     plugin.removeIgnoredConfigFile(path)
@@ -135,7 +261,10 @@ export const configDelete = async function (path: string, plugin: FastSync, even
         path: path,
         pathHash: hashContent(path),
     }
-    await plugin.concurrencyLimiter.waitForSlot(path)
+    if (!await plugin.concurrencyLimiter.waitForSlot(path)) {
+        plugin.removeIgnoredConfigFile(path)
+        return
+    }
     void plugin.websocket.SendMessage("SettingDelete", data, undefined, () => {
         // 消息真正写入 TCP 缓冲区后加入 pending set，等待 SettingDeleteAck 再删 hash
         // Add to pending set only after message is actually buffered; remove hash only on SettingDeleteAck
@@ -158,7 +287,7 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
         plugin.recordSyncCompleted('setting', data.pageIndex)
         return
     }
-    if (plugin.ignoredConfigFiles.has(data.path)) {
+    if (plugin.ignoredConfigFiles.has(data.path) && !pendingConfigUpdates.has(data.path)) {
         plugin.recordSyncCompleted('setting', data.pageIndex)
         return
     }
@@ -169,9 +298,7 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
         if (isVirtual) {
             if (await plugin.localStorageManager.handleReceivedUpdate(data.path, data.content)) {
                 plugin.removeIgnoredConfigFile(data.path)
-                if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"))) {
-                    plugin.localStorageManager.setMetadata("lastConfigSyncTime", data.lastTime)
-                }
+                advanceLiveSyncTime(plugin, "lastConfigSyncTime", data.lastTime)
                 plugin.recordSyncCompleted('setting', data.pageIndex)
                 return
             }
@@ -220,7 +347,22 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
             return
         }
 
-        await plugin.app.vault.adapter.write(filePath, data.content, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
+        if (await guardPluginDowngrade(data, plugin)) {
+            plugin.removeIgnoredConfigFile(data.path)
+            plugin.recordSyncCompleted('setting', data.pageIndex)
+            return
+        }
+
+        // 服务端历史数据可能存秒级 mtime/ctime（#461），落盘/比较前先归一化为毫秒
+        // Legacy server rows may hold second-scale mtime/ctime (#461); normalize to milliseconds
+        const mtime = normalizeServerTimestamp(data.mtime)
+        const ctime = normalizeServerTimestamp(data.ctime)
+        await plugin.app.vault.adapter.write(filePath, data.content, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
+
+        // 游标推进放在写盘成功之后：写盘失败走 catch，不应越过本条（service#101）
+        // Advance only after the write succeeded: a failure takes the catch path and must
+        // not skip this item (service#101)
+        advanceLiveSyncTime(plugin, "lastConfigSyncTime", data.lastTime)
     } catch (e) {
         dumpError("[writeConfigFile] error:", e)
         if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'ConfigModify')) {
@@ -229,17 +371,15 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
         plugin.configSyncTasks.failed++
     }
 
+    // 保持对该文件的忽略直到 configReload 中的 checkAndReload 落盘并更新状态后再解除（#114）
     await configReload(data.path, plugin, false, data.content)
-    plugin.removeIgnoredConfigFile(data.path)
 
     // 更新 ConfigManager 的文件状态，防止重复触发 configModify
+    // （mtime 已归一化为毫秒，与 config_manager 读到的本地 stat.mtime 单位一致）
+    // (mtime normalized to milliseconds, matching the unit of the local stat.mtime config_manager reads)
     if (plugin.configManager) {
         const absPath = normalizePath(data.path)
-        plugin.configManager.updateFileState(absPath, data.mtime)
-    }
-
-    if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"))) {
-        plugin.localStorageManager.setMetadata("lastConfigSyncTime", data.lastTime)
+        plugin.configManager.updateFileState(absPath, normalizeServerTimestamp(data.mtime))
     }
 
     // 更新配置哈希表
@@ -249,8 +389,8 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
         // 如果是虚拟路径，mtime 使用推送过来的，size 使用内容长度
         // For virtual paths, use pushed mtime and content length as size
         const size = isVirtual ? (data.content?.length || 0) : (stat?.size || 0);
-        const mtime = data.mtime || (stat?.mtime || 0);
-        
+        const mtime = normalizeServerTimestamp(data.mtime) || (stat?.mtime || 0);
+
         plugin.configHashManager.setFileHash(data.path, data.contentHash, mtime, size)
         // 记录 mtime
         plugin.lastSyncMtime.set(data.path, mtime)
@@ -261,6 +401,13 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
 
 export const receiveConfigUpload = async function (data: ReceivePathMessage, plugin: FastSync) {
     if (plugin.settings.configSyncEnabled == false) return;
+    // 只读端不响应服务端的配置上传请求，与笔记/附件一致（#275）
+    // A read-only device ignores the server's config upload requests, same as notes/attachments (#275)
+    if (plugin.settings.readonlySyncEnabled) {
+        dump(`Read-only mode: Intercepted config upload request for ${data.path}`)
+        plugin.recordSyncCompleted('setting', data.pageIndex)
+        return
+    }
 
     if (!isPathInConfigSyncDirs(data.path, plugin)) {
         plugin.recordSyncCompleted('setting', data.pageIndex)
@@ -292,6 +439,11 @@ export const receiveConfigUpload = async function (data: ReceivePathMessage, plu
         if (exists) {
             const stat = await plugin.app.vault.adapter.stat(filePath);
             if (stat) {
+                if (isLargeBinarySyncRisk(stat.size, plugin)) {
+                    plugin.removeIgnoredConfigFile(data.path);
+                    plugin.recordSyncCompleted('setting', data.pageIndex);
+                    return;
+                }
                 contentHash = await hashFileAsync(plugin.app, filePath);
                 const contentBufRead = await plugin.app.vault.adapter.readBinary(filePath);
                 contentStr = new TextDecoder().decode(contentBufRead);
@@ -301,7 +453,7 @@ export const receiveConfigUpload = async function (data: ReceivePathMessage, plu
             }
         }
     } catch (error) {
-        dumpError("读取配置文件出错:", error);
+        dumpError("Failed to read config file:", error);
         plugin.configSyncTasks.failed++;
         plugin.recordSyncCompleted('setting', data.pageIndex);
         return
@@ -334,7 +486,10 @@ export const receiveConfigUpload = async function (data: ReceivePathMessage, plu
     if (data.pageIndex !== undefined) {
         plugin.syncState.pendingConfigPushPageIndex.set(data.path, data.pageIndex)
     }
-    await plugin.concurrencyLimiter.waitForSlot(data.path)
+    if (!await plugin.concurrencyLimiter.waitForSlot(data.path)) {
+        plugin.removeIgnoredConfigFile(data.path)
+        return
+    }
     void plugin.websocket.SendMessage("SettingModify", sendData, undefined, function () {
         plugin.removeIgnoredConfigFile(data.path);
     }, (data as ReceivePathMessage & { context?: string }).context);
@@ -359,11 +514,20 @@ export const receiveConfigSyncMtime = async function (data: ReceiveMtimeMessage,
 
     plugin.addIgnoredConfigFile(data.path)
     const filePath = normalizePath(data.path)
+    // 服务端历史数据可能存秒级 mtime/ctime（#461），落盘前先归一化为毫秒
+    // Legacy server rows may hold second-scale mtime/ctime (#461); normalize to milliseconds
+    const mtime = normalizeServerTimestamp(data.mtime)
+    const ctime = normalizeServerTimestamp(data.ctime)
     try {
         if (await plugin.app.vault.adapter.exists(filePath)) {
             const content = await plugin.app.vault.adapter.readBinary(filePath)
-            await plugin.app.vault.adapter.writeBinary(filePath, content, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
+            await plugin.app.vault.adapter.writeBinary(filePath, content, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
         }
+
+        // 游标推进放在写盘成功之后：失败走 catch，不应越过本条（service#101）
+        // Advance only after the write succeeded: a failure takes the catch path and must
+        // not skip this item (service#101)
+        advanceLiveSyncTime(plugin, "lastConfigSyncTime", data.lastTime)
     } catch (e) {
         dumpError("[updateConfigFileTime] error:", e)
         if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'ConfigMtime')) {
@@ -372,11 +536,6 @@ export const receiveConfigSyncMtime = async function (data: ReceiveMtimeMessage,
         plugin.configSyncTasks.failed++
     }
     plugin.removeIgnoredConfigFile(data.path)
-
-    // 更新同步时间
-    if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"))) {
-        plugin.localStorageManager.setMetadata("lastConfigSyncTime", data.lastTime)
-    }
 
     plugin.recordSyncCompleted('setting', data.pageIndex)
 }
@@ -404,7 +563,7 @@ export const receiveConfigSyncDelete = async function (data: { path: string, las
             // 记录删除路径
             plugin.lastSyncPathDeleted.add(data.path)
             try {
-                await plugin.app.vault.adapter.remove(fullPath)
+                await plugin.app.vault.adapter.trashLocal(fullPath)
             } finally {
                 // 延时 500ms 清理
                 window.setTimeout(() => {
@@ -416,6 +575,10 @@ export const receiveConfigSyncDelete = async function (data: { path: string, las
         dumpError("[receiveConfigSyncDelete] error:", e)
         SyncLogManager.getInstance().addLog('receive', 'ConfigDelete', e instanceof Error ? e.message : String(e), 'error', data.path);
         plugin.configSyncTasks.failed++
+        // Preserve hash/state when moving to trash fails; never fall back to remove.
+        if (data.path) plugin.concurrencyLimiter.releaseSlot(data.path)
+        plugin.recordSyncCompleted('setting', data.pageIndex)
+        return
     }
 
     // 更新 ConfigManager 的文件状态
@@ -429,9 +592,7 @@ export const receiveConfigSyncDelete = async function (data: { path: string, las
     }
 
     // 更新同步时间
-    if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"))) {
-        plugin.localStorageManager.setMetadata("lastConfigSyncTime", data.lastTime)
-    }
+    advanceLiveSyncTime(plugin, "lastConfigSyncTime", data.lastTime)
     if (data.path) { plugin.concurrencyLimiter.releaseSlot(data.path) }
 
     plugin.recordSyncCompleted('setting', data.pageIndex)
@@ -448,10 +609,19 @@ export const receiveConfigSyncEnd = async function (data: unknown, plugin: FastS
     plugin.configSyncTasks.needSyncMtime = syncData.needSyncMtimeCount || 0
     plugin.configSyncTasks.needDelete = syncData.needDeleteCount || 0
 
-    const hasUpdates = (syncData.needUploadCount || 0) + (syncData.needModifyCount || 0) + (syncData.needSyncMtimeCount || 0) + (syncData.needDeleteCount || 0) > 0;
-    if (hasUpdates) {
-        plugin.localStorageManager.setMetadata("lastConfigSyncTime", syncData.lastTime)
-    }
+    // 与 note/file/folder 三类一致：无条件暂存（service#101）。服务端 SettingSyncEnd 的
+    // lastTime 同样取查询开始时刻（ws_setting.go syncStartTime），无下行更新时也有效；
+    // 若仅在 hasUpdates 时暂存，纯上行的一轮结束后游标停在旧值（首次为 0），每轮都触发
+    // isCover 全量覆盖比对。该条件系上游 ebaf4b5 给四类统一误加、09ea67b 修三类时漏掉
+    // config 的残留，无保留依据。
+    // Same as note/file/folder: stash unconditionally (service#101). The server's
+    // SettingSyncEnd lastTime is also its query start (ws_setting.go syncStartTime), valid
+    // even with no downlink updates; stashing only on hasUpdates left the cursor stale after
+    // pure-uplink rounds (0 on first sync), forcing an isCover full comparison every round.
+    // The condition was an upstream misapplication (ebaf4b5 added it to all four types,
+    // 09ea67b removed three but missed config) with no surviving justification.
+    // 暂存，待本类型全部完成且无失败时由 settleSyncTimes 落盘 / Stashed; persisted by settleSyncTimes
+    plugin.syncState.pendingSyncEndTime.set("lastConfigSyncTime", syncData.lastTime)
     plugin.syncTypeCompleteCount++
 }
 
@@ -492,9 +662,7 @@ export const receiveConfigModifyAck = async function (data: { lastTime?: number;
             plugin.localStorageManager.savePending('pendingConfigModifies', plugin.pendingConfigModifies)
         }
     }
-    if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"))) {
-        plugin.localStorageManager.setMetadata("lastConfigSyncTime", data.lastTime)
-    }
+    advanceLiveSyncTime(plugin, "lastConfigSyncTime", data.lastTime)
     if (data.path) {
         plugin.concurrencyLimiter.releaseSlot(data.path)
     }
@@ -517,9 +685,7 @@ export const receiveConfigDeleteAck = function (data: { lastTime?: number; path?
         }
         plugin.pendingConfigDeleteAcks.delete(data.path)
     }
-    if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"))) {
-        plugin.localStorageManager.setMetadata("lastConfigSyncTime", data.lastTime)
-    }
+    advanceLiveSyncTime(plugin, "lastConfigSyncTime", data.lastTime)
     if (data.path) {
         plugin.concurrencyLimiter.releaseSlot(data.path)
     }
@@ -537,17 +703,18 @@ export const configAllPaths = async function (configDirs: string[], plugin: Fast
     /**
      * 递归扫描通用目录
      */
-    const scanDirRecursive = async (dirPath: string) => {
+    const scanDirRecursive = async (dirPath: string, pluginResources: boolean = false) => {
         try {
             if (!(await adapter.exists(normalizePath(dirPath)))) return
             const result = await adapter.list(normalizePath(dirPath))
             for (const file of result.files) {
                 if (isExcluded(file)) continue
+                if (pluginResources && !CONFIG_PLUGIN_EXTS_TO_WATCH.some(ext => file.toLowerCase().endsWith(ext))) continue
                 paths.push(file)
             }
             for (const folder of result.folders) {
-                if (isExcluded(folder)) continue
-                await scanDirRecursive(folder)
+                if (isExcluded(folder) || (pluginResources && isPluginConfigPathExcluded(folder, plugin.app.vault.configDir))) continue
+                await scanDirRecursive(folder, pluginResources)
             }
         } catch (e) {
             dump(`Error scanning directory ${dirPath}:`, e)
@@ -584,15 +751,8 @@ export const configAllPaths = async function (configDirs: string[], plugin: Fast
                 if (await adapter.exists(pluginsPath)) {
                     const result = await adapter.list(pluginsPath)
                     for (const folderPath of result.folders) {
-                        const folderName = folderPath.split("/").pop()
-                        const folderItems = await adapter.list(folderPath)
-                        for (const file of folderItems.files) {
-                            const fileName = file.split("/").pop() || ""
-                            if (CONFIG_PLUGIN_EXTS_TO_WATCH.some(ext => fileName.endsWith(ext))) {
-                                const rel = `${configDir}/plugins/${folderName}/${fileName}`
-                                if (!isExcluded(rel)) paths.push(rel)
-                            }
-                        }
+                        if (isExcluded(folderPath)) continue
+                        await scanDirRecursive(folderPath, true)
                     }
                 }
                 const themesPath = normalizePath(`${configDir}/themes`)
@@ -686,6 +846,7 @@ export const configReload = async function (path: string, plugin: FastSync, even
                 readSnippets(): Promise<void>;
             };
             plugins: {
+                plugins?: Record<string, { onExternalSettingsChange?(): unknown }>;
                 enabledPlugins: Set<string>;
                 disablePlugin(id: string): Promise<void>;
                 enablePlugin(id: string): Promise<void>;
@@ -704,119 +865,153 @@ export const configReload = async function (path: string, plugin: FastSync, even
         const updates = Array.from(pendingConfigUpdates.entries())
         const communityPluginsUpdated = updates.some(([p]) => p === `${configDir}/community-plugins.json`)
         pendingConfigUpdates.clear()
+        // 本轮写入已全部落定，降级还原用的备份不再需要 / The round's writes are settled; restore backups are no longer needed
+        pluginCodeBackups.clear()
         reloadTimer = null
 
-        if (app.vault.reloadConfig) await app.vault.reloadConfig()
+        for (const [p] of updates) {
+            plugin.addIgnoredConfigFile?.(p)
+        }
 
-        const pluginsToReload = new Set<string>()
-        for (const [p, d] of updates) {
-            if (p === `${configDir}/app.json` || p === `${configDir}/appearance.json`) {
-                try {
-                    const config = JSON.parse(d) as Record<string, unknown>;
-                    // 仅在值确实改变时才设置，减少刷新频率
-                    for (const key in config) {
-                        if (Object.prototype.hasOwnProperty.call(config, key)) {
-                            if (app.vault.getConfig(key) !== config[key]) {
-                                app.vault.setConfig(key, config[key]);
-                            }
-                        }
-                    }
+        try {
+            if (app.vault.reloadConfig) await app.vault.reloadConfig()
 
-                    if (p === `${configDir}/appearance.json` && app.customCss) {
-                        // 修正属性名：社区主题使用的是 cssTheme
-                        const targetTheme = config.cssTheme as string | undefined;
-                        if (targetTheme !== undefined) {
-                            // 核心检查：在切换主题前，先检查本地是否存在该主题文件
-                            // 防止因为同步延迟导致主题文件夹还没下载完就切换，触发 Obsidian 的自动回落
-                            const themes = (app.customCss as unknown as { themes?: Record<string, unknown> }).themes || {};
-                            if (targetTheme === "" || Object.prototype.hasOwnProperty.call(themes, targetTheme)) {
-                                if (app.customCss.theme !== targetTheme) {
-                                    app.customCss.setTheme(targetTheme)
-                                    app.customCss.onConfigChange()
+            const pluginsToReload = new Set<string>()
+            for (const [p, d] of updates) {
+                if (p === `${configDir}/app.json` || p === `${configDir}/appearance.json`) {
+                    try {
+                        const config = JSON.parse(d) as Record<string, unknown>;
+                        // 仅在值确实改变时才设置，减少刷新频率
+                        for (const key in config) {
+                            if (Object.prototype.hasOwnProperty.call(config, key)) {
+                                if (app.vault.getConfig(key) !== config[key]) {
+                                    app.vault.setConfig(key, config[key]);
                                 }
-                            } else {
-                                console.warn(`[Sync] 主题 "${targetTheme}" 本地尚未就绪，暂不切换以防重置为默认`);
                             }
                         }
+
+                        if (p === `${configDir}/appearance.json` && app.customCss) {
+                            // 修正属性名：社区主题使用的是 cssTheme
+                            const targetTheme = config.cssTheme as string | undefined;
+                            if (targetTheme !== undefined) {
+                                // 核心检查：在切换主题前，先检查本地是否存在该主题文件
+                                // 防止因为同步延迟导致主题文件夹还没下载完就切换，触发 Obsidian 的自动回落
+                                const themes = (app.customCss as unknown as { themes?: Record<string, unknown> }).themes || {};
+                                if (targetTheme === "" || Object.prototype.hasOwnProperty.call(themes, targetTheme)) {
+                                    if (app.customCss.theme !== targetTheme) {
+                                        app.customCss.setTheme(targetTheme)
+                                        app.customCss.onConfigChange()
+                                    }
+                                } else {
+                                    console.warn(`[Sync] theme "${targetTheme}" not ready locally, skipping switch to avoid resetting to default`);
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        dumpError(`[Sync] failed to process ${p}:`, e);
                     }
-                } catch (e) {
-                    dumpError(`[Sync] 处理 ${p} 失败:`, e);
+                } else if (p === `${configDir}/community-plugins.json`) {
+                    try {
+                        const newP = JSON.parse(d) as string[]
+                        const oldP = plugin.configManager ? Array.from(plugin.configManager.enabledPlugins) : []
+                        const toE = newP.filter((p: string) => !oldP.includes(p))
+                        const toD = oldP.filter((p: string) => !newP.includes(p))
+                        if (plugin.configManager) {
+                            plugin.configManager.enabledPlugins = new Set(newP)
+                        }
+                        for (const id of toE) {
+                            if (id != "hot-reload" && id != "fast-note-sync") {
+                                pluginsToReload.add(id)
+                            }
+                        }
+                        for (const id of toD) {
+                            if (id != "hot-reload" && id != "fast-note-sync") await app.plugins.disablePlugin(id)
+                        }
+                    } catch { /* ignore */ }
+                } else if (p === `${configDir}/hotkeys.json`) {
+                    if (app.hotkeys) await app.hotkeys.load()
+                } else if (p.startsWith(`${configDir}/snippets/`) && p.endsWith(".css")) {
+                    if (app.customCss) await app.customCss.readSnippets()
+                } else if (p.startsWith(`${configDir}/plugins/`)) {
+                    const parts = p.split("/")
+                    // .obsidian/plugins/id/file -> parts=[".obsidian", "plugins", "id", "file"]
+                    if (parts.length >= 4) {
+                        const id = parts[2]
+                        pluginsToReload.add(id)
+                    }
                 }
-            } else if (p === `${configDir}/community-plugins.json`) {
-                try {
-                    const newP = JSON.parse(d) as string[]
-                    const oldP = plugin.configManager ? Array.from(plugin.configManager.enabledPlugins) : []
-                    const toE = newP.filter((p: string) => !oldP.includes(p))
-                    const toD = oldP.filter((p: string) => !newP.includes(p))
-                    if (plugin.configManager) {
-                        plugin.configManager.enabledPlugins = new Set(newP)
+            }
+
+            // 统一处理插件重载
+            // 将 fast-note-sync 移到最后处理，确保其他插件先重载
+            // Process fast-note-sync last to ensure other plugins reload first
+            const sortedPlugins = Array.from(pluginsToReload);
+            const selfId = "fast-note-sync";
+            if (sortedPlugins.includes(selfId)) {
+                const index = sortedPlugins.indexOf(selfId);
+                sortedPlugins.splice(index, 1);
+                sortedPlugins.push(selfId);
+            }
+
+            for (const id of sortedPlugins) {
+                if (id === "hot-reload") continue
+
+                const hasMainJsUpdate = updates.some(([p]) => p === `${configDir}/plugins/${id}/main.js`)
+                const hasManifestUpdate = updates.some(([p]) => p === `${configDir}/plugins/${id}/manifest.json`)
+
+                // 特殊处理本插件的更新：
+                // 如果 main.js 或 manifest.json 更新了，则进行正常的重载流程
+                // 否则（例如仅 data.json 更新），跳过重载以免影响插件运行
+                if (id === selfId) {
+                    if (hasMainJsUpdate || hasManifestUpdate) {
+                        dump(`[FastNoteSync] Detected critical update for self, triggering reload.`);
+                        plugin.websocket.unRegister();
+                        // Fall through to reload logic
+                    } else {
+                        continue;
                     }
-                    for (const id of toE) {
-                        if (id != "hot-reload" && id != "fast-note-sync") {
-                            pluginsToReload.add(id)
+                }
+
+                const isCurrentlyEnabled = app.plugins.enabledPlugins.has(id)
+                const shouldBeEnabled = plugin.configManager && plugin.configManager.enabledPlugins.has(id)
+                // 只有代码/样式/清单变化才需要先停再开；data.json 等数据文件变化重载会让插件在加载时写回
+                // 本机状态，多端版本不一致时形成无限重载循环（#249 #269）。数据变化改为通知插件自行重读设置
+                // Only code/style/manifest changes need a disable+enable. Reloading on data files such as
+                // data.json makes plugins write back device state on load, which loops forever across devices
+                // running different versions (#249 #269). For data changes, notify the plugin to re-read settings
+                const hasCodeUpdate = updates.some(([p]) => PLUGIN_CODE_FILES.some(f => p === `${configDir}/plugins/${id}/${f}`))
+
+                if (isCurrentlyEnabled && !hasCodeUpdate) {
+                    if (updates.some(([p]) => p === `${configDir}/plugins/${id}/data.json`)) {
+                        try {
+                            await app.plugins.plugins?.[id]?.onExternalSettingsChange?.()
+                        } catch (e) {
+                            dumpError(`[Sync] onExternalSettingsChange failed for ${id}:`, e)
                         }
                     }
-                    for (const id of toD) {
-                        if (id != "hot-reload" && id != "fast-note-sync") await app.plugins.disablePlugin(id)
+                } else if (isCurrentlyEnabled) {
+                    // 如果当前已启用，则执行重载逻辑（先停再开）
+                    await app.plugins.disablePlugin(id)
+                    await app.plugins.enablePlugin(id)
+                } else if (communityPluginsUpdated && shouldBeEnabled) {
+                    // 如果当前未启用，仅当本次同步包含了最新的 community-plugins.json 且要求启用时才开启
+                    await app.plugins.enablePlugin(id)
+                }
+            }
+            if (app.setting?.activeTab) app.setting.activeTab.display()
+        } finally {
+            // 配置应用与落盘完成后，刷新 ConfigManager 的文件状态并解除忽略保护（#114）
+            for (const [p] of updates) {
+                const absPath = normalizePath(p)
+                try {
+                    const stat = await plugin.app?.vault?.adapter?.stat?.(absPath)
+                    if (stat && plugin.configManager?.updateFileState) {
+                        plugin.configManager.updateFileState(absPath, stat.mtime)
                     }
                 } catch { /* ignore */ }
-            } else if (p === `${configDir}/hotkeys.json`) {
-                if (app.hotkeys) await app.hotkeys.load()
-            } else if (p.startsWith(`${configDir}/snippets/`) && p.endsWith(".css")) {
-                if (app.customCss) await app.customCss.readSnippets()
-            } else if (p.startsWith(`${configDir}/plugins/`)) {
-                const parts = p.split("/")
-                // .obsidian/plugins/id/file -> parts=[".obsidian", "plugins", "id", "file"]
-                if (parts.length >= 4) {
-                    const id = parts[2]
-                    pluginsToReload.add(id)
-                }
+                plugin.removeIgnoredConfigFile?.(p)
             }
         }
-
-        // 统一处理插件重载
-        // 将 fast-note-sync 移到最后处理，确保其他插件先重载
-        // Process fast-note-sync last to ensure other plugins reload first
-        const sortedPlugins = Array.from(pluginsToReload);
-        const selfId = "fast-note-sync";
-        if (sortedPlugins.includes(selfId)) {
-            const index = sortedPlugins.indexOf(selfId);
-            sortedPlugins.splice(index, 1);
-            sortedPlugins.push(selfId);
-        }
-
-        for (const id of sortedPlugins) {
-            if (id === "hot-reload") continue
-
-            const hasMainJsUpdate = updates.some(([p]) => p === `${configDir}/plugins/${id}/main.js`)
-            const hasManifestUpdate = updates.some(([p]) => p === `${configDir}/plugins/${id}/manifest.json`)
-
-            // 特殊处理本插件的更新：
-            // 如果 main.js 或 manifest.json 更新了，则进行正常的重载流程
-            // 否则（例如仅 data.json 更新），跳过重载以免影响插件运行
-            if (id === selfId) {
-                if (hasMainJsUpdate || hasManifestUpdate) {
-                    dump(`[FastNoteSync] Detected critical update for self, triggering reload.`);
-                    plugin.websocket.unRegister();
-                    // Fall through to reload logic
-                } else {
-                    continue;
-                }
-            }
-
-            const isCurrentlyEnabled = app.plugins.enabledPlugins.has(id)
-            const shouldBeEnabled = plugin.configManager && plugin.configManager.enabledPlugins.has(id)
-
-            if (isCurrentlyEnabled) {
-                // 如果当前已启用，则执行重载逻辑（先停再开）
-                await app.plugins.disablePlugin(id)
-                await app.plugins.enablePlugin(id)
-            } else if (communityPluginsUpdated && shouldBeEnabled) {
-                // 如果当前未启用，仅当本次同步包含了最新的 community-plugins.json 且要求启用时才开启
-                await app.plugins.enablePlugin(id)
-            }
-        }
-        if (app.setting?.activeTab) app.setting.activeTab.display()
     }
 
     reloadTimer = window.setTimeout(() => { void checkAndReload(); }, 1000)
