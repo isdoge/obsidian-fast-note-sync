@@ -1637,8 +1637,8 @@ export class SettingTab extends PluginSettingTab {
     if (this.plugin.settings.hashSyncLimitEnabled !== false) {
       new Setting(set).setName($("setting.sync.hash_limit")).addText((text) =>
         text
-          .setPlaceholder("20000")
-          .setValue((this.plugin.settings.hashSyncLimit ?? 20000).toString())
+          .setPlaceholder("50000")
+          .setValue((this.plugin.settings.hashSyncLimit ?? 50000).toString())
           .onChange(async (value) => {
             const numValue = parseInt(value)
             if (!isNaN(numValue) && numValue >= 0) {

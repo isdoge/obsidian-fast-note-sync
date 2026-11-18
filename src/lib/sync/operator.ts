@@ -149,18 +149,19 @@ export function settleSyncTimes(plugin: FastSync, abort = false): void {
     ["lastFolderSyncTime", "folder", plugin.folderSyncTasks],
     ["lastConfigSyncTime", "setting", plugin.configSyncTasks],
   ] as const;
-  const { pendingSyncEndTime, syncTimeBaseline } = plugin.syncState;
+  const { pendingSyncEndTime, syncTimeBaseline, truncatedSyncFields } = plugin.syncState;
   for (const [field, trackerType, tasks] of types) {
     const endTime = pendingSyncEndTime.get(field);
     if (endTime === undefined) continue;
     const done = plugin.progressTracker.isTypeFullyDone(trackerType)
       && (trackerType !== "file" || plugin.fileDownloadSessions.size === 0);
-    if (!abort && done && tasks.failed === 0) {
+    const truncated = truncatedSyncFields?.has(field) ?? false;
+    if (!abort && !truncated && done && tasks.failed === 0) {
       plugin.localStorageManager.setMetadata(field, endTime);
     } else if (abort || done) {
       const baseline = syncTimeBaseline.get(field);
       if (baseline !== undefined) plugin.localStorageManager.setMetadata(field, baseline);
-      dump(`[SyncTime] ${field} kept at baseline ${baseline} (failed=${tasks.failed}, abort=${abort}); End time ${endTime} discarded`);
+      dump(`[SyncTime] ${field} kept at baseline ${baseline} (failed=${tasks.failed}, abort=${abort}, truncated=${truncated}); End time ${endTime} discarded`);
     } else {
       continue;
     }
@@ -834,6 +835,8 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       plugin.configSyncEnd = true;
     }
 
+    plugin.syncState.truncatedSyncFields?.clear();
+
     if (plugin.settings.syncEnabled && shouldSyncNotes) {
       const list = plugin.app.vault.getAllLoadedFiles();
       let processedCount = 0;
@@ -844,8 +847,13 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
 
       // --- PERF: Limit hash computations per sync cycle ---
       // Prevents V8 heap exhaustion on first full scan of large vaults.
-      const MAX_HASH_PER_CYCLE = plugin.settings.hashSyncLimitEnabled !== false ? (plugin.settings.hashSyncLimit ?? 20000) : Infinity;
+      // 上限填 0 视为不限制：按字面当作"一个都不算"会让未缓存的文件永远同步不上（#302）
+      // A limit of 0 means unlimited: taking it literally would never hash any uncached file
+      const hashSyncLimit = plugin.settings.hashSyncLimit ?? 50000;
+      const MAX_HASH_PER_CYCLE = plugin.settings.hashSyncLimitEnabled !== false && hashSyncLimit > 0 ? hashSyncLimit : Infinity;
       let hashComputeCount = 0;
+      let truncatedNoteCount = 0;
+      let truncatedFileCount = 0;
 
       // --- PERF: bounded concurrency for cache-miss hash computation ---
       // 哈希缓存未命中的文件原先完全串行 read+hash，大库首次/全量扫描时很慢；
@@ -934,7 +942,10 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                   ...(baseHash !== null ? { baseHash } : { baseHashMissing: true }),
                 });
               } else {
-                if (hashComputeCount >= MAX_HASH_PER_CYCLE) continue;
+                if (hashComputeCount >= MAX_HASH_PER_CYCLE) {
+                  truncatedNoteCount++;
+                  continue;
+                }
                 hashComputeCount++;
                 const notePath = file.path, noteMtime = file.stat.mtime, noteCtime = file.stat.ctime, noteSize = file.stat.size;
                 await scheduleHashTask(async () => {
@@ -984,7 +995,10 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                   ...(baseHash !== null ? { baseHash } : { baseHashMissing: true }),
                 });
               } else {
-                if (hashComputeCount >= MAX_HASH_PER_CYCLE) continue;
+                if (hashComputeCount >= MAX_HASH_PER_CYCLE) {
+                  truncatedFileCount++;
+                  continue;
+                }
                 hashComputeCount++;
                 const attPath = file.path, attMtime = file.stat.mtime, attCtime = file.stat.ctime, attSize = file.stat.size;
                 await scheduleHashTask(async () => {
@@ -1033,6 +1047,18 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       commitScannedHashes(plugin.scannedNoteHashes, (m) => plugin.fileHashManager.bulkSetFromScanned(m));
       commitScannedHashes(plugin.scannedFileHashes, (m) => plugin.fileHashManager.bulkSetFromScanned(m));
       dump(`[ScanPerf] Scan done: ${hashComputeCount}/${MAX_HASH_PER_CYCLE} hashes computed, notes=${notes.length}, files=${files.length}, folders=${folders.length}`);
+      if (truncatedNoteCount > 0) plugin.syncState.truncatedSyncFields?.add("lastNoteSyncTime");
+      if (truncatedFileCount > 0) plugin.syncState.truncatedSyncFields?.add("lastFileSyncTime");
+      const truncatedTotal = truncatedNoteCount + truncatedFileCount;
+      if (truncatedTotal > 0) {
+        const msg = $("ui.notice.hash_limit_exceeded", {
+          skipped: String(truncatedTotal),
+          limit: String(MAX_HASH_PER_CYCLE),
+        });
+        dump(`[ScanPerf] Hash limit exceeded (${MAX_HASH_PER_CYCLE}): skipped ${truncatedTotal} files (notes=${truncatedNoteCount}, files=${truncatedFileCount})`);
+        SyncLogManager.getInstance().addLog("info", "HashLimitExceeded", msg, "error");
+        showSyncNotice(msg, 10000);
+      }
 
       // 检测被删除的文件 (对比哈希表和本地 Vault)
       if (plugin.settings.offlineDeleteSyncEnabled) {

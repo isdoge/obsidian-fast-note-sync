@@ -109,6 +109,13 @@ export class SyncState {
    */
   syncTimeBaseline = new Map<SyncTimeField, number>();
   pendingSyncEndTime = new Map<SyncTimeField, number>();
+  /**
+   * 本轮扫描因达到 hashSyncLimit 而被截断跳过部分文件的同步字段集合。
+   * settleSyncTimes 会跳过这些字段的游标推进，防止被截断的已修改文件在下一轮因 mtime < 新游标而被永久跳过。
+   * Sync time fields whose vault scan was truncated by hashSyncLimit in this round.
+   * settleSyncTimes keeps them at baseline so skipped modified files aren't permanently bypassed next round.
+   */
+  truncatedSyncFields = new Set<SyncTimeField>();
 
   // ─── Per-type sync task statistics ───────────────────────────────────────────
   onCompletedChange?: (type: "note" | "file" | "setting" | "folder") => void;
@@ -254,6 +261,7 @@ export class SyncState {
     this.configSyncEnd = false;
     this.folderSyncEnd = false;
     this.offlineGuardSkippedThisRound = false;
+    this.truncatedSyncFields.clear();
     // 注意：不再清空 scannedXxxHashes。这些哈希是扫描期实打实算出来的，条目自带 mtime/size 校验，
     // 留到下一轮同步结束时提交依然有效；在这里清空会把上一轮（可能仍在收尾）算出的哈希白白丢掉，
     // 导致同一批文件每次同步都要重算。提交由 operator.ts 的 commitScannedHashes 按键移除。
