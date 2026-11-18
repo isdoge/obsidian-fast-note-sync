@@ -91,6 +91,21 @@ export class WebSocketManager {
   // Disable protobuf only for this plugin session, preserving the saved setting for the next launch.
   private hasProtobufDecodeFailed = false;
 
+  // ─── 活跃同步期间它源消息的延后队列 ───────────────────────────────────────────
+  // 一轮同步进行中（activeSyncContext 非空）时，context 不匹配且不属于本机已作废 context 的
+  // 消息（其它设备的实时广播、本机无 context 请求的应答如 #205 的 NoteRePush 回包）不再丢弃，
+  // 而是进此队列，本轮结束（activeSyncContext 置空，setter 触发 onSyncContextRetired）后按到达
+  // 顺序走与实时分发完全相同的路径回放。回放中新一轮开始则剩余消息留队等下一次。断线清空。
+  // While a sync round is active, messages whose context mismatches but is not one of this
+  // client's retired contexts (other devices' live broadcasts, replies to this client's
+  // contextless requests such as #205's NoteRePush round trip) are deferred here instead of
+  // being dropped; they replay through the exact same dispatch path in arrival order once the
+  // round ends (the activeSyncContext setter fires onSyncContextRetired). If a new round
+  // starts mid-replay the rest stays queued for the next drain. Cleared on disconnect.
+  private deferredMessages: { action: string; data: StructuredMessageData }[] = [];
+  private deferredBytes = 0;
+  private replayScheduled = false;
+
   // --- 轻量事件总线，用于分批发送时等待服务端 BatchAck ---
   // Lightweight event bus for awaiting server BatchAck during batch send
   private _listeners: Map<string, Set<(...args: unknown[]) => void>> = new Map();
@@ -130,6 +145,12 @@ export class WebSocketManager {
 
   constructor(plugin: FastSync) {
     this.plugin = plugin;
+    // 活跃同步 context 置空/替换（近十处分散写入点）时，由此集中触发延后队列回放；
+    // 回放异步调度，不在置空的调用栈里同步重入分发
+    // Clearing/superseding the active sync context (scattered write sites) centrally triggers
+    // the deferred-queue replay here; replay is scheduled async, never re-entering dispatch
+    // synchronously inside the clearing call stack
+    this.plugin.syncState.onSyncContextRetired = () => this.scheduleDeferredReplay();
     this.client = new WebSocketClient(this.plugin, {
       getWsUrl: (count) => {
         const client = CLIENT_TYPE;
@@ -184,6 +205,12 @@ export class WebSocketManager {
           // 本轮未完成：已推进的同步时间回到本轮基线 / Unfinished round: sync times return to the baseline
           settleSyncTimes(this.plugin, true);
         }
+        // 旧连接上的延后消息不该在新连接上处理（其 vault/会话前提可能已失效）；
+        // 断线后本轮游标回基线，重连的增量同步会重新拉这些变更
+        // Deferred messages from the closed connection must not run on a new one (their
+        // vault/session assumptions may be stale); the round's cursor fell back to its
+        // baseline, so the post-reconnect incremental sync re-pulls those changes
+        this.clearDeferredMessages();
         this.receivedFileDetails.clear();
         // #205：断线后空白笔记探测的结论不会再到达，作废在途/已确认标记，重连后重新探测
         // #205: no probe verdict can arrive after the drop; void the marks so reconnect re-probes
@@ -488,8 +515,13 @@ export class WebSocketManager {
         return;
       }
 
-      // 基于 Context 进行过滤：如果处于活跃的同步中，必须完全匹配
-      // Filter based on Context: if there's an active sync context, incoming messages (including Acks) must match
+      // 基于 Context 进行过滤：活跃同步中必须完全匹配；不匹配时区分两类——
+      // 本机已作废 context（上一轮的迟到应答）照旧丢弃；其它来源（其它设备的实时广播、
+      // 本机无 context 请求的应答）延后到本轮结束再处理，不再直接丢弃
+      // Context filter: during an active round messages must match. On mismatch, retired
+      // contexts of this client (late replies of the previous round) are still discarded;
+      // other sources (other devices' live broadcasts, replies to this client's contextless
+      // requests) are deferred until the round ends instead of being dropped outright
       if (this.plugin.syncState.activeSyncContext) {
         const isControlMsg = msgAction === WSAction.ClientReceiveAuth || msgAction === WSAction.ClientReceiveInfo;
         // Older servers omit context on the UpdateMtime response to NoteModify.
@@ -498,14 +530,30 @@ export class WebSocketManager {
           && typeof data.data?.path === 'string'
           && this.plugin.pendingNoteModifies.has(data.data.path);
         if (!isControlMsg && !isPendingMtimeAck && data.context !== this.plugin.syncState.activeSyncContext) {
-          dump(`[SyncContext] Discard message ${msgAction} due to mismatched context. Expected: ${this.plugin.syncState.activeSyncContext}, Got: ${data.context}`);
+          if (data.context && this.plugin.syncState.retiredSyncContexts.has(data.context)) {
+            dump(`[SyncContext] Discard message ${msgAction} due to mismatched context. Expected: ${this.plugin.syncState.activeSyncContext}, Got: ${data.context}`);
+            return;
+          }
+          this.enqueueDeferredMessage(msgAction, data);
           return;
         }
       }
 
-      const handler = receiveOperators.get(msgAction);
-      if (handler) {
-        // WSResponse 信封 pageIndex 转换（设计稿 §4.3，唯一转换点）：线上 1-based，
+      this.dispatchReceiveMessage(msgAction, data);
+    }
+  }
+
+  /**
+   * 实时与延后回放共用的分发路径（原 handleStructuredMessage 尾段原样抽出）：vault 校验已在上游
+   * 完成，此处做 pageIndex 转换、context 合并、重传去重并调用 handler。
+   * Shared dispatch path for live and deferred replay (extracted verbatim from the former
+   * tail of handleStructuredMessage): vault filtering already happened upstream; this does
+   * the pageIndex conversion, context merge, retransmission dedup and handler invocation.
+   */
+  private dispatchReceiveMessage(msgAction: string, data: StructuredMessageData) {
+    const handler = receiveOperators.get(msgAction);
+    if (!handler) return;
+    // WSResponse 信封 pageIndex 转换（设计稿 §4.3，唯一转换点）：线上 1-based，
         // 0/undefined = 非分页消息（不并入 payload，下游按 undefined 走旧路径）；
         // n>0 = 下载第 n-1 页，转换为内部 0-based 值并入 payload.pageIndex
         // WSResponse envelope pageIndex conversion (design §4.3, the single conversion point):
@@ -542,8 +590,59 @@ export class WebSocketManager {
           dump('Sync handler failed', msgAction, error);
         });
         this.client.notifyActivity();
-      }
+  }
+
+  // ─── 延后队列（见类顶部字段注释 / see class-top field comment）──────────────
+
+  /** 队列上限：条数与序列化字节数，防 NoteSyncModify 带正文撑爆内存；超限丢弃新消息并 dump */
+  private static readonly DEFERRED_MAX_COUNT = 500;
+  private static readonly DEFERRED_MAX_BYTES = 8 * 1024 * 1024;
+
+  private enqueueDeferredMessage(action: string, data: StructuredMessageData): void {
+    if (!receiveOperators.has(action)) return;
+    const size = WebSocketManager.stringifySize(data);
+    if (this.deferredMessages.length >= WebSocketManager.DEFERRED_MAX_COUNT
+      || this.deferredBytes + size > WebSocketManager.DEFERRED_MAX_BYTES) {
+      dump(`[SyncContext] Deferred queue overflow (${this.deferredMessages.length} items, ${this.deferredBytes} bytes); discard incoming ${action}`);
+      return;
     }
+    this.deferredMessages.push({ action, data });
+    this.deferredBytes += size;
+    dump(`[SyncContext] Deferring message ${action} (context: ${data.context || "none"}) until the active round ends; queued: ${this.deferredMessages.length}`);
+  }
+
+  /** 轮次结束（activeSyncContext 置空/替换）时异步调度回放；不在置空调用栈里同步重入 */
+  private scheduleDeferredReplay(): void {
+    if (this.deferredMessages.length === 0 || this.replayScheduled) return;
+    this.replayScheduled = true;
+    window.setTimeout(() => {
+      this.replayScheduled = false;
+      this.drainDeferredMessages();
+    }, 0);
+  }
+
+  private drainDeferredMessages(): void {
+    // 回放期间新一轮同步已开始：剩余消息留队，等该轮结束的下次触发
+    // A new round started mid-replay: leave the rest queued for that round's next trigger
+    while (this.deferredMessages.length > 0 && !this.plugin.syncState.activeSyncContext) {
+      const { action, data } = this.deferredMessages.shift()!;
+      this.deferredBytes -= WebSocketManager.stringifySize(data);
+      this.handleStructuredMessage(action, data);
+    }
+  }
+
+  private static stringifySize(data: StructuredMessageData): number {
+    try { return safeStringify(data).length; } catch { return 2048; }
+  }
+
+  /** 断线清空：旧连接上的消息不该在新连接上处理；重连后增量同步按基线游标重新拉 */
+  private clearDeferredMessages(): void {
+    if (this.deferredMessages.length > 0) {
+      dump(`[SyncContext] Connection closed; dropping ${this.deferredMessages.length} deferred messages`);
+    }
+    this.deferredMessages = [];
+    this.deferredBytes = 0;
+    this.replayScheduled = false;
   }
 
   public sendClientInfo() {
