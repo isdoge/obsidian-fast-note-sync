@@ -760,8 +760,11 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
       // Temporarily store hash in pending map, update hashManager only after server FileUploadAck
       plugin.pendingUploadHashes.set(data.path, contentHash)
       plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes)
-      // 记录当前文件的 mtime/size 到缓存，以便后续利用
-      plugin.fileHashManager.setFileHash(data.path, contentHash, file.stat.mtime, file.stat.size)
+      // 记录当前文件的 mtime/size 到缓存，以便后续利用。只写缓存：同步基线要等 FileUploadAck，
+      // 否则上传中断后基线会声称服务端已有这份内容（haierkeys/fast-note-sync-service#512）
+      // Cache only: the sync baseline waits for FileUploadAck, or an interrupted upload leaves a
+      // baseline claiming the server already has this content
+      plugin.fileHashManager.setFileHashes([[data.path, contentHash]], () => file.stat)
 
       // 使用外层计算好的 actualTotalChunks
 
@@ -933,10 +936,14 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
             const serverInfo = await apiService.getFileInfo(file.path);
 
             if (serverInfo) {
-              // 核对 path、size、mtime 是否一致
+              // 核对 path、size、mtime 是否一致；还要求服务端内容哈希就是本次上传的内容，
+              // 大小和时间相同的旧记录不能当作"已收到"（haierkeys/fast-note-sync-service#512）
+              // Besides path, size and mtime the server must hold the content just uploaded; an older
+              // record with the same size and mtime does not prove the upload arrived
               if (serverInfo.path === file.path &&
                 serverInfo.size === file.stat.size &&
-                serverInfo.mtime === file.stat.mtime) {
+                serverInfo.mtime === file.stat.mtime &&
+                serverInfo.contentHash === contentHash) {
                 dump(`Cloud Preview: Auto delete verified file: ${file.path}`);
                 plugin.addIgnoredFile(file.path);
                 try {
@@ -1353,6 +1360,15 @@ export const checkAndUploadAttachments = async function (plugin: FastSync) {
       // 如果没有数据，说明服务端不存在
       if (!res) {
         dump(`Cloud Preview: File missing on server, starting upload: ${file.path}`);
+        await fileModify(file, plugin, false);
+        uploadCount++;
+      } else if (file.stat.mtime > res.mtime) {
+        // 服务端已有但本地更新：云预览附件不参与常规扫描，离线期间的修改只能在这里补传。
+        // 是否真有改动由 fileModify 判断，内容与同步基线一致（只是 mtime 变了，#256）不会上传
+        // The server has it but the local copy is newer: cloud preview attachments skip the regular
+        // scan, so an edit made while offline can only be uploaded here. fileModify decides whether
+        // anything changed; content equal to the sync baseline (mtime only, #256) is not uploaded
+        dump(`Cloud Preview: Local copy newer than server, checking upload: ${file.path}`);
         await fileModify(file, plugin, false);
         uploadCount++;
       }

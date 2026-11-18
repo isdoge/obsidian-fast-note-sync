@@ -466,7 +466,7 @@ export class HttpApiService {
      * 获取服务端文件信息
      * 用于在删除本地文件前核对状态
      */
-    async getFileInfo(path: string): Promise<FileInfoResponse> {
+    async getFileInfo(path: string): Promise<FileInfoResponse | null> {
         const params = new URLSearchParams({
             vault: this.plugin.settings.vault,
             path: path,
@@ -479,6 +479,16 @@ export class HttpApiService {
         const { status, json } = await this.request(endpoint, {
             method: "GET"
         });
+
+        // 服务端没有该附件的记录：HTTP 200 + 业务码 0（details 为 "record not found"），或未找到类业务码。
+        // 这是"服务端不存在"，不是请求失败，返回 null 交调用方处理（haierkeys/fast-note-sync-service#512）
+        // The server has no record of this attachment: HTTP 200 with code 0 (details "record not
+        // found") or a not-found code. That is "missing on the server", not a failed request: return null
+        const missing = json as (ApiResponse<unknown> & { details?: unknown }) | null;
+        if (status === 200 && missing && (missing.code === 430 || missing.code === 455
+            || (missing.code === 0 && typeof missing.details === "string" && /record not found/i.test(missing.details)))) {
+            return null;
+        }
 
         if (status !== 200 || !this.isSuccess(json)) {
             const res = json as ApiResponse<unknown>;
