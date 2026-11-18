@@ -2,6 +2,7 @@ import { normalizePath, App } from "obsidian";
 
 import { hashContent, dump, dumpError, configIsPathExcluded, getSafeCtime, isPathInConfigSyncDirs, showSyncNotice, isInWhitelist, hashFileAsync, checkAndNotifyCaseConflict, isLargeBinarySyncRisk, normalizeServerTimestamp } from "../utils/helpers";
 import { SyncLogManager } from "./sync_log_manager";
+import { advanceLiveSyncTime } from "./sync_state";
 import { ReceiveMessage, ReceiveMtimeMessage, ReceivePathMessage, SyncEndData } from "../utils/types";
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
@@ -297,9 +298,7 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
         if (isVirtual) {
             if (await plugin.localStorageManager.handleReceivedUpdate(data.path, data.content)) {
                 plugin.removeIgnoredConfigFile(data.path)
-                if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"))) {
-                    plugin.localStorageManager.setMetadata("lastConfigSyncTime", data.lastTime)
-                }
+                advanceLiveSyncTime(plugin, "lastConfigSyncTime", data.lastTime)
                 plugin.recordSyncCompleted('setting', data.pageIndex)
                 return
             }
@@ -359,6 +358,11 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
         const mtime = normalizeServerTimestamp(data.mtime)
         const ctime = normalizeServerTimestamp(data.ctime)
         await plugin.app.vault.adapter.write(filePath, data.content, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
+
+        // 游标推进放在写盘成功之后：写盘失败走 catch，不应越过本条（service#101）
+        // Advance only after the write succeeded: a failure takes the catch path and must
+        // not skip this item (service#101)
+        advanceLiveSyncTime(plugin, "lastConfigSyncTime", data.lastTime)
     } catch (e) {
         dumpError("[writeConfigFile] error:", e)
         if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'ConfigModify')) {
@@ -376,10 +380,6 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
     if (plugin.configManager) {
         const absPath = normalizePath(data.path)
         plugin.configManager.updateFileState(absPath, normalizeServerTimestamp(data.mtime))
-    }
-
-    if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"))) {
-        plugin.localStorageManager.setMetadata("lastConfigSyncTime", data.lastTime)
     }
 
     // 更新配置哈希表
@@ -523,6 +523,11 @@ export const receiveConfigSyncMtime = async function (data: ReceiveMtimeMessage,
             const content = await plugin.app.vault.adapter.readBinary(filePath)
             await plugin.app.vault.adapter.writeBinary(filePath, content, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
         }
+
+        // 游标推进放在写盘成功之后：失败走 catch，不应越过本条（service#101）
+        // Advance only after the write succeeded: a failure takes the catch path and must
+        // not skip this item (service#101)
+        advanceLiveSyncTime(plugin, "lastConfigSyncTime", data.lastTime)
     } catch (e) {
         dumpError("[updateConfigFileTime] error:", e)
         if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'ConfigMtime')) {
@@ -531,11 +536,6 @@ export const receiveConfigSyncMtime = async function (data: ReceiveMtimeMessage,
         plugin.configSyncTasks.failed++
     }
     plugin.removeIgnoredConfigFile(data.path)
-
-    // 更新同步时间
-    if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"))) {
-        plugin.localStorageManager.setMetadata("lastConfigSyncTime", data.lastTime)
-    }
 
     plugin.recordSyncCompleted('setting', data.pageIndex)
 }
@@ -592,9 +592,7 @@ export const receiveConfigSyncDelete = async function (data: { path: string, las
     }
 
     // 更新同步时间
-    if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"))) {
-        plugin.localStorageManager.setMetadata("lastConfigSyncTime", data.lastTime)
-    }
+    advanceLiveSyncTime(plugin, "lastConfigSyncTime", data.lastTime)
     if (data.path) { plugin.concurrencyLimiter.releaseSlot(data.path) }
 
     plugin.recordSyncCompleted('setting', data.pageIndex)
@@ -611,11 +609,19 @@ export const receiveConfigSyncEnd = async function (data: unknown, plugin: FastS
     plugin.configSyncTasks.needSyncMtime = syncData.needSyncMtimeCount || 0
     plugin.configSyncTasks.needDelete = syncData.needDeleteCount || 0
 
-    const hasUpdates = (syncData.needUploadCount || 0) + (syncData.needModifyCount || 0) + (syncData.needSyncMtimeCount || 0) + (syncData.needDeleteCount || 0) > 0;
-    if (hasUpdates) {
-        // 暂存，待本类型全部完成且无失败时由 settleSyncTimes 落盘 / Stashed; persisted by settleSyncTimes
-        plugin.syncState.pendingSyncEndTime.set("lastConfigSyncTime", syncData.lastTime)
-    }
+    // 与 note/file/folder 三类一致：无条件暂存（service#101）。服务端 SettingSyncEnd 的
+    // lastTime 同样取查询开始时刻（ws_setting.go syncStartTime），无下行更新时也有效；
+    // 若仅在 hasUpdates 时暂存，纯上行的一轮结束后游标停在旧值（首次为 0），每轮都触发
+    // isCover 全量覆盖比对。该条件系上游 ebaf4b5 给四类统一误加、09ea67b 修三类时漏掉
+    // config 的残留，无保留依据。
+    // Same as note/file/folder: stash unconditionally (service#101). The server's
+    // SettingSyncEnd lastTime is also its query start (ws_setting.go syncStartTime), valid
+    // even with no downlink updates; stashing only on hasUpdates left the cursor stale after
+    // pure-uplink rounds (0 on first sync), forcing an isCover full comparison every round.
+    // The condition was an upstream misapplication (ebaf4b5 added it to all four types,
+    // 09ea67b removed three but missed config) with no surviving justification.
+    // 暂存，待本类型全部完成且无失败时由 settleSyncTimes 落盘 / Stashed; persisted by settleSyncTimes
+    plugin.syncState.pendingSyncEndTime.set("lastConfigSyncTime", syncData.lastTime)
     plugin.syncTypeCompleteCount++
 }
 
@@ -656,9 +662,7 @@ export const receiveConfigModifyAck = async function (data: { lastTime?: number;
             plugin.localStorageManager.savePending('pendingConfigModifies', plugin.pendingConfigModifies)
         }
     }
-    if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"))) {
-        plugin.localStorageManager.setMetadata("lastConfigSyncTime", data.lastTime)
-    }
+    advanceLiveSyncTime(plugin, "lastConfigSyncTime", data.lastTime)
     if (data.path) {
         plugin.concurrencyLimiter.releaseSlot(data.path)
     }
@@ -681,9 +685,7 @@ export const receiveConfigDeleteAck = function (data: { lastTime?: number; path?
         }
         plugin.pendingConfigDeleteAcks.delete(data.path)
     }
-    if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"))) {
-        plugin.localStorageManager.setMetadata("lastConfigSyncTime", data.lastTime)
-    }
+    advanceLiveSyncTime(plugin, "lastConfigSyncTime", data.lastTime)
     if (data.path) {
         plugin.concurrencyLimiter.releaseSlot(data.path)
     }

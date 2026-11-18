@@ -28,6 +28,7 @@ function load(file) {
       : id.includes('helpers_obsidian_bypass') ? { ...helpers, vaultDelete: async () => {} }
       : id.includes('helpers') ? { ...helpers, vaultDelete: async () => {} }
       : id.includes('sync_log_manager') ? { SyncLogManager: { getInstance: () => ({ addLog: (...a) => logEntries.push(a) }) } }
+      : id.includes('sync_state') ? { advanceLiveSyncTime: (plugin, field, lastTime) => { if (lastTime && lastTime > Number(plugin.localStorageManager.getMetadata(field))) plugin.localStorageManager.setMetadata(field, lastTime); } }
       : id.includes('remote_path_guard') ? { blockAliasedRemoteMutation: () => false }
       : id.includes('remote_delete_guard') ? { firstKeepWithoutBaseline: () => false }
       : {} });

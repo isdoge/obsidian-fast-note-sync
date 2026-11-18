@@ -15,6 +15,7 @@ vm.runInNewContext(code, { module, exports: module.exports, console, Error,
     : id.includes('helpers') ? new Proxy({ isPathExcluded: () => false,
         showSyncNotice: (...args) => notices.push(args), checkAndNotifyCaseConflict: () => false }, { get: (t, k) => t[k] ?? noop })
     : id.includes('sync_log_manager') ? { SyncLogManager: { getInstance: () => ({ addLog: (...args) => logs.push(args) }) } }
+    : id.includes('sync_state') ? { advanceLiveSyncTime: (plugin, field, lastTime) => { if (lastTime && lastTime > Number(plugin.localStorageManager.getMetadata(field))) plugin.localStorageManager.setMetadata(field, lastTime); } }
     : id.includes('i18n') ? { $: k => k } : {} });
 
 for (const path of ['test:colon/note.md', 'notes/test:colon.md', 'notes/valid.md']) {

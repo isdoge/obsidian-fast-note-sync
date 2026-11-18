@@ -1,4 +1,5 @@
 import { blockAliasedRemoteMutation } from "./remote_path_guard";
+import { advanceLiveSyncTime } from "./sync_state";
 import { firstKeepWithoutBaseline } from "./remote_delete_guard";
 import { TFile, TAbstractFile, normalizePath } from "obsidian";
 
@@ -442,9 +443,7 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
           }
           await plugin.app.vault.create(normalizedPath, data.content, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
         }
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
-          plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
-        }
+        advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
 
         // 服务端推送笔记更新,更新哈希表(使用内容哈希)
         // 注意：由于是服务端推送，我们信任服务端返回的 mtime，并尝试获取本地文件大小
@@ -619,9 +618,7 @@ export const receiveNoteSyncMtime = async function (data: ReceiveMtimeMessage, p
             plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies)
           }
           // 更新同步时间
-          if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
-            plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
-          }
+          advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
         } finally {
           plugin.removeIgnoredFile(normalizedPath)
         }
@@ -713,9 +710,7 @@ export const receiveNoteSyncDelete = async function (data: ReceiveMessage, plugi
           plugin.pendingNoteModifies.delete(normalizedPath)
           plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies)
           // 更新同步时间
-          if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
-            plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
-          }
+          advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
         } finally {
           // 延时 500ms 清理拦截集合，确保本地事件已被处理
           window.setTimeout(() => {
@@ -837,9 +832,7 @@ export const receiveNoteSyncRename = async function (data: { path: string, oldPa
           plugin.fileHashManager.setFileHash(data.path, data.contentHash, mtime || (renamedFile instanceof TFile ? renamedFile.stat.mtime : 0), renamedFile instanceof TFile ? renamedFile.stat.size : 0)
 
           // 更新同步时间
-          if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
-            plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
-          }
+          advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
         } finally {
           window.setTimeout(() => {
             plugin.removeIgnoredFile(normalizedNewPath)
@@ -905,9 +898,7 @@ export const receiveNoteModifyAck = function (data: { lastTime?: number; path?: 
       dump(`NoteModifyAck received for non-pending path: ${data.path}`)
     }
   }
-  if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
-    plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
-  }
+  advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
   if (data.path) {
     plugin.concurrencyLimiter.releaseSlot(data.path)
   }
@@ -943,9 +934,7 @@ export const receiveNoteRenameAck = function (data: { lastTime?: number; path?: 
     const file = plugin.app.vault.getFileByPath(normalizePath(pending.newPath))
     plugin.fileHashManager.setFileHash(pending.newPath, pending.contentHash, file?.stat.mtime || 0, file?.stat.size || 0)
   }
-  if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
-    plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
-  }
+  advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
   plugin.concurrencyLimiter.releaseFifoSlot()
 }
 
@@ -961,7 +950,5 @@ export const receiveNoteDeleteAck = function (data: { lastTime?: number; path?: 
   if (data.path) {
     plugin.concurrencyLimiter.releaseSlot(data.path)
   }
-  if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
-    plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
-  }
+  advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
 }

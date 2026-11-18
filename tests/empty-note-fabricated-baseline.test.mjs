@@ -136,6 +136,7 @@ const { FileHashManager } = loadModule("src/lib/storage/file_hash_manager.ts", (
     if (id === "../utils/helpers") return new Proxy({ isPathExcluded: () => false, hashContent: (s) => `h${s.length}`, hashContentAsync: async (s) => `h${s.length}`, getPluginDir: () => "" }, { get: (t, n) => t[n] ?? (() => false) });
     if (id === "./remote_path_guard") return { blockAliasedRemoteMutation: () => false };
     if (id === "./sync_log_manager") return { SyncLogManager: { getInstance: () => ({ addLog: () => undefined }) } };
+    if (id === "./sync_state") return { advanceLiveSyncTime: (plugin, field, lastTime) => { if (lastTime && lastTime > Number(plugin.localStorageManager.getMetadata(field))) plugin.localStorageManager.setMetadata(field, lastTime); } };
     return {};
   });
   const file = new TFile("diary/today.md");
@@ -187,6 +188,7 @@ const { FileHashManager } = loadModule("src/lib/storage/file_hash_manager.ts", (
     if (id === "../utils/helpers") return new Proxy({ isPathExcluded: () => false, hashContent: (s) => `h${s.length}`, hashContentAsync: async (s) => `h${s.length}`, getPluginDir: () => "" }, { get: (t, n) => t[n] ?? (() => false) });
     if (id === "./remote_path_guard") return { blockAliasedRemoteMutation: () => false };
     if (id === "./sync_log_manager") return { SyncLogManager: { getInstance: () => ({ addLog: () => undefined }) } };
+    if (id === "./sync_state") return { advanceLiveSyncTime: (plugin, field, lastTime) => { if (lastTime && lastTime > Number(plugin.localStorageManager.getMetadata(field))) plugin.localStorageManager.setMetadata(field, lastTime); } };
     return {};
   });
   const file = new TFile("diary/today.md");
