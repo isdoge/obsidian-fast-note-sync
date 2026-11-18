@@ -1,6 +1,6 @@
 import { normalizePath } from "obsidian";
 
-import { hashContentAsync, dump, dumpError, configIsPathExcluded, getConfigSyncCustomDirs, showSyncNotice, hashFileAsync, debounce, LocalStateFileMirror } from "../utils/helpers";
+import { hashContentAsync, dump, dumpError, configIsPathExcluded, getConfigSyncCustomDirs, showSyncNotice, hashFileAsync, debounce, LocalStateFileMirror, computeMirrorDigest } from "../utils/helpers";
 import { configAllPaths } from "../sync/operator_config";
 import { $ } from "../../i18n/lang";
 import type FastSync from "../../main";
@@ -30,6 +30,8 @@ export class ConfigHashManager {
     private debouncedFlush: () => void;
     // 文件镜像：localStorage 被移动端系统清除后的兜底恢复
     private mirror: LocalStateFileMirror;
+    private restoredFromPersisted: boolean = false;
+    private digest: string = "";
 
     constructor(plugin: FastSync) {
         this.plugin = plugin;
@@ -73,6 +75,7 @@ export class ConfigHashManager {
 
         if (loaded) {
             dump(`ConfigHashManager: loaded from localStorage (${this.hashMap.size} configs)`);
+            this.restoredFromPersisted = true;
             this.isInitialized = true;
             return;
         }
@@ -81,14 +84,27 @@ export class ConfigHashManager {
         const mirrored = await this.mirror.read();
         if (mirrored && this.parseAndLoad(mirrored)) {
             dump("ConfigHashManager: restored hash map from file mirror");
+            this.restoredFromPersisted = true;
             this.saveToStorage();
             this.isInitialized = true;
             return;
         }
 
         dump("ConfigHashManager: no data in localStorage or file mirror, building config hash map");
+        this.restoredFromPersisted = false;
         await this.buildConfigHashMap();
         this.isInitialized = true;
+    }
+
+    wasRebuilt(): boolean {
+        return !this.restoredFromPersisted;
+    }
+
+    getDigest(): string {
+        if (this.isDirty || !this.digest) {
+            this.digest = computeMirrorDigest(JSON.stringify(Object.fromEntries(this.hashMap)));
+        }
+        return this.digest;
     }
 
     /**
@@ -331,6 +347,7 @@ export class ConfigHashManager {
             }
 
             this.hashMap = migratedMap;
+            this.digest = computeMirrorDigest(JSON.stringify(Object.fromEntries(this.hashMap)));
             if (needsSave) this.saveToStorage();
 
             return true;
@@ -348,6 +365,7 @@ export class ConfigHashManager {
         try {
             const obj = Object.fromEntries(this.hashMap);
             data = JSON.stringify(obj);
+            this.digest = computeMirrorDigest(data);
         } catch (error) {
             dump("ConfigHashManager: failed to serialize hash map", error);
             return;

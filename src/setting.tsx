@@ -840,6 +840,7 @@ export class SettingTab extends PluginSettingTab {
                 `${getPluginDir(this.plugin)}/configHashMap.json`,
                 `${getPluginDir(this.plugin)}/fileHashMap.json`,
                 `${getPluginDir(this.plugin)}/folderSnapshot.json`,
+                `${getPluginDir(this.plugin)}/syncState.json`,
                 `${this.app.vault.configDir}/community-plugins.json`,
               ]
               this.plugin.settings.syncExcludeFolders = JSON.stringify(defaultExcludes.map((pattern) => ({ pattern, caseSensitive: false })))

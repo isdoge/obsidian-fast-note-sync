@@ -396,6 +396,12 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, _sync
       plugin.syncState.hasSyncedThisConnection = true;
     }
 
+    // 本轮同步结束：先强制落盘哈希/快照，再落盘同步时间镜像，保证配对一致
+    (plugin.fileHashManager as { flush?: () => void } | undefined)?.flush?.();
+    (plugin.configHashManager as { flush?: () => void } | undefined)?.flush?.();
+    (plugin.folderSnapshotManager as { flush?: () => void } | undefined)?.flush?.();
+    (plugin.localStorageManager as { flushSyncStateMirror?: () => void } | undefined)?.flushSyncStateMirror?.();
+
     // 如果开启了云预览，在首次同步后检查所有附件在服务端的状态
     if (plugin.settings.cloudPreviewEnabled) {
       void checkAndUploadAttachments(plugin);

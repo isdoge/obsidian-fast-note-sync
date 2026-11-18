@@ -1,6 +1,38 @@
-import { hashContent, dump, SyncRule } from "../utils/helpers";
+import { hashContent, dump, SyncRule, LocalStateFileMirror, computeMirrorDigest } from "../utils/helpers";
 import { configModify } from "../sync/operator_config";
 import type FastSync from "../../main";
+
+const SYNC_STATE_MIRROR_FIELDS = [
+    "lastNoteSyncTime",
+    "lastFileSyncTime",
+    "lastConfigSyncTime",
+    "lastFolderSyncTime",
+    "isInitSync",
+    "lastSyncSuccessTime",
+] as const;
+
+type SyncStateMirrorField = (typeof SYNC_STATE_MIRROR_FIELDS)[number];
+const SYNC_STATE_MIRROR_FIELD_SET: ReadonlySet<string> = new Set(SYNC_STATE_MIRROR_FIELDS);
+
+interface SyncStateMirrorData {
+    version: 1;
+    scope: string;
+    lastNoteSyncTime: number;
+    lastFileSyncTime: number;
+    lastConfigSyncTime: number;
+    lastFolderSyncTime: number;
+    isInitSync: boolean;
+    lastSyncSuccessTime: number;
+    hashes: {
+        syncHash: string | null;
+        configHash: string | null;
+        folderSnapshot: string | null;
+    };
+}
+
+function isValidNonNegativeNumber(v: unknown): v is number {
+    return typeof v === "number" && Number.isFinite(v) && v >= 0;
+}
 
 
 /**
@@ -17,6 +49,10 @@ export class LocalStorageManager {
     private lastMtimes: Map<string, number> = new Map();
     private watchTimer: number | null = null;
     private storageHandler: ((event: StorageEvent) => void) | null = null;
+    // 同步状态文件镜像：localStorage 被移动端系统清除后的兜底恢复（与哈希表配对校验）
+    private syncStateMirror: LocalStateFileMirror | null = null;
+    private syncStateDirty: boolean = false;
+    private stageTimer: number | null = null;
 
     /**
      * 底层读原子操作
@@ -38,7 +74,7 @@ export class LocalStorageManager {
         return `fns-${field}`;
     }
 
-    getMetadata(field: 'lastNoteSyncTime' | 'lastFileSyncTime' | 'lastConfigSyncTime' | 'lastFolderSyncTime' | 'lastSyncSuccessTime' | 'clientName' | 'isInitSync' | 'serverVersion' | 'serverChangelog' | 'serverVersionIsNew' | 'serverVersionNewName' | 'serverVersionNewLink' | 'serverVersionNewChangelogContent' | 'serverVersionChangelogContent' | 'pluginVersionIsNew' | 'pluginVersionNewName' | 'pluginVersionNewLink' | 'pluginVersionNewChangelogContent' | 'pluginVersionChangelogContent' | 'internalExcludes' | 'apiToken' | 'apiUrl' | 'vault' | 'autoRedirectEnabled' | 'wsPreProbeEnabled' | 'serverVersionHistory' | 'pluginVersionHistory'): unknown {
+    private readMetadataWithMigration(field: string): string | null {
         const newKey = this.getInternalKey(field);
         let value = this.read(newKey);
 
@@ -69,6 +105,15 @@ export class LocalStorageManager {
                 this.write(newKey, value);
             }
         }
+        return value;
+    }
+
+    private hasStoredMetadata(field: SyncStateMirrorField): boolean {
+        return this.readMetadataWithMigration(field) !== null;
+    }
+
+    getMetadata(field: 'lastNoteSyncTime' | 'lastFileSyncTime' | 'lastConfigSyncTime' | 'lastFolderSyncTime' | 'lastSyncSuccessTime' | 'clientName' | 'isInitSync' | 'serverVersion' | 'serverChangelog' | 'serverVersionIsNew' | 'serverVersionNewName' | 'serverVersionNewLink' | 'serverVersionNewChangelogContent' | 'serverVersionChangelogContent' | 'pluginVersionIsNew' | 'pluginVersionNewName' | 'pluginVersionNewLink' | 'pluginVersionNewChangelogContent' | 'pluginVersionChangelogContent' | 'internalExcludes' | 'apiToken' | 'apiUrl' | 'vault' | 'autoRedirectEnabled' | 'wsPreProbeEnabled' | 'serverVersionHistory' | 'pluginVersionHistory'): unknown {
+        const value = this.readMetadataWithMigration(field);
         if (field.endsWith('Time')) {
             return value ? Number(value) : 0;
         }
@@ -83,6 +128,9 @@ export class LocalStorageManager {
      */
     setMetadata(field: 'lastNoteSyncTime' | 'lastFileSyncTime' | 'lastConfigSyncTime' | 'lastFolderSyncTime' | 'lastSyncSuccessTime' | 'clientName' | 'isInitSync' | 'serverVersion' | 'serverChangelog' | 'serverVersionIsNew' | 'serverVersionNewName' | 'serverVersionNewLink' | 'serverVersionNewChangelogContent' | 'serverVersionChangelogContent' | 'pluginVersionIsNew' | 'pluginVersionNewName' | 'pluginVersionNewLink' | 'pluginVersionNewChangelogContent' | 'pluginVersionChangelogContent' | 'internalExcludes' | 'apiToken' | 'apiUrl' | 'vault' | 'autoRedirectEnabled' | 'wsPreProbeEnabled' | 'serverVersionHistory' | 'pluginVersionHistory', value: unknown): void {
         this.write(this.getInternalKey(field), String(value));
+        if (SYNC_STATE_MIRROR_FIELD_SET.has(field)) {
+            this.scheduleSyncStateMirrorSave();
+        }
     }
 
     /**
@@ -161,10 +209,180 @@ export class LocalStorageManager {
         // 同步清除持久化的冲突路径，避免重启后旧冲突记录在全新同步后误触发冲突列表弹窗
         // Also clear persisted conflicted paths so stale conflicts don't re-surface after a fresh sync
         this.setConflictedPaths(new Set());
+        this.flushSyncStateMirror();
+    }
+
+    private computeSyncStateScope(): string {
+        const api = (this.plugin.settings?.api || "").trim().replace(/\/+$/, "");
+        const vault = (this.plugin.settings?.vault || "").trim();
+        const apiToken = (this.plugin.settings?.apiToken || "").trim();
+        return computeMirrorDigest(`${api}\0${vault}\0${apiToken}`);
+    }
+
+    private buildSyncStateMirrorPayload(): SyncStateMirrorData {
+        const fhm = this.plugin.fileHashManager;
+        const chm = this.plugin.configHashManager;
+        const fsm = this.plugin.folderSnapshotManager;
+        return {
+            version: 1,
+            scope: this.computeSyncStateScope(),
+            lastNoteSyncTime: Number(this.getMetadata("lastNoteSyncTime")) || 0,
+            lastFileSyncTime: Number(this.getMetadata("lastFileSyncTime")) || 0,
+            lastConfigSyncTime: Number(this.getMetadata("lastConfigSyncTime")) || 0,
+            lastFolderSyncTime: Number(this.getMetadata("lastFolderSyncTime")) || 0,
+            isInitSync: Boolean(this.getMetadata("isInitSync")),
+            lastSyncSuccessTime: Number(this.getMetadata("lastSyncSuccessTime")) || 0,
+            hashes: {
+                syncHash: fhm?.isReady() ? fhm.getSyncBaselineDigest() : null,
+                configHash: chm?.isReady() ? chm.getDigest() : null,
+                folderSnapshot: fsm?.isReady() ? fsm.getDigest() : null,
+            },
+        };
+    }
+
+    private scheduleSyncStateMirrorSave(): void {
+        if (!this.syncStateMirror) return;
+        this.syncStateDirty = true;
+        if (this.stageTimer) window.clearTimeout(this.stageTimer);
+        this.stageTimer = window.setTimeout(() => {
+            this.stageTimer = null;
+            this.stageSyncStateMirror();
+        }, 800);
+    }
+
+    private stageSyncStateMirror(): void {
+        if (!this.syncStateDirty || !this.syncStateMirror) return;
+        this.syncStateDirty = false;
+        // 确保依赖的哈希/快照先于同步状态落盘，并获取最新配对指纹
+        this.plugin.fileHashManager?.flush();
+        this.plugin.configHashManager?.flush();
+        this.plugin.folderSnapshotManager?.flush();
+        try {
+            const payload = this.buildSyncStateMirrorPayload();
+            this.syncStateMirror.scheduleWrite(JSON.stringify(payload));
+        } catch (e) {
+            dump("[LocalStorageManager] Failed to serialize sync state mirror:", e);
+        }
+    }
+
+    flushSyncStateMirror(): void {
+        if (this.stageTimer) {
+            window.clearTimeout(this.stageTimer);
+            this.stageTimer = null;
+        }
+        if (!this.syncStateMirror) return;
+        if (this.syncStateDirty) {
+            this.stageSyncStateMirror();
+        }
+        this.syncStateMirror.flush();
+    }
+
+    refreshSyncStateMirrorIfPresent(): void {
+        if (!this.syncStateMirror) return;
+        if (Number(this.getMetadata("lastFolderSyncTime")) > 0 || Boolean(this.getMetadata("isInitSync"))) {
+            this.scheduleSyncStateMirrorSave();
+        }
+    }
+
+    async restoreSyncStateFromMirror(): Promise<void> {
+        if (!this.syncStateMirror) return;
+        const missingFields = SYNC_STATE_MIRROR_FIELDS.filter((f) => !this.hasStoredMetadata(f));
+        if (missingFields.length === 0) {
+            // 老版本升级补齐兜底：localStorage 已有同步状态但镜像文件尚未生成时安排一次落盘
+            const hasActiveSyncState = Boolean(this.getMetadata("isInitSync"))
+                || Number(this.getMetadata("lastNoteSyncTime")) > 0
+                || Number(this.getMetadata("lastFileSyncTime")) > 0
+                || Number(this.getMetadata("lastConfigSyncTime")) > 0
+                || Number(this.getMetadata("lastFolderSyncTime")) > 0;
+            if (hasActiveSyncState) {
+                const existing = await this.syncStateMirror.read();
+                if (!existing) {
+                    this.scheduleSyncStateMirrorSave();
+                }
+            }
+            return;
+        }
+
+        const raw = await this.syncStateMirror.read();
+        if (!raw) return;
+
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(raw);
+        } catch (e) {
+            dump("[LocalStorageManager] Failed to parse syncState mirror, ignoring:", e);
+            return;
+        }
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+
+        const data = parsed as Partial<SyncStateMirrorData>;
+        if (data.version !== 1) return;
+
+        const expectedScope = this.computeSyncStateScope();
+        if (typeof data.scope !== "string" || data.scope !== expectedScope) {
+            dump("[LocalStorageManager] syncState mirror scope mismatch, discarding mirrored sync times");
+            return;
+        }
+
+        const hashes = data.hashes && typeof data.hashes === "object" ? data.hashes : null;
+        if (!hashes) return;
+
+        const fhm = this.plugin.fileHashManager;
+        const noteFilePaired = fhm
+            ? fhm.isReady() && !fhm.wasSyncRebuilt() && typeof hashes.syncHash === "string" && hashes.syncHash === fhm.getSyncBaselineDigest()
+            : hashes.syncHash === null;
+
+        const chm = this.plugin.configHashManager;
+        const configPaired = chm && chm.isReady()
+            ? !chm.wasRebuilt() && typeof hashes.configHash === "string" && hashes.configHash === chm.getDigest()
+            : hashes.configHash === null;
+
+        const fsm = this.plugin.folderSnapshotManager;
+        const folderPaired = fsm
+            ? fsm.isReady() && !fsm.wasRebuilt() && typeof hashes.folderSnapshot === "string" && hashes.folderSnapshot === fsm.getDigest()
+            : hashes.folderSnapshot === null;
+
+        let anyRestored = false;
+
+        if (noteFilePaired) {
+            if (!this.hasStoredMetadata("lastNoteSyncTime") && isValidNonNegativeNumber(data.lastNoteSyncTime)) {
+                this.write(this.getInternalKey("lastNoteSyncTime"), String(data.lastNoteSyncTime));
+                if (data.lastNoteSyncTime > 0) anyRestored = true;
+            }
+            if (!this.hasStoredMetadata("lastFileSyncTime") && isValidNonNegativeNumber(data.lastFileSyncTime)) {
+                this.write(this.getInternalKey("lastFileSyncTime"), String(data.lastFileSyncTime));
+                if (data.lastFileSyncTime > 0) anyRestored = true;
+            }
+        }
+        if (configPaired) {
+            if (!this.hasStoredMetadata("lastConfigSyncTime") && isValidNonNegativeNumber(data.lastConfigSyncTime)) {
+                this.write(this.getInternalKey("lastConfigSyncTime"), String(data.lastConfigSyncTime));
+                if (data.lastConfigSyncTime > 0) anyRestored = true;
+            }
+        }
+        if (folderPaired) {
+            if (!this.hasStoredMetadata("lastFolderSyncTime") && isValidNonNegativeNumber(data.lastFolderSyncTime)) {
+                this.write(this.getInternalKey("lastFolderSyncTime"), String(data.lastFolderSyncTime));
+                if (data.lastFolderSyncTime > 0) anyRestored = true;
+            }
+        }
+
+        if (anyRestored) {
+            if (!this.hasStoredMetadata("isInitSync") && typeof data.isInitSync === "boolean") {
+                this.write(this.getInternalKey("isInitSync"), String(data.isInitSync));
+            }
+            if (!this.hasStoredMetadata("lastSyncSuccessTime") && isValidNonNegativeNumber(data.lastSyncSuccessTime)) {
+                this.write(this.getInternalKey("lastSyncSuccessTime"), String(data.lastSyncSuccessTime));
+            }
+            dump("[LocalStorageManager] Restored sync state from file mirror");
+        }
     }
 
     constructor(plugin: FastSync) {
         this.plugin = plugin;
+        if (plugin?.app?.vault?.configDir && plugin?.manifest) {
+            this.syncStateMirror = new LocalStateFileMirror(plugin, "syncState.json");
+        }
     }
 
     /**
