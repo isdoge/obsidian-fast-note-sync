@@ -1798,12 +1798,26 @@ const handleFileChunkDownloadComplete = async function (session: FileDownloadSes
   }
 }
 
-// 收到 FileRenameAck，服务端确认后更新 hashManager（FIFO 出队）并更新 lastFileSyncTime
-// Receive FileRenameAck, update hashManager after server confirmation (FIFO dequeue) and update lastFileSyncTime
-export const receiveFileRenameAck = function (data: { lastTime?: number }, plugin: FastSync) {
-  // 服务端确认重命名成功，FIFO 出队并更新 hashManager
-  // Server confirmed rename success, dequeue FIFO and update hashManager
-  const pending = plugin.pendingFileRenames.shift()
+// 收到 FileRenameAck，按 data.path（服务端下发的新路径）精确匹配待确认条目并更新 hashManager；
+// 老服务端不下发 path 时回退 FIFO；匹配不到时不误删队列其它项，仅记日志（haierkeys/fast-note-sync-service#312）
+// Receive FileRenameAck, match the pending entry precisely by data.path (the new path the server
+// echoes) and update hashManager; falls back to FIFO for legacy servers that omit path; a miss
+// never removes another entry, it just logs (haierkeys/fast-note-sync-service#312)
+export const receiveFileRenameAck = function (data: { lastTime?: number; path?: string }, plugin: FastSync) {
+  let pending: { oldPath: string; newPath: string; contentHash: string } | undefined
+  if (data.path) {
+    const index = plugin.pendingFileRenames.findIndex(entry => entry.newPath === data.path)
+    if (index !== -1) {
+      pending = plugin.pendingFileRenames[index]
+      plugin.pendingFileRenames.splice(index, 1)
+    } else {
+      dump(`FileRenameAck: no pending rename matches path ${data.path}, leaving the queue intact`)
+    }
+  } else {
+    // 老服务端未下发 path，回退 FIFO 出队
+    // Legacy server omits path, fall back to FIFO dequeue
+    pending = plugin.pendingFileRenames.shift()
+  }
   if (pending) {
     const file = plugin.app.vault.getFileByPath(normalizePath(pending.newPath))
     plugin.fileHashManager.setFileHash(pending.newPath, pending.contentHash, file?.stat.mtime || 0, file?.stat.size || 0)
