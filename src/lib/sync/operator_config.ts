@@ -1,6 +1,6 @@
 import { normalizePath, App } from "obsidian";
 
-import { hashContent, dump, dumpError, configIsPathExcluded, getSafeCtime, isPathInConfigSyncDirs, showSyncNotice, isInWhitelist, hashFileAsync, checkAndNotifyCaseConflict, isLargeBinarySyncRisk } from "../utils/helpers";
+import { hashContent, dump, dumpError, configIsPathExcluded, getSafeCtime, isPathInConfigSyncDirs, showSyncNotice, isInWhitelist, hashFileAsync, checkAndNotifyCaseConflict, isLargeBinarySyncRisk, normalizeServerTimestamp } from "../utils/helpers";
 import { SyncLogManager } from "./sync_log_manager";
 import { ReceiveMessage, ReceiveMtimeMessage, ReceivePathMessage, SyncEndData } from "../utils/types";
 import type FastSync from "../../main";
@@ -354,7 +354,11 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
             return
         }
 
-        await plugin.app.vault.adapter.write(filePath, data.content, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
+        // 服务端历史数据可能存秒级 mtime/ctime（#461），落盘/比较前先归一化为毫秒
+        // Legacy server rows may hold second-scale mtime/ctime (#461); normalize to milliseconds
+        const mtime = normalizeServerTimestamp(data.mtime)
+        const ctime = normalizeServerTimestamp(data.ctime)
+        await plugin.app.vault.adapter.write(filePath, data.content, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
     } catch (e) {
         dumpError("[writeConfigFile] error:", e)
         if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'ConfigModify')) {
@@ -367,9 +371,11 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
     await configReload(data.path, plugin, false, data.content)
 
     // 更新 ConfigManager 的文件状态，防止重复触发 configModify
+    // （mtime 已归一化为毫秒，与 config_manager 读到的本地 stat.mtime 单位一致）
+    // (mtime normalized to milliseconds, matching the unit of the local stat.mtime config_manager reads)
     if (plugin.configManager) {
         const absPath = normalizePath(data.path)
-        plugin.configManager.updateFileState(absPath, data.mtime)
+        plugin.configManager.updateFileState(absPath, normalizeServerTimestamp(data.mtime))
     }
 
     if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"))) {
@@ -383,8 +389,8 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
         // 如果是虚拟路径，mtime 使用推送过来的，size 使用内容长度
         // For virtual paths, use pushed mtime and content length as size
         const size = isVirtual ? (data.content?.length || 0) : (stat?.size || 0);
-        const mtime = data.mtime || (stat?.mtime || 0);
-        
+        const mtime = normalizeServerTimestamp(data.mtime) || (stat?.mtime || 0);
+
         plugin.configHashManager.setFileHash(data.path, data.contentHash, mtime, size)
         // 记录 mtime
         plugin.lastSyncMtime.set(data.path, mtime)
@@ -508,10 +514,14 @@ export const receiveConfigSyncMtime = async function (data: ReceiveMtimeMessage,
 
     plugin.addIgnoredConfigFile(data.path)
     const filePath = normalizePath(data.path)
+    // 服务端历史数据可能存秒级 mtime/ctime（#461），落盘前先归一化为毫秒
+    // Legacy server rows may hold second-scale mtime/ctime (#461); normalize to milliseconds
+    const mtime = normalizeServerTimestamp(data.mtime)
+    const ctime = normalizeServerTimestamp(data.ctime)
     try {
         if (await plugin.app.vault.adapter.exists(filePath)) {
             const content = await plugin.app.vault.adapter.readBinary(filePath)
-            await plugin.app.vault.adapter.writeBinary(filePath, content, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
+            await plugin.app.vault.adapter.writeBinary(filePath, content, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
         }
     } catch (e) {
         dumpError("[updateConfigFileTime] error:", e)

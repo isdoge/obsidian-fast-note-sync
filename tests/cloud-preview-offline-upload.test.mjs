@@ -23,6 +23,7 @@ const helpers = new Proxy({
   hashContent: s => `p:${s}`,
   hashFileAsync: async (_app, p) => localHash.get(p),
   getSafeCtime: stat => stat.ctime,
+  normalizeServerTimestamp: ts => ts === undefined ? undefined : (ts > 0 && ts < 100_000_000_000 ? ts * 1000 : ts),
   addRandomParam: url => url,
   sleep: async () => undefined,
   vaultDelete: async (_vault, f) => { vaultDeleted.push(f.path); },
@@ -93,21 +94,21 @@ const flush = async () => { for (let i = 0; i < 50; i++) await new Promise(r => 
 // 1. Post-sync check after the server was unreachable
 {
   const files = [
-    new TFile("new.png", 2000),          // created offline: the server has no record
-    new TFile("edited.png", 2000),       // edited offline: the server has the old version
-    new TFile("remote-newer.png", 2000), // another device uploaded a newer version
-    new TFile("same.png", 2000),         // unchanged
-    new TFile("touched.png", 2000),      // only the mtime moved, content equals the baseline (#256)
-    new TFile("unreachable.png", 2000),  // the info request failed
-    new TFile("note.md", 2000),
+    new TFile("new.png", 2e12),          // created offline: the server has no record
+    new TFile("edited.png", 2e12),       // edited offline: the server has the old version
+    new TFile("remote-newer.png", 2e12), // another device uploaded a newer version
+    new TFile("same.png", 2e12),         // unchanged
+    new TFile("touched.png", 2e12),      // only the mtime moved, content equals the baseline (#256)
+    new TFile("unreachable.png", 2e12),  // the info request failed
+    new TFile("note.md", 2e12),
   ];
   for (const f of files) localHash.set(f.path, "new");
   localHash.set("touched.png", "old");
   server.set("new.png", notFound);
-  server.set("edited.png", found("edited.png", 1000, "old"));
-  server.set("remote-newer.png", found("remote-newer.png", 3000, "remote"));
-  server.set("same.png", found("same.png", 2000, "new"));
-  server.set("touched.png", found("touched.png", 1000, "old"));
+  server.set("edited.png", found("edited.png", 1e12, "old"));
+  server.set("remote-newer.png", found("remote-newer.png", 3e12, "remote"));
+  server.set("same.png", found("same.png", 2e12, "new"));
+  server.set("touched.png", found("touched.png", 1e12, "old"));
   server.set("unreachable.png", new Error("net::ERR_CONNECTION_REFUSED"));
   const f = fixture(files, { "edited.png": "old", "remote-newer.png": "new", "same.png": "new", "touched.png": "old" });
   await ops.checkAndUploadAttachments(f.plugin);
@@ -121,9 +122,9 @@ const flush = async () => { for (let i = 0; i < 50; i++) await new Promise(r => 
 // needs the server to hold this content, a record with the same size and mtime is not enough
 for (const [serverHash, deleted] of [["other-content", []], ["new", ["shot.png"]]]) {
   vaultDeleted.length = 0;
-  const file = new TFile("shot.png", 2000);
+  const file = new TFile("shot.png", 2e12);
   localHash.set("shot.png", "new");
-  server.set("shot.png", found("shot.png", 2000, serverHash));
+  server.set("shot.png", found("shot.png", 2e12, serverHash));
   const f = fixture([file]);
   f.plugin.settings.cloudPreviewAutoDeleteLocal = true;
   await ops.receiveFileUpload({ path: "shot.png", pathHash: "p:shot.png", sessionId: "s".repeat(36), chunkSize: 1024 }, f.plugin);

@@ -17,6 +17,7 @@ vm.runInNewContext(code, { module, exports: module.exports, console,
     : id.includes('file_cloud_preview') ? { FileCloudPreview: { isRestrictedType: ext => ext === '.png' } }
     : id.includes('helpers') ? new Proxy({ isPathExcluded: () => false, isLargeBinarySyncRisk: () => false,
         checkAndNotifyCaseConflict: () => false, getPluginDir: () => 'plugin',
+        normalizeServerTimestamp: t => t === undefined ? undefined : (t > 0 && t < 1e11 ? t * 1000 : t),
         vaultDelete: (vault, f) => vault.delete(f) }, { get: (t, k) => t[k] ?? noop })
     : id.includes('sync_log_manager') ? { SyncLogManager: { getInstance: () => ({ addLog: noop }) } }
     : id.includes('remote_path_guard') ? { blockAliasedRemoteMutation: () => false }
@@ -49,6 +50,6 @@ for (const restricted of [true, false]) {
   const m = fixture(restricted);
   await ops.receiveFileSyncMtime({ path: 'image.png', pageIndex: 2, mtime: 5, ctime: 1 }, m.plugin);
   assert.equal(m.modified.length, 1, 'mtime update applies to an existing local file');
-  assert.equal(m.modified[0].mtime, 5);
+  assert.equal(m.modified[0].mtime, 5000);
 }
 console.log('PASS: cloud preview applies remote deletions and mtime updates');

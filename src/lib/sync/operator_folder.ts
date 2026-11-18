@@ -2,7 +2,7 @@ import { blockAliasedRemoteMutation } from "./remote_path_guard";
 import { TFolder, normalizePath } from "obsidian";
 
 import { SyncEndData, FolderSyncRenameMessage } from "../utils/types";
-import { hashContent, dump, dumpError, isFolderSyncPathExcluded, waitForFolderEmpty, checkAndNotifyCaseConflict } from "../utils/helpers";
+import { hashContent, dump, dumpError, isFolderSyncPathExcluded, waitForFolderEmpty, checkAndNotifyCaseConflict, normalizeServerTimestamp } from "../utils/helpers";
 import { SyncLogManager } from "./sync_log_manager";
 import type FastSync from "../../main";
 
@@ -179,7 +179,12 @@ export const receiveFolderSyncModify = async function (data: { path: string, mti
                         }
                     }
                 }
-                plugin.folderSnapshotManager.setFolderMtime(normalizedPath, data.mtime || Date.now())
+                // 服务端历史数据可能存秒级 mtime（#461），比较前先归一化为毫秒（快照与
+                // lastFolderSyncTime 同为毫秒，秒级值会被误判为早于游标而跳过创建）
+                // Legacy server rows may hold second-scale mtime (#461); normalize before use. The
+                // snapshot and lastFolderSyncTime are both milliseconds; a seconds value would
+                // compare as older than the cursor and skip folder creation
+                plugin.folderSnapshotManager.setFolderMtime(normalizedPath, normalizeServerTimestamp(data.mtime) || Date.now())
             } finally {
                 window.setTimeout(() => {
                     plugin.removeIgnoredFile(normalizedPath)
@@ -315,7 +320,8 @@ export const receiveFolderSyncRename = async function (data: FolderSyncRenameMes
 
                     await plugin.app.vault.rename(folder, normalizedNewPath)
                     plugin.folderSnapshotManager.removeFolder(normalizedOldPath)
-                    plugin.folderSnapshotManager.setFolderMtime(normalizedNewPath, data.mtime || Date.now())
+                    // 同上：归一化秒级 mtime（#461）/ Same as above: normalize second-scale mtime (#461)
+                    plugin.folderSnapshotManager.setFolderMtime(normalizedNewPath, normalizeServerTimestamp(data.mtime) || Date.now())
                 } finally {
                     window.setTimeout(() => {
                         plugin.removeIgnoredFile(normalizedNewPath)
@@ -333,7 +339,8 @@ export const receiveFolderSyncRename = async function (data: FolderSyncRenameMes
                             dump(`Folder create ignored (may already exist): ${normalizedNewPath}`, e)
                         }
                     }
-                    plugin.folderSnapshotManager.setFolderMtime(normalizedNewPath, data.mtime || Date.now())
+                    // 同上：归一化秒级 mtime（#461）/ Same as above: normalize second-scale mtime (#461)
+                    plugin.folderSnapshotManager.setFolderMtime(normalizedNewPath, normalizeServerTimestamp(data.mtime) || Date.now())
                 }
             }
         }, { maxRetries: 10, retryInterval: 100 });

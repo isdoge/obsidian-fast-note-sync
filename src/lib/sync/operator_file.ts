@@ -3,7 +3,7 @@ import { firstKeepWithoutBaseline } from "./remote_delete_guard";
 import { TFile, TAbstractFile, normalizePath, Platform } from "obsidian";
 
 import { ReceiveFileSyncUpdateMessage, FileUploadMessage, FileSyncChunkDownloadMessage, FileDownloadSession, ReceiveMtimeMessage, ReceivePathMessage, SyncEndData } from "../utils/types";
-import { hashContent, hashArrayBuffer, getPluginDir, dump, dumpError, sleep, isPathExcluded, getSafeCtime, isLargeBinarySyncRisk, describeBinarySyncLimit, showSyncNotice, checkAndNotifyCaseConflict, logMemorySnapshot, hashFileAsync, vaultDelete } from "../utils/helpers";
+import { hashContent, hashArrayBuffer, getPluginDir, dump, dumpError, sleep, isPathExcluded, getSafeCtime, isLargeBinarySyncRisk, describeBinarySyncLimit, showSyncNotice, checkAndNotifyCaseConflict, logMemorySnapshot, hashFileAsync, vaultDelete, normalizeServerTimestamp } from "../utils/helpers";
 import { FileCloudPreview } from "../storage/file_cloud_preview";
 import { SyncLogManager } from "./sync_log_manager";
 import { HttpApiService } from "../api/http_api_service";
@@ -937,12 +937,15 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
 
             if (serverInfo) {
               // 核对 path、size、mtime 是否一致；还要求服务端内容哈希就是本次上传的内容，
-              // 大小和时间相同的旧记录不能当作"已收到"（haierkeys/fast-note-sync-service#512）
+              // 大小和时间相同的旧记录不能当作"已收到"（haierkeys/fast-note-sync-service#512）；
+              // 服务端历史数据可能存秒级 mtime（#461），比较前归一化为毫秒
               // Besides path, size and mtime the server must hold the content just uploaded; an older
               // record with the same size and mtime does not prove the upload arrived
+              // (haierkeys/fast-note-sync-service#512); legacy rows may hold second-scale mtime
+              // (#461), normalize before comparing
               if (serverInfo.path === file.path &&
                 serverInfo.size === file.stat.size &&
-                serverInfo.mtime === file.stat.mtime &&
+                normalizeServerTimestamp(serverInfo.mtime) === file.stat.mtime &&
                 serverInfo.contentHash === contentHash) {
                 dump(`Cloud Preview: Auto delete verified file: ${file.path}`);
                 plugin.addIgnoredFile(file.path);
@@ -1038,12 +1041,14 @@ export const receiveFileSyncUpdate = async function (data: ReceiveFileSyncUpdate
 
     dump(`Receive file sync update(download): `, data.path)
     const tempKey = `temp_${data.path}`
+    // 服务端历史数据可能存秒级 mtime/ctime（#461），落盘/比较前先归一化为毫秒
+    // Legacy server rows may hold second-scale mtime/ctime (#461); normalize to milliseconds
     const tempSession: FileDownloadSession = {
       commitGuard: captureDownloadGuard(plugin, data.path),
       path: data.path,
       contentHash: data.contentHash,
-      ctime: data.ctime,
-      mtime: data.mtime,
+      ctime: normalizeServerTimestamp(data.ctime),
+      mtime: normalizeServerTimestamp(data.mtime),
       lastTime: data.lastTime,
       sessionId: "",
       totalChunks: 0,
@@ -1175,7 +1180,11 @@ export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, p
   // Cloud preview does not skip mtime updates: the handler only touches files that already
   // exist locally, and skipping left their mtime stale so every round re-checked them.
 
-  dump(`Receive file sync mtime: `, data.path, data.mtime)
+  // 服务端历史数据可能存秒级 mtime/ctime（#461），落盘/比较前先归一化为毫秒
+  // Legacy server rows may hold second-scale mtime/ctime (#461); normalize to milliseconds
+  const mtime = normalizeServerTimestamp(data.mtime)
+  const ctime = normalizeServerTimestamp(data.ctime)
+  dump(`Receive file sync mtime: `, data.path, mtime)
   const normalizedPath = normalizePath(data.path)
 
   await plugin.lockManager.withLock(normalizedPath, async () => {
@@ -1183,7 +1192,7 @@ export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, p
     if (file) {
       if (isLargeBinarySyncRisk(file.stat.size, plugin)) {
         dump(`Skip binary mtime rewrite for large attachment (${describeBinarySyncLimit()} limit): ${normalizedPath}`, file.stat.size)
-        plugin.lastSyncMtime.set(data.path, data.mtime)
+        plugin.lastSyncMtime.set(data.path, mtime || 0)
         if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
           plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
         }
@@ -1192,9 +1201,9 @@ export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, p
       const content = await plugin.app.vault.readBinary(file)
       plugin.addIgnoredFile(normalizedPath)
       try {
-        await plugin.app.vault.modifyBinary(file, content, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
+        await plugin.app.vault.modifyBinary(file, content, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
         // 记录 mtime
-        plugin.lastSyncMtime.set(data.path, data.mtime)
+        plugin.lastSyncMtime.set(data.path, mtime || 0)
         // 更新同步时间
         if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
           plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
@@ -1251,12 +1260,14 @@ export const receiveFileSyncChunkDownload = async function (data: FileSyncChunkD
     dump(`Ignore unsolicited file chunk download reply: ${data.path}`)
     return
   }
+  // 服务端历史数据可能存秒级 mtime/ctime（#461），落盘/比较前先归一化为毫秒
+  // Legacy server rows may hold second-scale mtime/ctime (#461); normalize to milliseconds
   const session: FileDownloadSession = {
     commitGuard: tempSession.commitGuard,
     path: data.path,
     contentHash: data.contentHash,
-    ctime: data.ctime,
-    mtime: data.mtime,
+    ctime: normalizeServerTimestamp(data.ctime),
+    mtime: normalizeServerTimestamp(data.mtime),
     lastTime: tempSession.lastTime,
     sessionId: data.sessionId,
     totalChunks: data.totalChunks,
@@ -1362,12 +1373,14 @@ export const checkAndUploadAttachments = async function (plugin: FastSync) {
         dump(`Cloud Preview: File missing on server, starting upload: ${file.path}`);
         await fileModify(file, plugin, false);
         uploadCount++;
-      } else if (file.stat.mtime > res.mtime) {
+      } else if (file.stat.mtime > (normalizeServerTimestamp(res.mtime) ?? 0)) {
         // 服务端已有但本地更新：云预览附件不参与常规扫描，离线期间的修改只能在这里补传。
-        // 是否真有改动由 fileModify 判断，内容与同步基线一致（只是 mtime 变了，#256）不会上传
+        // 是否真有改动由 fileModify 判断，内容与同步基线一致（只是 mtime 变了，#256）不会上传；
+        // 服务端历史数据可能存秒级 mtime（#461），比较前归一化为毫秒
         // The server has it but the local copy is newer: cloud preview attachments skip the regular
         // scan, so an edit made while offline can only be uploaded here. fileModify decides whether
-        // anything changed; content equal to the sync baseline (mtime only, #256) is not uploaded
+        // anything changed; content equal to the sync baseline (mtime only, #256) is not uploaded;
+        // legacy server rows may hold second-scale mtime (#461), normalize before comparing
         dump(`Cloud Preview: Local copy newer than server, checking upload: ${file.path}`);
         await fileModify(file, plugin, false);
         uploadCount++;
@@ -1499,6 +1512,11 @@ export const receiveFileSyncRename = async function (data: { oldPath: string; pa
 
   dump(`Receive file rename:`, data.oldPath, "->", data.path)
 
+  // 服务端历史数据可能存秒级 mtime/ctime（#461），落盘/比较前先归一化为毫秒
+  // Legacy server rows may hold second-scale mtime/ctime (#461); normalize to milliseconds
+  const mtime = normalizeServerTimestamp(data.mtime)
+  const ctime = normalizeServerTimestamp(data.ctime)
+
   const normalizedOldPath = normalizePath(data.oldPath)
   const normalizedNewPath = normalizePath(data.path)
 
@@ -1543,14 +1561,14 @@ export const receiveFileSyncRename = async function (data: { oldPath: string; pa
 
         await plugin.app.vault.rename(file, normalizedNewPath)
 
-        if (data.mtime) {
+        if (mtime) {
           const renamedFile = plugin.app.vault.getFileByPath(normalizedNewPath)
           if (renamedFile instanceof TFile) {
             if (isLargeBinarySyncRisk(renamedFile.stat.size, plugin)) {
               dump(`Skip renamed binary mtime rewrite for large attachment (${describeBinarySyncLimit()} limit): ${normalizedNewPath}`, renamedFile.stat.size)
             } else {
               const content = await plugin.app.vault.readBinary(renamedFile)
-              await plugin.app.vault.modifyBinary(renamedFile, content, { ...((data.ctime ?? 0) > 0 && { ctime: data.ctime }), ...((data.mtime ?? 0) > 0 && { mtime: data.mtime }) })
+              await plugin.app.vault.modifyBinary(renamedFile, content, { ...((ctime ?? 0) > 0 && { ctime }), ...((mtime ?? 0) > 0 && { mtime }) })
             }
           }
         }

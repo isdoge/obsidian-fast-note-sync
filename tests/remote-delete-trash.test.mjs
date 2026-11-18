@@ -9,7 +9,8 @@ class TFolder { constructor(path) { this.path = path; this.children = []; } }
 const helpers = { dump: noop, dumpError: noop, isPathExcluded: () => false,
   isFolderSyncPathExcluded: () => false, configIsPathExcluded: () => false,
   isPathInConfigSyncDirs: () => true, waitForFolderEmpty: async () => true,
-  checkAndNotifyCaseConflict: () => false, isLargeBinarySyncRisk: () => false };
+  checkAndNotifyCaseConflict: () => false, isLargeBinarySyncRisk: () => false,
+  normalizeServerTimestamp: t => t === undefined ? undefined : (t > 0 && t < 1e11 ? t * 1000 : t) };
 let permanentCalls = 0;
 const forbidden = () => { permanentCalls++; throw new Error('permanent deletion must not be used'); };
 function load(file) {
