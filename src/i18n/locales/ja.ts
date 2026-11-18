@@ -615,6 +615,7 @@ export default {
   "ui.notice.connection_retrying": "同期接続が繰り返し失敗しています。バックグラウンドで再試行を続けます",
   "ui.notice.protobuf_fallback": "Protobuf メッセージのデコードに失敗したため、このセッションでは JSON に切り替えました。保存済みの Protobuf 設定は変更されていません。",
   "ui.notice.hash_limit_exceeded": "1回のハッシュ計算上限 (${limit}) に達したため、今回は ${skipped} 件のファイルをスキップしました。次回の同期で処理を続行します。上限を引き上げるか制限を無効にすることもできます。",
+  "ui.notice.hash_timeout": "ハッシュ計算がタイムアウトしたため、${count} 件のファイルをスキップしました。該当する種類の同期時刻を保持し、次回の同期で再試行します。",
   "ui.conflict.list_count": "${count} 件の競合ファイル",
   "ui.conflict.list_empty": "現在競合しているノートはありません",
   "ui.conflict.diff_skipped": "ファイルが大きいため、行ごとの差分比較をスキップしました。上のボタンでローカル/リモート版を選択するか、右側のエディターで直接編集してください。",
