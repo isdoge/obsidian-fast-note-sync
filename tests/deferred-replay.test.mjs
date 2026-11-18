@@ -66,7 +66,7 @@ function makeManager(initialContext = null, retired = []) {
   m.plugin.syncState.onSyncContextRetired = () => m.scheduleDeferredReplay();
   return m;
 }
-const flushTimers = async () => { while (timers.length) { const t = timers.shift(); t(); await Promise.resolve(); } };
+const flushTimers = async () => { while (timers.length) { const t = timers.shift(); await t(); await new Promise(setImmediate); } };
 
 // 1+2. 活跃轮中收到无 context 的 NoteSyncModify / 其它设备 context 的 FolderSyncModify：不立即处理、不丢；轮结束后处理一次
 {

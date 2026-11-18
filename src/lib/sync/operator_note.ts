@@ -581,14 +581,14 @@ export const receiveNoteUpload = async function (data: ReceivePathMessage, plugi
 /**
  * 接收服务端笔记元数据(mtime)更新通知
  */
-export const receiveNoteSyncMtime = async function (data: ReceiveMtimeMessage, plugin: FastSync) {
+export const receiveNoteSyncMtime = async function (data: ReceiveMtimeMessage, plugin: FastSync, outsideRound = false) {
   if (plugin.settings.syncEnabled == false) return
-  const pushPageIndex = plugin.syncState.pendingNotePushPageIndex.get(data.path);
+  const pushPageIndex = outsideRound ? undefined : plugin.syncState.pendingNotePushPageIndex.get(data.path);
   const completionPageIndex = pushPageIndex ?? data.pageIndex;
-  plugin.syncState.pendingNotePushPageIndex.delete(data.path);
+  if (!outsideRound) plugin.syncState.pendingNotePushPageIndex.delete(data.path);
   plugin.concurrencyLimiter.releaseSlot(data.path);
   if (isPathExcluded(data.path, plugin)) {
-    plugin.recordSyncCompleted('note', completionPageIndex)
+    if (!outsideRound) plugin.recordSyncCompleted('note', completionPageIndex)
     return
   }
   // 服务端历史数据可能存秒级 mtime/ctime（#461），落盘/比较前先归一化为毫秒
@@ -618,7 +618,7 @@ export const receiveNoteSyncMtime = async function (data: ReceiveMtimeMessage, p
             plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies)
           }
           // 更新同步时间
-          advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
+          if (!outsideRound) advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
         } finally {
           plugin.removeIgnoredFile(normalizedPath)
         }
@@ -632,9 +632,9 @@ export const receiveNoteSyncMtime = async function (data: ReceiveMtimeMessage, p
     if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'NoteMtime')) {
       SyncLogManager.getInstance().addLog('receive', 'NoteMtime', e instanceof Error ? e.message : String(e), 'error', data.path);
     }
-    plugin.noteSyncTasks.failed++
+    if (!outsideRound) plugin.noteSyncTasks.failed++
   } finally {
-    plugin.recordSyncCompleted('note', completionPageIndex)
+    if (!outsideRound) plugin.recordSyncCompleted('note', completionPageIndex)
   }
 }
 
@@ -887,7 +887,7 @@ export const receiveNoteSyncRename = async function (data: { path: string, oldPa
 
 // 收到 NoteModifyAck，将 pending hash 转移到正式 hashManager 并更新 lastNoteSyncTime
 // Receive NoteModifyAck, move pending hash to formal hashManager and update lastNoteSyncTime
-export const receiveNoteModifyAck = function (data: { lastTime?: number; path?: string }, plugin: FastSync) {
+export const receiveNoteModifyAck = function (data: { lastTime?: number; path?: string }, plugin: FastSync, outsideRound = false) {
   // 服务端确认笔记写入成功，将 pending hash 转移到正式 hashManager
   // Server confirmed note write success, move pending hash to formal hashManager
   if (data.path) {
@@ -902,10 +902,11 @@ export const receiveNoteModifyAck = function (data: { lastTime?: number; path?: 
       dump(`NoteModifyAck received for non-pending path: ${data.path}`)
     }
   }
-  advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
+  if (!outsideRound) advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
   if (data.path) {
     plugin.concurrencyLimiter.releaseSlot(data.path)
   }
+  if (outsideRound) return
   // 该 Ack 若对应服务端 NeedPush 驱动的上传，查表取回其所属下载页归账（供 ack 水位线推进）；
   // 查不到说明是本地用户自发编辑触发的 Ack，不属于任何页，走旧路径（现状语义不变）
   // If this Ack corresponds to a server NeedPush-driven upload, look up its owning download page
@@ -939,7 +940,7 @@ export const receiveNoteRenameAck = function (data: { lastTime?: number; path?: 
     plugin.fileHashManager.setFileHash(pending.newPath, pending.contentHash, file?.stat.mtime || 0, file?.stat.size || 0)
   }
   advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
-  plugin.concurrencyLimiter.releaseFifoSlot()
+  if (pending) plugin.concurrencyLimiter.releaseSlot(pending.newPath)
 }
 
 // 收到 NoteDeleteAck，仅当路径仍在 pending set 中时才从 hashManager 移除

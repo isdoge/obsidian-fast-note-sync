@@ -677,16 +677,16 @@ export const fileRename = async function (file: TAbstractFile, oldfile: string, 
 /**
  * 接收服务端文件上传指令 (FileUpload)
  */
-export const receiveFileUpload = async function (data: FileUploadMessage, plugin: FastSync) {
+export const receiveFileUpload = async function (data: FileUploadMessage, plugin: FastSync, outsideRound = false) {
   if (plugin.settings.syncEnabled == false) return
 
   if (plugin.settings.readonlySyncEnabled) {
     dump(`Read-only mode: Intercepted file upload request for ${data.path}`)
-    plugin.recordSyncCompleted('file', data.pageIndex)
+    if (!outsideRound) plugin.recordSyncCompleted('file', data.pageIndex)
     return
   }
   if (isPathExcluded(data.path, plugin)) {
-    plugin.recordSyncCompleted('file', data.pageIndex)
+    if (!outsideRound) plugin.recordSyncCompleted('file', data.pageIndex)
     return
   }
   dump(`Receive file need upload (queued): `, data.path, data.sessionId)
@@ -698,13 +698,13 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
   const file = plugin.app.vault.getFileByPath(normalizePath(data.path))
   if (!file) {
     dump(`File not found for upload: ${data.path} `)
-    plugin.recordSyncCompleted('file', data.pageIndex)
+    if (!outsideRound) plugin.recordSyncCompleted('file', data.pageIndex)
     return
   }
   if (isLargeBinarySyncRisk(file.stat.size, plugin)) {
     dump(`Skip file upload for large attachment (${describeBinarySyncLimit()} limit): ${data.path}`, file.stat.size)
     notifyLargeFileSkipped(plugin, data.path, file.stat.size, `Fast Note Sync skipped large file upload: ${data.path}`)
-    plugin.recordSyncCompleted('file', data.pageIndex)
+    if (!outsideRound) plugin.recordSyncCompleted('file', data.pageIndex)
     return
   }
 
@@ -713,7 +713,7 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
   // NeedPush(FileUpload)-driven upload/ack round trip: FileUploadAck carries no pageIndex; record
   // the owning page by path for the Ack to look up on arrival (see sync_state.ts
   // pendingFilePushPageIndex comment)
-  if (data.pageIndex !== undefined) {
+  if (!outsideRound && data.pageIndex !== undefined) {
     plugin.syncState.pendingFilePushPageIndex.set(data.path, data.pageIndex)
   }
 
@@ -721,7 +721,7 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
   const actualTotalChunks = file.stat.size === 0 ? 1 : Math.ceil(file.stat.size / chunkSize)
 
   // 始终在进入并发队列前就累加待上传分片总数，以精确驱动进度条
-  plugin.totalChunksToUpload += actualTotalChunks
+  if (!outsideRound) plugin.totalChunksToUpload += actualTotalChunks
 
   const runUpload = async () => {
     // 标记该路径进入活跃上传状态
@@ -733,7 +733,7 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
     uploadAckTimers.delete(data.path)
     const uploadState = { cancelled: false, checkpointKey };
     activeUploadsMap.set(data.path, uploadState);
-    uploadContexts.set(data.path, plugin.syncState.activeSyncContext);
+    uploadContexts.set(data.path, outsideRound ? null : plugin.syncState.activeSyncContext);
 
     // 断点续传 checkpoint key，提升到 try 外以便 catch 块中也能清除
     // Resume checkpoint key hoisted outside try so the catch block can also remove it
@@ -748,10 +748,10 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
       }
       if (!content) {
         clearUploadTracking(data.path)
-        plugin.fileSyncTasks.failed++
-        plugin.totalChunksToUpload -= actualTotalChunks
+        if (!outsideRound) plugin.fileSyncTasks.failed++
+        if (!outsideRound) plugin.totalChunksToUpload -= actualTotalChunks
         plugin.concurrencyLimiter.releaseSlot(data.path)
-        plugin.recordSyncCompleted('file', data.pageIndex)
+        if (!outsideRound) plugin.recordSyncCompleted('file', data.pageIndex)
         return;
       }
 
@@ -791,7 +791,7 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
 
       // 如从断点恢复，则同步累加已上传计数以对齐进度
       if (startChunkIndex > 0) {
-        plugin.uploadedChunksCount += startChunkIndex
+        if (!outsideRound) plugin.uploadedChunksCount += startChunkIndex
       }
 
       // 打印上传信息表格
@@ -840,7 +840,7 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
           },
           () => {
             // after: 发送成功后更新计数和日志
-            plugin.uploadedChunksCount++
+            if (!outsideRound) plugin.uploadedChunksCount++
             const currentProgress = Math.floor(((i + 1) / actualTotalChunks) * 100);
             const isLastChunk = (i + 1) === actualTotalChunks;
 
@@ -906,7 +906,7 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
           // Clear checkpoint on cancel to avoid stale session reuse
           try { plugin.app.saveLocalStorage(checkpointKey, null) } catch { /* ignore */ }
           plugin.concurrencyLimiter.releaseSlot(data.path)
-          plugin.recordSyncCompleted('file', data.pageIndex)
+          if (!outsideRound) plugin.recordSyncCompleted('file', data.pageIndex)
           return;
         }
 
@@ -970,10 +970,10 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
       // 异常退出时清除 checkpoint，避免下次用无效的 sessionId 继续
       try { plugin.app.saveLocalStorage(checkpointKey, null) } catch { /* ignore */ }
       clearUploadTracking(data.path)
-      plugin.fileSyncTasks.failed++
-      plugin.totalChunksToUpload -= actualTotalChunks
+      if (!outsideRound) plugin.fileSyncTasks.failed++
+      if (!outsideRound) plugin.totalChunksToUpload -= actualTotalChunks
       plugin.concurrencyLimiter.releaseSlot(data.path);
-      plugin.recordSyncCompleted('file', data.pageIndex)
+      if (!outsideRound) plugin.recordSyncCompleted('file', data.pageIndex)
     } finally {
       // 任务结束（完成或取消/失败），移除活跃标记
       // Keep the session mapping until ACK/error, which arrives after the send loop.
@@ -1161,18 +1161,18 @@ export const receiveFileSyncDelete = async function (data: ReceivePathMessage, p
 /**
  * 接收服务端文件元数据(mtime)更新通知
  */
-export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, plugin: FastSync) {
+export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, plugin: FastSync, outsideRound = false) {
   if (plugin.settings.syncEnabled == false) return
-  const pendingPage = plugin.syncState.pendingFilePushPageIndex.get(data.path)
+  const pendingPage = outsideRound ? undefined : plugin.syncState.pendingFilePushPageIndex.get(data.path)
   const completionPage = pendingPage ?? data.pageIndex
   clearUploadTracking(data.path)
   uploadContexts.delete(data.path)
   uploadRetries.delete(data.path)
-  plugin.syncState.pendingFilePushPageIndex.delete(data.path)
+  if (!outsideRound) plugin.syncState.pendingFilePushPageIndex.delete(data.path)
   plugin.concurrencyLimiter.releaseSlot(data.path)
 
   if (isPathExcluded(data.path, plugin)) {
-    plugin.recordSyncCompleted('file', completionPage);
+    if (!outsideRound) plugin.recordSyncCompleted('file', completionPage);
     return
   }
 
@@ -1192,17 +1192,23 @@ export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, p
       if (isLargeBinarySyncRisk(file.stat.size, plugin)) {
         dump(`Skip binary mtime rewrite for large attachment (${describeBinarySyncLimit()} limit): ${normalizedPath}`, file.stat.size)
         plugin.lastSyncMtime.set(data.path, mtime || 0)
-        advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
+        if (!outsideRound) advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
         return
       }
       const content = await plugin.app.vault.readBinary(file)
       plugin.addIgnoredFile(normalizedPath)
       try {
         await plugin.app.vault.modifyBinary(file, content, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
+        const pendingHash = plugin.pendingUploadHashes.get(data.path)
+        if (pendingHash !== undefined) {
+          plugin.fileHashManager.setFileHash(data.path, pendingHash, mtime || 0, file.stat.size)
+          plugin.pendingUploadHashes.delete(data.path)
+          plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes)
+        }
         // 记录 mtime
         plugin.lastSyncMtime.set(data.path, mtime || 0)
         // 更新同步时间
-        advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
+        if (!outsideRound) advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
       } finally {
         window.setTimeout(() => {
           plugin.removeIgnoredFile(normalizedPath)
@@ -1218,13 +1224,13 @@ export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, p
     if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'FileMtime')) {
       SyncLogManager.getInstance().addLog('receive', 'FileMtime', e instanceof Error ? e.message : String(e), 'error', data.path);
     }
-    plugin.fileSyncTasks.failed++
+    if (!outsideRound) plugin.fileSyncTasks.failed++
   });
 
   // FileSyncMtime 表示文件已在服务端存在（无需上传），释放 fileModify 中获取的并发槽位
   // FileSyncMtime indicates file already exists on server (no upload needed), release slot acquired by fileModify
   if (data.path) plugin.concurrencyLimiter.releaseSlot(data.path)
-  plugin.recordSyncCompleted('file', completionPage)
+  if (!outsideRound) plugin.recordSyncCompleted('file', completionPage)
 }
 
 /**
@@ -1835,12 +1841,12 @@ export const receiveFileRenameAck = function (data: { lastTime?: number; path?: 
   }
   advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
   dump(`FileRenameAck: lastFileSyncTime updated to`, data.lastTime)
-  plugin.concurrencyLimiter.releaseFifoSlot()
+  if (pending) plugin.concurrencyLimiter.releaseSlot(pending.newPath)
 }
 
 // 收到 FileUploadAck，将 pending hash 转移到正式 hashManager 并更新 lastFileSyncTime
 // Receive FileUploadAck, move pending hash to formal hashManager and update lastFileSyncTime
-export const receiveFileUploadAck = function (data: { lastTime?: number; path?: string; pathHash?: string }, plugin: FastSync) {
+export const receiveFileUploadAck = function (data: { lastTime?: number; path?: string; pathHash?: string }, plugin: FastSync, outsideRound = false) {
   // 服务端确认上传成功，将 pending hash 转移到正式 hashManager
   // Server confirmed upload success, move pending hash to formal hashManager
   if (data.path) {
@@ -1861,11 +1867,12 @@ export const receiveFileUploadAck = function (data: { lastTime?: number; path?: 
     const vaultName = plugin.app.vault.getName()
     try { plugin.app.saveLocalStorage(`fns-${vaultName}-uploadSession-${data.pathHash}`, null) } catch { /* ignore */ }
   }
-  advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
+  if (!outsideRound) advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
   dump(`FileUploadAck: lastFileSyncTime updated to`, data.lastTime)
   if (data.path) {
     plugin.concurrencyLimiter.releaseSlot(data.path)
   }
+  if (outsideRound) return
   // 查表归账所属下载页（NeedPush=FileUpload 驱动）；查不到说明是本地用户自发编辑触发的上传 Ack，走旧路径
   // Look up the owning download page (NeedPush=FileUpload-driven); a miss means a local
   // user-initiated edit triggered this upload Ack, falls back to the legacy path

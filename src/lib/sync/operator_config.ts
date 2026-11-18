@@ -641,7 +641,7 @@ export const receiveConfigSyncClear = async function (data: unknown, plugin: Fas
  * 收到 SettingModifyAck，将 pending hash 转移到正式 configHashManager 并更新 lastConfigSyncTime
  * Receive SettingModifyAck, move pending hash to formal configHashManager and update lastConfigSyncTime
  */
-export const receiveConfigModifyAck = async function (data: { lastTime?: number; path?: string }, plugin: FastSync) {
+export const receiveConfigModifyAck = async function (data: { lastTime?: number; path?: string }, plugin: FastSync, outsideRound = false) {
     if (data.path) {
         const contentHash = plugin.pendingConfigModifies.get(data.path)
         if (contentHash !== undefined) {
@@ -662,10 +662,11 @@ export const receiveConfigModifyAck = async function (data: { lastTime?: number;
             plugin.localStorageManager.savePending('pendingConfigModifies', plugin.pendingConfigModifies)
         }
     }
-    advanceLiveSyncTime(plugin, "lastConfigSyncTime", data.lastTime)
+    if (!outsideRound) advanceLiveSyncTime(plugin, "lastConfigSyncTime", data.lastTime)
     if (data.path) {
         plugin.concurrencyLimiter.releaseSlot(data.path)
     }
+    if (outsideRound) return
     // 查表归账所属下载页（NeedPush 驱动）；查不到说明是本地用户自发编辑触发的 Ack，走旧路径
     // Look up the owning download page (NeedPush-driven); a miss means a local user-initiated
     // edit triggered this Ack, falls back to the legacy path

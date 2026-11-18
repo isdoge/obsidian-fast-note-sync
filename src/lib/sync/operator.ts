@@ -155,7 +155,7 @@ export function settleSyncTimes(plugin: FastSync, abort = false): void {
     if (endTime === undefined) continue;
     const done = plugin.progressTracker.isTypeFullyDone(trackerType)
       && (trackerType !== "file" || plugin.fileDownloadSessions.size === 0);
-    const truncated = truncatedSyncFields?.has(field) ?? false;
+    const truncated = (truncatedSyncFields?.has(field) ?? false) || (plugin.syncState.hashTimeoutCounts?.has(field) ?? false);
     if (!abort && !truncated && done && tasks.failed === 0) {
       plugin.localStorageManager.setMetadata(field, endTime);
     } else if (abort || done) {
@@ -324,6 +324,12 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, _sync
     // before resetSyncTasks (which also clears offlineGuardSkippedThisRound), so we can decide
     // below whether refreshing lastSyncSuccessTime is trustworthy
     const offlineGuardSkippedThisRound = plugin.syncState.offlineGuardSkippedThisRound;
+    const hashTimeoutCount = Array.from(plugin.syncState.hashTimeoutCounts?.values() ?? [])
+      .reduce((sum, count) => sum + count, 0);
+    if (hashTimeoutCount > 0) {
+      showSyncNotice($("ui.notice.hash_timeout", { count: String(hashTimeoutCount) }), 10000);
+      plugin.syncState.hasSyncedThisConnection = false;
+    }
     // 未参与完成判定的类型（如本轮中途关闭了同步）仍有暂存时间时回到基线
     // Types left unsettled (e.g. sync disabled mid-round) fall back to their baseline
     settleSyncTimes(plugin, true);
@@ -377,7 +383,7 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, _sync
     // was intercepted by the offline guard this round (user clicked "Cancel"), that batch of
     // risky files was never actually handled — refreshing the timestamp would zero out the
     // offline duration and silently defeat the guard on the very next round.
-    if (!offlineGuardSkippedThisRound && totalFailed === 0) {
+    if (!offlineGuardSkippedThisRound && totalFailed === 0 && hashTimeoutCount === 0) {
       plugin.localStorageManager.setMetadata("lastSyncSuccessTime", Date.now());
       // 本连接自此完成过一轮正常同步：实时单条消息此后允许推进游标（service#101，
       // 见 sync_state.hasSyncedThisConnection 注释）。与本轮 lastSyncSuccessTime 同判定：
@@ -418,14 +424,14 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, _sync
  * 消息接收调度
  */
 
-export type OperatorHandler = (data: unknown, plugin: FastSync) => Promise<void> | void;
+export type OperatorHandler = (data: unknown, plugin: FastSync, outsideRound?: boolean) => Promise<void> | void;
 export const receiveOperators: Map<WSAction.WSReceiveAction, OperatorHandler> = new Map([
   [WSAction.NoteSyncModify, receiveNoteSyncModify],
   [WSAction.NoteSyncNeedPush, receiveNoteUpload],
   [WSAction.NoteSyncMtime, receiveNoteSyncMtime],
   [WSAction.NoteSyncDelete, receiveNoteSyncDelete],
   [WSAction.NoteSyncRename, receiveNoteSyncRename],
-  [WSAction.NoteModifyAck, (data, plugin) => receiveNoteModifyAck(data as { lastTime?: number; path?: string }, plugin)],
+  [WSAction.NoteModifyAck, (data, plugin, outsideRound) => receiveNoteModifyAck(data as { lastTime?: number; path?: string }, plugin, outsideRound)],
   [WSAction.NoteRenameAck, (data, plugin) => receiveNoteRenameAck(data as { lastTime?: number; path?: string }, plugin)],
   [WSAction.NoteDeleteAck, (data, plugin) => receiveNoteDeleteAck(data as { lastTime?: number; path?: string }, plugin)],
   [WSAction.NoteSyncEnd, (data, plugin) => receiveSyncEndWrapper(data, plugin, "note")],
@@ -763,23 +769,17 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     plugin.downloadedChunksCount = 0;
     plugin.totalChunksToUpload = 0;
     plugin.uploadedChunksCount = 0;
-    // 清空上一次连接的未完成 rename 队列，由 hashManager 旧路径进 delFiles 自然处理
-    // Clear pending renames from previous connection; old paths in hashManager will naturally go into delFiles
-    plugin.pendingFileRenames = []
-    // 清空上一次连接的未完成笔记 rename 队列，由 hashManager 旧路径进 delNotes 自然处理
-    // Clear pending note renames from previous connection; old paths in hashManager will naturally go into delNotes
-    plugin.pendingNoteRenames = new Map()
-    // 清空 pending 删除路径集合，避免旧 of pending 条目干扰本次同步
-    // Clear pending delete path sets to avoid stale entries interfering with this sync
+    // 只保留仍占用空闲槽位的请求，旧轮次/旧连接的条目由扫描重新处理。
+    // Keep pending idle-owned requests until their ACKs; rescan retired/disconnected entries.
+    plugin.pendingFileRenames = plugin.pendingFileRenames.filter(entry => plugin.concurrencyLimiter.getSlotContext?.(entry.newPath) === null)
+    plugin.pendingNoteRenames = new Map(Array.from(plugin.pendingNoteRenames).filter(([path]) => plugin.concurrencyLimiter.getSlotContext?.(path) === null))
     plugin.pendingDeleteNotePaths.clear()
     plugin.pendingDeleteFilePaths.clear()
     plugin.pendingDeleteFolderPaths.clear()
     plugin.pendingDeleteConfigPaths.clear()
-    // 重连时清空 pending Ack 集合；路径保留在 hashManager，将自然进入 delNotes
-    // On reconnect clear pending Ack sets; paths remain in hashManager and flow into delNotes naturally
-    plugin.pendingNoteDeleteAcks.clear()
-    plugin.pendingFileDeleteAcks.clear()
-    plugin.pendingConfigDeleteAcks.clear()
+    plugin.pendingNoteDeleteAcks = new Set(Array.from(plugin.pendingNoteDeleteAcks).filter(path => plugin.concurrencyLimiter.getSlotContext?.(path) === null))
+    plugin.pendingFileDeleteAcks = new Set(Array.from(plugin.pendingFileDeleteAcks).filter(path => plugin.concurrencyLimiter.getSlotContext?.(path) === null))
+    plugin.pendingConfigDeleteAcks = new Set(Array.from(plugin.pendingConfigDeleteAcks).filter(path => plugin.concurrencyLimiter.getSlotContext?.(path) === null))
     // 清空上一轮 NeedPush→Ack 页归属查找表（C3，见 sync_state.ts 注释），避免残留条目误归账到新一轮的页
     // Clear the previous round's NeedPush->Ack page-attribution lookup maps (C3, see sync_state.ts
     // comment), preventing stale entries from misattributing completions in the new round
@@ -863,6 +863,8 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       let hashComputeCount = 0;
       let truncatedNoteCount = 0;
       let truncatedFileCount = 0;
+      let timedOutNoteCount = 0;
+      let timedOutFileCount = 0;
 
       // --- PERF: bounded concurrency for cache-miss hash computation ---
       // 哈希缓存未命中的文件原先完全串行 read+hash，大库首次/全量扫描时很慢；
@@ -961,7 +963,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                   try {
                     const contentHash = await Promise.race([
                       plugin.app.vault.read(file).then(content => hashContentAsync(content)),
-                      new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error(`Hash timeout`)), 15000))
+                      new Promise<never>((_, reject) => window.setTimeout(() => reject(Object.assign(new Error(`Hash timeout`), { name: "HashTimeoutError" })), 15000))
                     ]);
                     plugin.scannedNoteHashes.set(notePath, { hash: contentHash, mtime: noteMtime, size: noteSize });
                     const baseHash = plugin.fileHashManager.getPathHash(notePath);
@@ -974,8 +976,9 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                       size: noteSize,
                       ...(baseHash !== null ? { baseHash } : { baseHashMissing: true }),
                     });
-                  } catch {
-                    // 哈希失败或超时，跳过该文件，不计入本轮同步 / Skip file on hash failure or timeout
+                  } catch (error) {
+                    // 超时单独计数，受影响类型保留游标供下轮重试。 / Count timeouts separately and retry the type next round.
+                    if (error instanceof Error && error.name === "HashTimeoutError") timedOutNoteCount++;
                   }
                 });
               }
@@ -1014,7 +1017,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                   try {
                     const contentHash = await Promise.race([
                       hashFileAsync(plugin.app, attPath),
-                      new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error(`Hash timeout`)), 15000))
+                      new Promise<never>((_, reject) => window.setTimeout(() => reject(Object.assign(new Error(`Hash timeout`), { name: "HashTimeoutError" })), 15000))
                     ]);
                     const baseHash = plugin.fileHashManager.getPathHash(attPath);
                     // 内容未变只是 mtime 被刷新：上报同步时的 mtime，服务端有新版本时按下载处理而非要求上传；
@@ -1034,8 +1037,9 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                       size: attSize,
                       ...(baseHash !== null ? { baseHash } : { baseHashMissing: true }),
                     });
-                  } catch {
-                    // 哈希失败或超时，跳过该文件，不计入本轮同步 / Skip file on hash failure or timeout
+                  } catch (error) {
+                    // 超时单独计数，受影响类型保留游标供下轮重试。 / Count timeouts separately and retry the type next round.
+                    if (error instanceof Error && error.name === "HashTimeoutError") timedOutFileCount++;
                   }
                 });
               }
@@ -1051,6 +1055,10 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       if (hashInFlight.size > 0) {
         await Promise.all(Array.from(hashInFlight));
       }
+
+      if (plugin.syncState.activeSyncContext !== context) return;
+      if (timedOutNoteCount > 0) plugin.syncState.hashTimeoutCounts.set("lastNoteSyncTime", timedOutNoteCount);
+      if (timedOutFileCount > 0) plugin.syncState.hashTimeoutCounts.set("lastFileSyncTime", timedOutFileCount);
 
       // Persist any newly computed hashes (breaks the Catch-22)
       commitScannedHashes(plugin.scannedNoteHashes, (m) => plugin.fileHashManager.bulkSetFromScanned(m));

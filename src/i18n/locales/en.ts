@@ -616,6 +616,7 @@ export default {
   "ui.notice.connection_retrying": "Sync connection keeps failing; will keep retrying in the background",
   "ui.notice.protobuf_fallback": "Protobuf message decoding failed. Switched to JSON for this session; your saved Protobuf setting is unchanged.",
   "ui.notice.hash_limit_exceeded": "Hash calculation limit (${limit}) reached; ${skipped} files were skipped this round and will be processed in the next sync. You can also raise or disable the limit.",
+  "ui.notice.hash_timeout": "${count} files were skipped because hash calculation timed out. Sync times for affected types were kept so the files can be retried next sync.",
   "ui.conflict.list_count": "${count} file(s) in conflict",
   "ui.conflict.list_empty": "No conflicting notes",
   "ui.status.label_note": "Note",

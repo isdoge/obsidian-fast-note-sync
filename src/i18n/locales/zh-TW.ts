@@ -615,6 +615,7 @@ export default {
   "ui.notice.connection_retrying": "同步連線持續失敗，將繼續在背景重試",
   "ui.notice.protobuf_fallback": "Protobuf 訊息解碼失敗，本次工作階段已切換為 JSON；儲存的 Protobuf 設定未變更。",
   "ui.notice.hash_limit_exceeded": "已達到單次雜湊計算上限 (${limit})，本次跳過 ${skipped} 個檔案，將在下次同步時繼續處理；也可以調高上限或關閉限制。",
+  "ui.notice.hash_timeout": "本輪有 ${count} 個檔案因雜湊計算逾時而略過，受影響類型的同步時間已保留，將於下次同步重試。",
   "ui.conflict.list_count": "${count} 個檔案衝突",
   "ui.conflict.list_empty": "目前沒有發生衝突的筆記",
   "ui.conflict.diff_skipped": "檔案較大，已略過逐行差異對比。可點擊上方按鈕選用本地/遠端版本，或在右側編輯器直接編輯。",

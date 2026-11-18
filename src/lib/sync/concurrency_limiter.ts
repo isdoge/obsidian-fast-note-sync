@@ -9,6 +9,8 @@ export class ConcurrencyLimiter {
     private plugin: FastSync;
     private queue: { key: string; priority: number; resolve: () => void; cancel: () => void }[] = [];
     private activeKeys: Set<string> = new Set();
+    // 槽位归属固定在申请时，空闲编辑不计入后来开始的同步。 / Slot ownership survives a later sync start.
+    private slotContexts = new Map<string, string | null>();
     
     // 针对 FIFO 类型的 ACK（如重命名消息），记录其对应的 Key 顺序
     private fifoKeys: string[] = [];
@@ -24,6 +26,7 @@ export class ConcurrencyLimiter {
      * @param priority 优先级（数字越大优先级越高，用于实现先上传后下载等逻辑）
      */
     public async waitForSlot(key: string, isFifo: boolean = false, priority: number = 0): Promise<boolean> {
+        const context = this.plugin.syncState?.activeSyncContext ?? null;
         if (!this.plugin.settings.concurrencyControlEnabled) {
             return true;
         }
@@ -33,6 +36,7 @@ export class ConcurrencyLimiter {
 
         if (this.activeKeys.size < this.plugin.settings.maxConcurrentUploads) {
             this.activeKeys.add(key);
+            this.slotContexts.set(key, context);
             if (isFifo) this.fifoKeys.push(key);
             dump(`Concurrency: Slot acquired immediately for ${key} (Priority: ${priority}). Active: ${this.activeKeys.size}`);
             return true;
@@ -45,6 +49,7 @@ export class ConcurrencyLimiter {
                 priority,
                 resolve: () => {
                     this.activeKeys.add(key);
+                    this.slotContexts.set(key, context);
                     if (isFifo) this.fifoKeys.push(key);
                     dump(`Concurrency: Slot acquired from queue for ${key}. Active: ${this.activeKeys.size}`);
                     resolve(true);
@@ -54,6 +59,11 @@ export class ConcurrencyLimiter {
             // 按照优先级倒序排序（优先级数值越大的越靠前）
             this.queue.sort((a, b) => b.priority - a.priority);
         });
+    }
+
+    /** 空闲请求为 null，不存在的槽位为 undefined。 / Null means idle-owned; undefined means no active slot. */
+    public getSlotContext(key: string): string | null | undefined {
+        return this.slotContexts.get(key);
     }
 
     /**
@@ -67,6 +77,7 @@ export class ConcurrencyLimiter {
 
         if (this.activeKeys.has(key)) {
             this.activeKeys.delete(key);
+            this.slotContexts.delete(key);
             // 同时从 FIFO 队列中移除该 key (如果存在)
             const fifoIndex = this.fifoKeys.indexOf(key);
             if (fifoIndex !== -1) {
@@ -91,6 +102,7 @@ export class ConcurrencyLimiter {
         const key = this.fifoKeys.shift();
         if (key) {
             this.activeKeys.delete(key);
+            this.slotContexts.delete(key);
             dump(`Concurrency: FIFO slot released for ${key}. Remaining active: ${this.activeKeys.size}`);
             this.processQueue();
         }
@@ -126,6 +138,7 @@ export class ConcurrencyLimiter {
             item.cancel();
         }
         this.activeKeys.clear();
+        this.slotContexts.clear();
         this.fifoKeys = [];
     }
 
