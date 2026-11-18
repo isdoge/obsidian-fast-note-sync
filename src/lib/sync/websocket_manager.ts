@@ -212,6 +212,10 @@ export class WebSocketManager {
         // baseline, so the post-reconnect incremental sync re-pulls those changes
         this.clearDeferredMessages();
         this.receivedFileDetails.clear();
+        // 断线即失去"本连接已对齐"的保证：单条消息推进游标的许可随连接失效（service#101）
+        // Disconnect voids the "this connection is aligned" guarantee: the per-item cursor
+        // advance permission expires with the connection (service#101)
+        this.plugin.syncState.hasSyncedThisConnection = false;
         // #205：断线后空白笔记探测的结论不会再到达，作废在途/已确认标记，重连后重新探测
         // #205: no probe verdict can arrive after the drop; void the marks so reconnect re-probes
         clearEmptyNoteProbes(this.plugin);
@@ -446,6 +450,12 @@ export class WebSocketManager {
         }
 
         dump("Service authorization success");
+        // 新连接：离线增量尚未对齐，单条实时消息不得推进游标，直到本连接完成一轮正常同步
+        //（service#101，见 sync_state.hasSyncedThisConnection）
+        // New connection: the offline backlog is unaligned, per-item live messages must not
+        // advance the cursor until this connection completes one clean round
+        // (service#101, see sync_state.hasSyncedThisConnection)
+        this.plugin.syncState.hasSyncedThisConnection = false;
         this.client.notifyStatusChange(true);
 
         this.sendClientInfo();

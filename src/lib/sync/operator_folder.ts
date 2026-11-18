@@ -1,4 +1,5 @@
 import { blockAliasedRemoteMutation } from "./remote_path_guard";
+import { advanceLiveSyncTime } from "./sync_state";
 import { TFolder, normalizePath } from "obsidian";
 
 import { SyncEndData, FolderSyncRenameMessage } from "../utils/types";
@@ -194,6 +195,12 @@ export const receiveFolderSyncModify = async function (data: { path: string, mti
         // 抢锁失败时任务未执行：按失败处理，不能计为完成
         // Lock not acquired means the task never ran: count it as a failure, never as completed
         if (locked === null) throw new Error("Path lock busy")
+        // 游标推进仅在处理成功后执行（service#101：本地失败/锁忙不越过未处理条目），
+        // 且经 advanceLiveSyncTime 统一门控（轮次中/首轮未完成不落盘）
+        // Advance the cursor only after the handler succeeded (service#101: a local failure or
+        // busy lock must not skip unprocessed items), through the advanceLiveSyncTime gate
+        // (no persist mid-round or before the first clean round)
+        advanceLiveSyncTime(plugin, "lastFolderSyncTime", data.lastTime)
     } catch (e) {
         dumpError(`[FastSync] Failed to receiveFolderSyncModify: ${normalizedPath}`, e);
         if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'FolderModify')) {
@@ -201,11 +208,6 @@ export const receiveFolderSyncModify = async function (data: { path: string, mti
         }
         plugin.folderSyncTasks.failed++
     } finally {
-        // 实时更新同步时间戳，与 note 端保持一致
-        // Update sync timestamp in real time, consistent with note side
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFolderSyncTime"))) {
-            plugin.localStorageManager.setMetadata("lastFolderSyncTime", data.lastTime)
-        }
         plugin.recordSyncCompleted('folder', data.pageIndex)
     }
 }
@@ -271,16 +273,17 @@ export const receiveFolderSyncDelete = async function (data: { path: string, las
         // 抢锁失败时任务未执行：按失败处理，不能计为完成
         // Lock not acquired means the task never ran: count it as a failure, never as completed
         if (locked === null) throw new Error("Path lock busy")
+        // 游标推进仅在处理成功后执行（service#101：本地失败/锁忙不越过未处理条目），
+        // 且经 advanceLiveSyncTime 统一门控（轮次中/首轮未完成不落盘）
+        // Advance the cursor only after the handler succeeded (service#101: a local failure or
+        // busy lock must not skip unprocessed items), through the advanceLiveSyncTime gate
+        // (no persist mid-round or before the first clean round)
+        advanceLiveSyncTime(plugin, "lastFolderSyncTime", data.lastTime)
     } catch (e) {
         dumpError(`[FastSync] Failed to receiveFolderSyncDelete: ${normalizedPath}`, e);
         SyncLogManager.getInstance().addLog('receive', 'FolderDelete', e instanceof Error ? e.message : String(e), 'error', data.path);
         plugin.folderSyncTasks.failed++
     } finally {
-        // 实时更新同步时间戳，与 note 端保持一致
-        // Update sync timestamp in real time, consistent with note side
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFolderSyncTime"))) {
-            plugin.localStorageManager.setMetadata("lastFolderSyncTime", data.lastTime)
-        }
         plugin.recordSyncCompleted('folder', data.pageIndex)
     }
 }
@@ -366,6 +369,12 @@ export const receiveFolderSyncRename = async function (data: FolderSyncRenameMes
         // 抢锁失败时任务未执行：按失败处理，不能计为完成
         // Lock not acquired means the task never ran: count it as a failure, never as completed
         if (locked === null) throw new Error("Path lock busy")
+        // 游标推进仅在处理成功后执行（service#101：本地失败/锁忙不越过未处理条目），
+        // 且经 advanceLiveSyncTime 统一门控（轮次中/首轮未完成不落盘）
+        // Advance the cursor only after the handler succeeded (service#101: a local failure or
+        // busy lock must not skip unprocessed items), through the advanceLiveSyncTime gate
+        // (no persist mid-round or before the first clean round)
+        advanceLiveSyncTime(plugin, "lastFolderSyncTime", data.lastTime)
     } catch (e) {
         dumpError(`[FastSync] Failed to receiveFolderSyncRename: ${normalizedOldPath} -> ${normalizedNewPath}`, e);
         if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'FolderRename')) {
@@ -373,11 +382,6 @@ export const receiveFolderSyncRename = async function (data: FolderSyncRenameMes
         }
         plugin.folderSyncTasks.failed++
     } finally {
-        // 实时更新同步时间戳，与 note 端保持一致
-        // Update sync timestamp in real time, consistent with note side
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFolderSyncTime"))) {
-            plugin.localStorageManager.setMetadata("lastFolderSyncTime", data.lastTime)
-        }
         plugin.recordSyncCompleted('folder', data.pageIndex)
     }
 }

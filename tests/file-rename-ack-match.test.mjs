@@ -29,6 +29,7 @@ vm.runInNewContext(code, {
     if (id === "../utils/types") return { CLIENT_TYPE: "test" };
     if (id === "./remote_path_guard") return { blockAliasedRemoteMutation: () => false };
     if (id === "./sync_log_manager") return { SyncLogManager: { getInstance: () => ({ addLog: noop, addOrUpdateLog: noop }) } };
+    if (id === "./sync_state") return { advanceLiveSyncTime: (plugin, field, lastTime) => { if (lastTime && lastTime > Number(plugin.localStorageManager.getMetadata(field))) plugin.localStorageManager.setMetadata(field, lastTime); } };
     if (id === "../storage/file_cloud_preview") return { FileCloudPreview: { isRestrictedType: () => true } };
     return {};
   },

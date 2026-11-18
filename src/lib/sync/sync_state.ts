@@ -3,6 +3,38 @@ import type { FileDownloadSession } from "../utils/types";
 export type SyncTimeField = "lastNoteSyncTime" | "lastFileSyncTime" | "lastConfigSyncTime" | "lastFolderSyncTime";
 
 /**
+ * 单条消息/单条 Ack 的游标统一推进入口（service#101 止损，替代各处理器里散落的
+ * `if (data.lastTime > 当前值) setMetadata(...)`）：
+ * - 轮次进行中（isSyncing 或 activeSyncContext 非空）不落盘：收尾由 settleSyncTimes 统一
+ *   提交本轮 End 时间（服务端查询开始时刻），期间任何单条落盘都会在中途崩溃时留下越过
+ *   未拉取条目的游标（settleSyncTimes 的回滚只在走到 onClose/cancelSync 时生效）；
+ * - 本连接尚未正常完成过一轮同步不落盘：离线增量还没对齐，实时广播/编辑 Ack 把游标推到
+ *   "现在"会掩盖整段离线变更（#101：点同步也拉不回，服务端只查 updated_timestamp >= 游标）；
+ * - 其余情况（空闲在线、已完成首轮）且处理本身成功时才单调递增推进——避免重启后把刚
+ *   处理过的实时变更再拉一遍。
+ * Unified cursor-advance entry for single messages and single Acks (service#101 guard,
+ * replacing the scattered `if (data.lastTime > current) setMetadata(...)` in handlers):
+ * - Never persist while a round is active (isSyncing or activeSyncContext): settlement is
+ *   owned by settleSyncTimes with the round's End time (the server's query start); any
+ *   per-item persist mid-round survives a crash and leaves a cursor past un-pulled items
+ *   (settleSyncTimes' rollback only runs when onClose/cancelSync is reached);
+ * - Never persist before this connection completed one clean round: the offline backlog
+ *   is unaligned, and a live broadcast / edit Ack pushing the cursor to "now" hides the
+ *   whole offline window (#101: even a manual sync can't pull it back — the server only
+ *   queries updated_timestamp >= cursor);
+ * - Otherwise (idle online, first round done) advance monotonically after the handler
+ *   itself succeeded — avoids re-pulling just-handled live changes after a restart.
+ */
+export function advanceLiveSyncTime(plugin: { isSyncing?: boolean; localStorageManager: { getMetadata(k: string): unknown; setMetadata(k: string, v: unknown): void }; syncState: { activeSyncContext: string | null; hasSyncedThisConnection: boolean } }, field: SyncTimeField, lastTime: number | undefined): void {
+  if (!lastTime) return;
+  if (plugin.isSyncing || plugin.syncState.activeSyncContext !== null) return;
+  if (!plugin.syncState.hasSyncedThisConnection) return;
+  if (lastTime > Number(plugin.localStorageManager.getMetadata(field))) {
+    plugin.localStorageManager.setMetadata(field, lastTime);
+  }
+}
+
+/**
  * Stats for a single sync type (notes / files / configs / folders).
  * 单类同步任务的统计数据（笔记 / 文件 / 配置 / 文件夹）。
  */
@@ -80,6 +112,22 @@ export class SyncState {
   isFirstSync = false;
   /** 是否正在等待清理确认以便后续同步 / Whether waiting for clear-sync confirmation */
   isWaitClearSync = false;
+  /**
+   * 本连接是否已至少正常完成过一轮同步（service#101 游标止损）。
+   * 连接鉴权成功与断线时置 false；checkSyncCompletion 判定一轮正常完成（无失败、未被离线
+   * 保护拦截）时置 true。轮次未参与的类型不算未完成：advanceLiveSyncTime 只推进当前处理
+   * 类型自己的游标，参与类型完成的轮次已把该类型离线增量对齐；未参与类型的单条实时消息
+   * 仍会被标志挡住（它们发生在参与类型完成之前或之后的空闲期——参与类型完成前 isSyncing
+   * 仍为 true）。保守规则：取消/失败/离线保护拦截/停滞重启的轮次一律不置 true。
+   * Whether this connection has completed at least one round normally (service#101 cursor
+   * guard). Set false on auth success and on disconnect; set true in checkSyncCompletion
+   * when a round completes cleanly (no failures, not intercepted by the offline guard).
+   * Types not participating in a round don't count as unfinished: advanceLiveSyncTime only
+   * advances the cursor of the type being handled, and the participating types' offline
+   * backlog was aligned by that round. Conservative rule: cancelled / failed / offline-guard
+   * intercepted / stall-restarted rounds never set the flag.
+   */
+  hasSyncedThisConnection = false;
   /** 当前同步类型 / Current sync type */
   currentSyncType: "full" | "incremental" = "incremental";
   /**

@@ -15,6 +15,7 @@ vm.runInNewContext(code, { module, exports: module.exports, console, Error,
     : id.includes('helpers') ? new Proxy({ isFolderSyncPathExcluded: () => false,
         waitForFolderEmpty: async () => { onWait(); return true; } }, { get: (t, k) => t[k] ?? noop })
     : id.includes('sync_log_manager') ? { SyncLogManager: { getInstance: () => ({ addLog: noop }) } }
+    : id.includes('sync_state') ? { advanceLiveSyncTime: (plugin, field, lastTime) => { if (lastTime && lastTime > Number(plugin.localStorageManager.getMetadata(field))) plugin.localStorageManager.setMetadata(field, lastTime); } }
     : id.includes('remote_path_guard') ? { blockAliasedRemoteMutation: () => false } : {} });
 
 for (const mode of ['gone-during-wait', 'stale-cache', 'still-exists', 'permission', 'normal', 'absent']) {

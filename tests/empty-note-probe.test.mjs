@@ -31,6 +31,7 @@ function load(name) {
       if (id === "../utils/helpers") return helpers;
       if (id === "./remote_path_guard") return { blockAliasedRemoteMutation: () => false };
       if (id === "./sync_log_manager") return { SyncLogManager: { getInstance: () => ({ addLog: (...a) => logs.push(a) }) } };
+      if (id === "./sync_state") return { advanceLiveSyncTime: (plugin, field, lastTime) => { if (lastTime && lastTime > Number(plugin.localStorageManager.getMetadata(field))) plugin.localStorageManager.setMetadata(field, lastTime); } };
       return {};
     },
   });

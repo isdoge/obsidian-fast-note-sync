@@ -6,6 +6,7 @@ import { ReceiveFileSyncUpdateMessage, FileUploadMessage, FileSyncChunkDownloadM
 import { hashContent, hashArrayBuffer, getPluginDir, dump, dumpError, sleep, isPathExcluded, getSafeCtime, isLargeBinarySyncRisk, describeBinarySyncLimit, showSyncNotice, checkAndNotifyCaseConflict, logMemorySnapshot, hashFileAsync, vaultDelete, normalizeServerTimestamp } from "../utils/helpers";
 import { FileCloudPreview } from "../storage/file_cloud_preview";
 import { SyncLogManager } from "./sync_log_manager";
+import { advanceLiveSyncTime } from "./sync_state";
 import { HttpApiService } from "../api/http_api_service";
 import type FastSync from "../../main";
 
@@ -1134,9 +1135,7 @@ export const receiveFileSyncDelete = async function (data: ReceivePathMessage, p
         plugin.fileHashManager.removeFileHash(normalizedPath)
         plugin.lastSyncMtime.delete(normalizedPath)
         // 更新同步时间
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
-          plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
-        }
+        advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
       } finally {
         // 延时 500ms 清理
         window.setTimeout(() => {
@@ -1193,9 +1192,7 @@ export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, p
       if (isLargeBinarySyncRisk(file.stat.size, plugin)) {
         dump(`Skip binary mtime rewrite for large attachment (${describeBinarySyncLimit()} limit): ${normalizedPath}`, file.stat.size)
         plugin.lastSyncMtime.set(data.path, mtime || 0)
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
-          plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
-        }
+        advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
         return
       }
       const content = await plugin.app.vault.readBinary(file)
@@ -1205,9 +1202,7 @@ export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, p
         // 记录 mtime
         plugin.lastSyncMtime.set(data.path, mtime || 0)
         // 更新同步时间
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
-          plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
-        }
+        advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
       } finally {
         window.setTimeout(() => {
           plugin.removeIgnoredFile(normalizedPath)
@@ -1597,9 +1592,7 @@ export const receiveFileSyncRename = async function (data: { oldPath: string; pa
         plugin.fileHashManager.setFileHash(data.path, data.contentHash || "", renamedFile instanceof TFile ? renamedFile.stat.mtime : 0, renamedFile instanceof TFile ? renamedFile.stat.size : 0)
 
         // 更新同步时间
-        if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
-          plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
-        }
+        advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
       } finally {
         window.setTimeout(() => {
           plugin.removeIgnoredFile(normalizedNewPath)
@@ -1768,9 +1761,7 @@ const handleFileChunkDownloadComplete = async function (session: FileDownloadSes
         }, 500);
       }
 
-      if (Number(plugin.localStorageManager.getMetadata("lastFileSyncTime")) < session.lastTime) {
-        plugin.localStorageManager.setMetadata("lastFileSyncTime", session.lastTime)
-      }
+      advanceLiveSyncTime(plugin, "lastFileSyncTime", session.lastTime)
 
       // 下载完成后自动计算哈希并更新缓存 (如果服务器传了内容哈希就直接使用，否则重新计算以兼容旧版本)
       let contentHash = session.contentHash
@@ -1842,10 +1833,8 @@ export const receiveFileRenameAck = function (data: { lastTime?: number; path?: 
     plugin.fileHashManager.setFileHash(pending.newPath, pending.contentHash, file?.stat.mtime || 0, file?.stat.size || 0)
     plugin.fileHashManager.removeFileHash(pending.oldPath)
   }
-  if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
-    plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
-    dump(`FileRenameAck: lastFileSyncTime updated to`, data.lastTime)
-  }
+  advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
+  dump(`FileRenameAck: lastFileSyncTime updated to`, data.lastTime)
   plugin.concurrencyLimiter.releaseFifoSlot()
 }
 
@@ -1872,10 +1861,8 @@ export const receiveFileUploadAck = function (data: { lastTime?: number; path?: 
     const vaultName = plugin.app.vault.getName()
     try { plugin.app.saveLocalStorage(`fns-${vaultName}-uploadSession-${data.pathHash}`, null) } catch { /* ignore */ }
   }
-  if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
-    plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
-    dump(`FileUploadAck: lastFileSyncTime updated to`, data.lastTime)
-  }
+  advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
+  dump(`FileUploadAck: lastFileSyncTime updated to`, data.lastTime)
   if (data.path) {
     plugin.concurrencyLimiter.releaseSlot(data.path)
   }
@@ -1894,9 +1881,7 @@ export const receiveFileDeleteAck = function (data: { lastTime?: number; path?: 
     plugin.fileHashManager.removeFileHash(data.path)
     plugin.pendingFileDeleteAcks.delete(data.path)
   }
-  if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
-    plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
-  }
+  advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
   if (data.path) {
     plugin.concurrencyLimiter.releaseSlot(data.path)
   }

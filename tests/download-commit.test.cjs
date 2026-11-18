@@ -14,6 +14,7 @@ vm.runInNewContext(transpiled,{module:m,exports:m.exports,console,Uint8Array,Arr
  if(id==='../utils/helpers')return helpers;
  if(id.includes('sync_log_manager'))return{SyncLogManager:{getInstance:()=>({addLog:noop,addOrUpdateLog:noop})}};
  if(id.includes('remote_path_guard'))return{blockAliasedRemoteMutation:()=>false};
+ if(id.includes('sync_state'))return{advanceLiveSyncTime:(plugin,field,lastTime)=>{if(lastTime&&lastTime>Number(plugin.localStorageManager.getMetadata(field)))plugin.localStorageManager.setMetadata(field,lastTime);}};
  return {};
 }});
 function fixture(){

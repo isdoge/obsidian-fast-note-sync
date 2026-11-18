@@ -379,6 +379,15 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, _sync
     // offline duration and silently defeat the guard on the very next round.
     if (!offlineGuardSkippedThisRound && totalFailed === 0) {
       plugin.localStorageManager.setMetadata("lastSyncSuccessTime", Date.now());
+      // 本连接自此完成过一轮正常同步：实时单条消息此后允许推进游标（service#101，
+      // 见 sync_state.hasSyncedThisConnection 注释）。与本轮 lastSyncSuccessTime 同判定：
+      // 有失败或被离线保护拦截的轮次不算，未参与类型不置 false（见字段注释的保守规则）
+      // This connection has now completed one clean round: live per-item messages may
+      // advance the cursor from here on (service#101, see
+      // sync_state.hasSyncedThisConnection). Same predicate as lastSyncSuccessTime:
+      // failed or offline-guard-intercepted rounds don't count; non-participating types
+      // don't block it (see the field's conservative rule)
+      plugin.syncState.hasSyncedThisConnection = true;
     }
 
     // 如果开启了云预览，在首次同步后检查所有附件在服务端的状态

@@ -41,6 +41,7 @@ function load(name) {
       : id.includes('helpers') ? helpers
       : id === './operator_config' ? load('operator_config')
       : id.includes('sync_log_manager') ? { SyncLogManager: { getInstance: () => ({ addLog: noop }) } }
+      : id.includes('sync_state') ? { advanceLiveSyncTime: (plugin, field, lastTime) => { if (lastTime && lastTime > Number(plugin.localStorageManager.getMetadata(field))) plugin.localStorageManager.setMetadata(field, lastTime); } }
       : id.includes('i18n') ? { $: p => p } : {} });
   cache.set(name, module.exports);
   return module.exports;
