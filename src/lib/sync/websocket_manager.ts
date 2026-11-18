@@ -231,6 +231,7 @@ export class WebSocketManager {
 
   /** 主动与被动断线共用清理，保留本地待上传改动。 / Shared disconnect cleanup preserves pending edits. */
   private cleanupDisconnectedSync(): void {
+    this.plugin.retryQueue?.onDisconnected();
     if (this.plugin.isSyncing) {
       this.plugin.isSyncing = false;
       this.plugin.isSyncRequesting = false;
@@ -348,8 +349,15 @@ export class WebSocketManager {
     this.client.triggerReconnect();
   }
   public SendMessage(action: WSAction.WSSendAction, data: unknown, before?: () => boolean, after?: () => void, context?: string) {
-    const injectedData = this.injectContext(data, context);
-    return this.client.SendMessage(action, injectedData, before, () => {
+    const queue = this.plugin.retryQueue;
+    const guard = queue?.sendGuard(action, data as { path?: string; oldPath?: string });
+    // Explicitly contextless: retry ACKs never belong to a scan round.
+    const injectedData = guard ? { ...(data as object), context: "" } : this.injectContext(data, context);
+    return this.client.SendMessage(action, injectedData, () => {
+      if (guard && !guard()) return true;
+      return before?.() ?? false;
+    }, () => {
+      if (guard) queue.onSent(action, data as { path?: string; oldPath?: string });
       // Record the send event in sync logs
       // 在同步日志中记录发送事件
       SyncLogManager.getInstance().logSentMessage(action, injectedData as object | string, this.plugin.currentSyncType);
@@ -484,6 +492,11 @@ export class WebSocketManager {
     }
 
     if (data.code <= 0 || data.code >= 300) {
+      if ((!data.vault || data.vault === this.plugin.settings.vault) && !data.context
+        && typeof data.data?.path === "string" && this.plugin.retryQueue?.ownsPendingPath(data.data.path)) {
+        dump("[RetryQueue] Mutation rejected; retaining operation", data.code, data.data.path);
+        return;
+      }
       // 处理冲突相关错误码
       if (data.code === ERROR_SYNC_CONFLICT) {
         void this.handleConflictError(data);
@@ -550,6 +563,7 @@ export class WebSocketManager {
         dump(`[SyncContext] Discard message ${msgAction} due to mismatched context. Expected: ${this.plugin.syncState.activeSyncContext}, Got: ${data.context}`);
         return;
       }
+      if (this.plugin.retryQueue?.shouldIgnoreAck(msgAction, typeof data.data?.path === "string" ? data.data.path : undefined)) return;
       // 仅本机空闲时申请的槽位允许提前确认；已作废 context 已在上方丢弃。
       // Only this client's idle-owned slots may settle early; retired contexts were rejected above.
       const ackPath = typeof data.data?.path === "string" && data.data.path ? data.data.path
@@ -561,7 +575,8 @@ export class WebSocketManager {
         WSAction.NoteSyncMtime, WSAction.FileSyncMtime, WSAction.FileUpload,
         WSAction.NoteRenameAck, WSAction.FileRenameAck, WSAction.NoteDeleteAck,
         WSAction.FileDeleteAck, WSAction.SettingDeleteAck].includes(msgAction);
-      const outsideRound = !!this.plugin.syncState.activeSyncContext && idleSlot && isLocalAck;
+      const queueAck = !data.context && this.plugin.retryQueue?.matchesAck(msgAction, typeof data.data?.path === "string" ? data.data.path : undefined);
+      const outsideRound = !!queueAck || (!!this.plugin.syncState.activeSyncContext && idleSlot && isLocalAck);
       if (this.plugin.syncState.activeSyncContext) {
         const isControlMsg = msgAction === WSAction.ClientReceiveAuth || msgAction === WSAction.ClientReceiveInfo;
         // Older servers omit context on the UpdateMtime response to NoteModify.
@@ -790,11 +805,15 @@ export class WebSocketManager {
       }
     }
 
+    // A failed or cancelled drain must not prevent the regular catch-up scan.
+    await this.plugin.retryQueue?.onAuthenticated().catch(error => {
+      dump("[RetryQueue] Replay interrupted; continuing regular sync safely", error);
+    });
+    if (handleId !== this.currentStartHandleId || !this.client.isAuth || !this.client.isOpen) return;
     this.plugin.isFirstSync = true;
 
     // 检查是否有用户手动触发的待执行同步 / Check if user manually triggered a pending sync
     const pendingType = this.plugin.syncState.pendingSyncType;
-    this.plugin.syncState.pendingSyncType = null;
 
     if (this.plugin.settings.manualSyncEnabled) {
       // 如果用户手动触发了同步，即使 manualSyncEnabled 也执行一次

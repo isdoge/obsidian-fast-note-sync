@@ -18,6 +18,7 @@ import { SyncLogManager } from "./lib/sync/sync_log_manager";
 import { DebugLogModal } from "./views/debug-log-modal";
 import { VersionManager } from "./lib/utils/version_manager";
 import { ConfigManager } from "./lib/sync/config_manager";
+import { RetryQueue } from "./lib/sync/retry_queue";
 import { EventManager } from "./lib/utils/events_manager";
 import { WebSocketManager } from "./lib/sync/websocket_manager";
 import { MenuManager } from "./lib/ui/menu_manager";
@@ -57,6 +58,7 @@ export default class FastSync extends Plugin {
   configManager: ConfigManager                    // 配置管理器
   lockManager: LockManager                        // 锁管理器
   concurrencyLimiter: ConcurrencyLimiter          // 并发管理器
+  retryQueue: RetryQueue
   eventManager: EventManager                      // 事件管理器
   menuManager: MenuManager                        // 菜单管理器
   shareIndicatorManager: ShareIndicatorManager    // 分享指示器管理器 / Share indicator manager
@@ -172,7 +174,10 @@ export default class FastSync extends Plugin {
 
   // SyncState — control flags
   get isSyncing() { return this.syncState.isSyncing }
-  set isSyncing(v: boolean) { this.syncState.isSyncing = v }
+  set isSyncing(v: boolean) {
+    this.syncState.isSyncing = v
+    if (!v) this.retryQueue?.resume()
+  }
   get isSyncRequesting() { return this.syncState.isSyncRequesting }
   set isSyncRequesting(v: boolean) { this.syncState.isSyncRequesting = v }
   get isFirstSync() { return this.syncState.isFirstSync }
@@ -551,6 +556,8 @@ export default class FastSync extends Plugin {
       }
       await Promise.all(initPromises)
       await this.localStorageManager.restoreSyncStateFromMirror()
+      this.retryQueue = new RetryQueue(this)
+      await this.retryQueue.initialize()
 
       // 崩溃恢复：从 localStorage 恢复持久化的 pending Map，过滤本地已不存在的路径
       // Crash recovery: restore persisted pending Maps, filtering out paths that no longer exist locally
@@ -639,6 +646,7 @@ export default class FastSync extends Plugin {
 
   onunload() {
     // 取消当前正在进行的同步，重置运行时状态
+    this.retryQueue?.stop()
     cancelSync(this)
     abortAllFileOperations()
     this.localStorageManager?.stopWatch()
@@ -745,6 +753,7 @@ export default class FastSync extends Plugin {
         `${pluginSelfDir}/fileHashMap.json`,
         `${pluginSelfDir}/folderSnapshot.json`,
         `${pluginSelfDir}/syncState.json`,
+        `${pluginSelfDir}/retryQueue.json`,
         `${this.app.vault.configDir}/community-plugins.json`,
       ];
       defaultExcludes.forEach(pattern => {

@@ -5,7 +5,7 @@ import { hashContent, hashContentAsync, dump, isPathExcluded, isFolderSyncPathEx
 import { receiveConfigSyncModify, receiveConfigUpload, receiveConfigSyncMtime, receiveConfigSyncDelete, receiveConfigSyncEnd, configAllPaths, receiveConfigSyncClear, receiveConfigModifyAck, receiveConfigDeleteAck } from "./operator_config";
 import { receiveNoteSyncModify, receiveNoteUpload, receiveNoteSyncMtime, receiveNoteSyncDelete, receiveNoteSyncEnd, receiveNoteSyncRename, receiveNoteModifyAck, receiveNoteRenameAck, receiveNoteDeleteAck } from "./operator_note";
 import { SyncMode, SnapFile, SnapFolder, SyncEndData, PathHashFile, NoteSyncData, FileSyncData, ConfigSyncData, FolderSyncData } from "../utils/types";
-import { receiveFolderSyncModify, receiveFolderSyncDelete, receiveFolderSyncRename, receiveFolderSyncEnd } from "./operator_folder";
+import { receiveFolderSyncModify, receiveFolderSyncDelete, receiveFolderSyncRename, receiveFolderSyncEnd, receiveFolderRetryAck } from "./operator_folder";
 import { FileCloudPreview } from "../storage/file_cloud_preview";
 import { SyncLogManager } from "./sync_log_manager";
 import * as WSAction from "./websocket_action";
@@ -335,6 +335,7 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, _sync
     settleSyncTimes(plugin, true);
     syncStallState.restarts = 0;
 
+    if (totalFailed === 0 && hashTimeoutCount === 0) plugin.retryQueue?.completeScan(plugin.progressTracker.getActiveTypes());
     plugin.syncState.activeSyncContext = null; // 同步完成，清空活跃的上下文 / Sync completed, reset the active context
     plugin.isSyncing = false;
     plugin.syncTypeCompleteCount = 0;
@@ -459,6 +460,8 @@ export const receiveOperators: Map<WSAction.WSReceiveAction, OperatorHandler> = 
   [WSAction.SettingSyncClear, receiveConfigSyncClear],
   [WSAction.SettingModifyAck, receiveConfigModifyAck],
   [WSAction.SettingDeleteAck, receiveConfigDeleteAck],
+  [WSAction.FolderDeleteAck, (data, plugin) => receiveFolderRetryAck("FolderDeleteAck", data as { path?: string }, plugin)],
+  [WSAction.FolderRenameAck, (data, plugin) => receiveFolderRetryAck("FolderRenameAck", data as { path?: string }, plugin)],
   [WSAction.FolderSyncModify, receiveFolderSyncModify],
   [WSAction.FolderSyncDelete, receiveFolderSyncDelete],
   [WSAction.FolderSyncRename, receiveFolderSyncRename],
@@ -696,6 +699,10 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     dump("Sync already in progress, skipping");
     return;
   }
+  await plugin.retryQueue?.drainBeforeSync().catch(error => {
+    dump("[RetryQueue] Replay interrupted; continuing regular sync safely", error);
+  });
+  if (plugin.isSyncing) return;
   plugin.isSyncing = true;
 
   // 同步开始前，全局清空上一轮残留的 conflict-notes 物理冲突临时目录中的文件（位于插件目录下，避免 Windows 锁定目录报错）
@@ -1090,7 +1097,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         let delCount = 0;
         for (const path of trackedPaths) {
           if (++delCount % 100 === 0) await yieldToMain();
-          if (isPathExcluded(path, plugin)) continue;
+          if (isPathExcluded(path, plugin) || plugin.retryQueue?.shouldSkipScanDelete(path)) continue;
           if (!localPathsSet.has(path)) {
             const item = { path: path, pathHash: hashContent(path) };
             if (path.endsWith(".md")) {
@@ -1108,7 +1115,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
           let folderCount = 0;
           for (const path of trackedFolderPaths) {
             if (++folderCount % 100 === 0) await yieldToMain();
-            if (isFolderSyncPathExcluded(path, plugin)) continue;
+            if (isFolderSyncPathExcluded(path, plugin) || plugin.retryQueue?.shouldSkipScanDelete(path)) continue;
             if (!localFolderPathsSet.has(path)) {
               delFolders.push({ path: path, pathHash: hashContent(path) });
             }
@@ -1734,6 +1741,20 @@ async function sendSyncInBatches<T1, T2, T3>(
  * concurrent createFolder races are absorbed by each handler's lazy folder-creation fallback (design §6.2)
  */
 export const handleRequestSend = async function (plugin: FastSync, syncMode: SyncMode, noteData: NoteSyncData, fileData: FileSyncData, configData: ConfigSyncData, folderData: FolderSyncData) {
+  const queue = plugin.retryQueue;
+  if (queue) {
+    noteData.delNotes = noteData.delNotes.filter(item => !queue.shouldSkipScanDelete(item.path));
+    fileData.delFiles = fileData.delFiles.filter(item => !queue.shouldSkipScanDelete(item.path));
+    folderData.delFolders = folderData.delFolders.filter(item => !queue.shouldSkipScanDelete(item.path));
+    // An unsafe queued delete must become a read-only pull even when offline delete sync is on,
+    // including paths absent from the hash map. Never let the scan reissue the rejected delete.
+    for (const [kind, missing] of [["note", noteData.missingNotes], ["file", fileData.missingFiles], ["folder", folderData.missingFolders]] as const) {
+      for (const path of queue.getRecoveryPaths(kind)) {
+        if (!missing.some(item => item.path === path)) missing.push({ path, pathHash: hashContent(path) });
+      }
+    }
+  }
+
   const shouldSyncNotes = syncMode === "auto" || syncMode === "note";
   const shouldSyncConfigs = syncMode === "auto" || syncMode === "config";
 
