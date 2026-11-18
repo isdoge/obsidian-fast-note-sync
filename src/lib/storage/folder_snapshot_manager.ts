@@ -1,6 +1,6 @@
 import { TFolder } from "obsidian";
 
-import { dump, isFolderSyncPathExcluded, debounce, LocalStateFileMirror } from "../utils/helpers";
+import { dump, isFolderSyncPathExcluded, debounce, LocalStateFileMirror, computeMirrorDigest } from "../utils/helpers";
 import type FastSync from "../../main";
 
 // 对账延迟：初始化后等待若干秒再比对，避开插件刚加载时的启动开销高峰
@@ -24,6 +24,8 @@ export class FolderSnapshotManager {
     private debouncedFlush: () => void;
     // 文件镜像：localStorage 被移动端系统清除后的兜底恢复
     private mirror: LocalStateFileMirror;
+    private restoredFromPersisted: boolean = false;
+    private digest: string = "";
 
     constructor(plugin: FastSync) {
         this.plugin = plugin;
@@ -60,6 +62,7 @@ export class FolderSnapshotManager {
     async initialize(): Promise<void> {
         const loaded = this.loadFromStorage();
         if (loaded) {
+            this.restoredFromPersisted = true;
             this.isInitialized = true;
             // 采用了持久化快照，其内容可能因外部工具改动目录而漂移（新增/删除文件夹后从未与
             // 真实 vault 对账过）。安排一次轻量后台对账去修正，buildSnapshot 分支是刚从 vault
@@ -76,6 +79,7 @@ export class FolderSnapshotManager {
         const mirrored = await this.mirror.read();
         if (mirrored && this.parseAndLoad(mirrored)) {
             dump("FolderSnapshotManager: restored snapshot from file mirror");
+            this.restoredFromPersisted = true;
             this.saveToStorage();
             this.isInitialized = true;
             // 镜像恢复的数据同样可能漂移，与 localStorage 命中分支一样安排对账
@@ -83,8 +87,20 @@ export class FolderSnapshotManager {
             return;
         }
 
+        this.restoredFromPersisted = false;
         await this.buildSnapshot();
         this.isInitialized = true;
+    }
+
+    wasRebuilt(): boolean {
+        return !this.restoredFromPersisted;
+    }
+
+    getDigest(): string {
+        if (this.isDirty || !this.digest) {
+            this.digest = computeMirrorDigest(JSON.stringify(Object.fromEntries(this.snapshotMap)));
+        }
+        return this.digest;
     }
 
     /**
@@ -141,6 +157,7 @@ export class FolderSnapshotManager {
             // rather than waiting for the debounce window
             this.isDirty = true;
             this.flush();
+            (this.plugin.localStorageManager as { refreshSyncStateMirrorIfPresent?: () => void } | undefined)?.refreshSyncStateMirrorIfPresent?.();
         } catch (error) {
             dump("FolderSnapshotManager: [Reconcile] failed", error);
         }
@@ -271,6 +288,7 @@ export class FolderSnapshotManager {
             this.snapshotMap = new Map(
                 Object.entries(parsed).map(([key, value]) => [key, Number(value)])
             );
+            this.digest = computeMirrorDigest(JSON.stringify(Object.fromEntries(this.snapshotMap)));
             return true;
         } catch (error) {
             dump("FolderSnapshotManager: failed to parse snapshot data", error);
@@ -286,6 +304,7 @@ export class FolderSnapshotManager {
         try {
             const obj = Object.fromEntries(this.snapshotMap);
             data = JSON.stringify(obj);
+            this.digest = computeMirrorDigest(data);
         } catch (error) {
             dump("FolderSnapshotManager: failed to serialize snapshot", error);
             return;

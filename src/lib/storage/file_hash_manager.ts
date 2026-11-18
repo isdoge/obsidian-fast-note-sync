@@ -1,4 +1,4 @@
-import { hashContentAsync, dump, isPathExcluded, showSyncNotice, isLargeBinarySyncRisk, describeBinarySyncLimit, logMemorySnapshot, hashFileAsync, debounce, LocalStateFileMirror } from "../utils/helpers";
+import { hashContentAsync, dump, isPathExcluded, showSyncNotice, isLargeBinarySyncRisk, describeBinarySyncLimit, logMemorySnapshot, hashFileAsync, debounce, LocalStateFileMirror, computeMirrorDigest } from "../utils/helpers";
 import { $ } from "../../i18n/lang";
 import type FastSync from "../../main";
 
@@ -30,6 +30,8 @@ export class FileHashManager {
   // 文件镜像：localStorage 被移动端系统清除后的兜底恢复
   private mirror: LocalStateFileMirror;
   private syncMirror: LocalStateFileMirror;
+  private syncBaselineRestoredFromPersisted: boolean = false;
+  private syncDigest: string = "";
 
   constructor(plugin: FastSync) {
     this.plugin = plugin;
@@ -112,6 +114,7 @@ export class FileHashManager {
     }
 
     // 3. 数据平滑迁移：全新用户或旧版插件升级用户 (syncHashMap 尚未创建但 hashMap 已有历史数据)
+    this.syncBaselineRestoredFromPersisted = hasRestoredSync;
     if (!hasRestoredSync) {
       dump("FileHashManager: sync baseline is empty, migrating from local hash cache...");
       for (const [path, cache] of this.hashMap.entries()) {
@@ -146,11 +149,29 @@ export class FileHashManager {
     try {
       const parsed = JSON.parse(data) as Record<string, string>;
       this.syncHashMap = new Map(Object.entries(parsed));
+      this.syncDigest = computeMirrorDigest(JSON.stringify(Object.fromEntries(this.syncHashMap)));
       return true;
     } catch (error) {
       dump("FileHashManager: failed to parse sync baseline hash data", error);
       return false;
     }
+  }
+
+  /**
+   * 本次初始化的同步基准表是否走过重建/迁移（未从持久化基准恢复）
+   */
+  wasSyncRebuilt(): boolean {
+    return !this.syncBaselineRestoredFromPersisted;
+  }
+
+  /**
+   * 获取当前同步基准表（syncHashMap）的配对指纹
+   */
+  getSyncBaselineDigest(): string {
+    if (this.isDirty || !this.syncDigest) {
+      this.syncDigest = computeMirrorDigest(JSON.stringify(Object.fromEntries(this.syncHashMap)));
+    }
+    return this.syncDigest;
   }
 
   /**
@@ -440,6 +461,7 @@ export class FileHashManager {
     try {
       const obj = Object.fromEntries(this.syncHashMap);
       data = JSON.stringify(obj);
+      this.syncDigest = computeMirrorDigest(data);
     } catch (error) {
       dump("FileHashManager: failed to serialize sync baseline hash map", error);
       return;
