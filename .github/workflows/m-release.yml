@@ -24,7 +24,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    if: github.actor == 'isdoge'
+    if: github.actor == 'isdoge' && github.repository == 'isdoge/obsidian-fast-note-sync'
 
     steps:
       - uses: actions/checkout@v6
@@ -40,9 +40,11 @@ jobs:
 
       - name: Resolve Version and Note
         id: version
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag_name }}
+          INPUT_NOTE: ${{ github.event.inputs.release_note }}
         run: |
           # 1. Resolve Version
-          INPUT_TAG="${{ github.event.inputs.tag_name }}"
           if [ -z "$INPUT_TAG" ]; then
             CURRENT_VERSION=$(jq -r .version manifest.json)
             echo "Using version from manifest.json: $CURRENT_VERSION"
@@ -61,7 +63,6 @@ jobs:
           echo "tag=$TARGET_TAG" >> $GITHUB_OUTPUT
 
           # 3. Resolve Release Note
-          INPUT_NOTE="${{ github.event.inputs.release_note }}"
           if [ -z "$INPUT_NOTE" ]; then
             echo "Release note is empty, fetching commit message for $TARGET_TAG..."
             COMMIT_MSG=$(git log -1 --pretty=%B "$TARGET_TAG")

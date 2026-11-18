@@ -21,7 +21,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    if: github.actor == 'isdoge'
+    if: github.actor == 'isdoge' && github.repository == 'isdoge/obsidian-fast-note-sync'
 
     steps:
       - uses: actions/checkout@v6
