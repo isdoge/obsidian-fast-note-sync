@@ -550,6 +550,7 @@ export default class FastSync extends Plugin {
         initPromises.push(this.configHashManager.initialize())
       }
       await Promise.all(initPromises)
+      await this.localStorageManager.restoreSyncStateFromMirror()
 
       // 崩溃恢复：从 localStorage 恢复持久化的 pending Map，过滤本地已不存在的路径
       // Crash recovery: restore persisted pending Maps, filtering out paths that no longer exist locally
@@ -645,10 +646,11 @@ export default class FastSync extends Plugin {
     this.menuManager?.unload()
     // 清理配置重载模块级计时器，避免插件卸载后仍触发回调
     cleanupConfigReloadTimer()
-    // 卸载前强制落盘防抖累积的哈希/快照写入，避免丢失
+    // 卸载前强制落盘防抖累积的哈希/快照与同步状态镜像写入，避免丢失
     this.fileHashManager?.flush()
     this.configHashManager?.flush()
     this.folderSnapshotManager?.flush()
+    this.localStorageManager?.flushSyncStateMirror()
     // 取消注册文件事件
     void this.reloadServices(false)
     this.updateStatusBar("")
@@ -742,6 +744,7 @@ export default class FastSync extends Plugin {
         `${pluginSelfDir}/configHashMap.json`,
         `${pluginSelfDir}/fileHashMap.json`,
         `${pluginSelfDir}/folderSnapshot.json`,
+        `${pluginSelfDir}/syncState.json`,
         `${this.app.vault.configDir}/community-plugins.json`,
       ];
       defaultExcludes.forEach(pattern => {
