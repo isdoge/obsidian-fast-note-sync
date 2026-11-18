@@ -7,7 +7,8 @@ const noop = () => {};
 class MockFile {}
 const helpers = { dump: noop, dumpError: noop, isPathExcluded: () => false,
   hashContent: x => x, hashContentAsync: async x => x, getPluginDir: () => '.plugin',
-  checkAndNotifyCaseConflict: () => false };
+  checkAndNotifyCaseConflict: () => false,
+  normalizeServerTimestamp: t => t === undefined ? undefined : (t > 0 && t < 1e11 ? t * 1000 : t) };
 const logs = { addLog: noop, addOrUpdateLog: noop, logReceivedMessage: noop };
 function load(file, extra = {}, globals = {}) {
   const module = { exports: {} };
@@ -171,7 +172,8 @@ console.log('PASS: queue recovery, mtime ACK release/page attribution/context ro
 }
 {
   Object.assign(helpers, { isLargeBinarySyncRisk: () => false, logMemorySnapshot: noop,
-    hashFileAsync: async () => 'hash', sleep: async () => {}, getSafeCtime: () => 1 });
+    hashFileAsync: async () => 'hash', sleep: async () => {}, getSafeCtime: () => 1,
+    normalizeServerTimestamp: t => t === undefined ? undefined : (t > 0 && t < 1e11 ? t * 1000 : t) });
   const timers = new Map(); let timerId = 0;
   const fileOps = load('src/lib/sync/operator_file.ts', {}, {
     TextEncoder, window: { setTimeout: fn => { timers.set(++timerId, fn); return timerId; },
@@ -185,7 +187,7 @@ console.log('PASS: queue recovery, mtime ACK release/page attribution/context ro
     app: { vault: { getFileByPath: () => file, getName: () => 'test', readBinary: async () => new Uint8Array([1,2,3]).buffer },
       loadLocalStorage: noop, saveLocalStorage: noop },
     pendingUploadHashes: new Map(), pendingFileDeleteAcks: new Set(), lastSyncMtime: new Map(),
-    fileHashManager: { getPathHash: () => null, getValidHash: () => 'hash', setFileHash: noop },
+    fileHashManager: { getPathHash: () => null, getValidHash: () => 'hash', setFileHash: noop, setFileHashes: noop },
     localStorageManager: { savePending: noop, getMetadata: () => 0, setMetadata: noop },
     lockManager: { withLock: async (_, fn) => fn() }, addIgnoredFile: noop, removeIgnoredFile: noop,
     totalChunksToUpload: 0, uploadedChunksCount: 0, fileSyncTasks: { failed: 0 },
@@ -229,7 +231,8 @@ console.log('PASS: queue recovery, mtime ACK release/page attribution/context ro
 
 {
   Object.assign(helpers, { isLargeBinarySyncRisk: () => false, logMemorySnapshot: noop,
-    hashFileAsync: async () => 'hash', sleep: async () => {}, getSafeCtime: () => 1 });
+    hashFileAsync: async () => 'hash', sleep: async () => {}, getSafeCtime: () => 1,
+    normalizeServerTimestamp: t => t === undefined ? undefined : (t > 0 && t < 1e11 ? t * 1000 : t) });
   const timers = new Map(); let timerId = 0;
   const fileOps = load('src/lib/sync/operator_file.ts', {}, {
     TextEncoder, window: { setTimeout: fn => { timers.set(++timerId, fn); return timerId; },
@@ -249,7 +252,7 @@ console.log('PASS: queue recovery, mtime ACK release/page attribution/context ro
       saveLocalStorage: (...args) => saved.push(args) },
     pendingUploadHashes: new Map(), pendingFileDeleteAcks: new Set(), lastSyncMtime: new Map(),
     lastSyncPathDeleted: new Set(),
-    fileHashManager: { getPathHash: () => null, getValidHash: () => 'hash', setFileHash: noop, removeFileHash: noop },
+    fileHashManager: { getPathHash: () => null, getValidHash: () => 'hash', setFileHash: noop, setFileHashes: noop, removeFileHash: noop },
     localStorageManager: { savePending: noop, getMetadata: () => 0, setMetadata: noop },
     lockManager: { withLock: async (_, fn) => fn() }, addIgnoredFile: noop, removeIgnoredFile: noop,
     totalChunksToUpload: 0, uploadedChunksCount: 0, fileSyncTasks: { failed: 0 },

@@ -648,6 +648,27 @@ export const getSafeCtime = function (stat: { ctime?: number; mtime?: number }):
 
 
 /**
+ * 归一化服务端传来的 ctime/mtime 为毫秒（haierkeys/fast-note-sync-service#461）
+ * 协议约定毫秒，但历史库中存在秒级记录（服务端已迁移存量，此处做接收侧兜底）：
+ * (0, 1e11) 区间（1e11 毫秒 = 1973-03-03，早于本项目的存在时间）视为秒并乘 1000；
+ * 其余值（0、负数、已是毫秒、undefined）原样返回。阈值与服务端 timex.NormalizeMilli 一致。
+ * 只在接收服务端单条记录时调用；不修改发往服务端的时间戳。
+ * Normalize a server-sent ctime/mtime to milliseconds (haierkeys/fast-note-sync-service#461).
+ * The protocol says milliseconds, but legacy rows stored seconds (the server migrates its own
+ * data; this guards the receive side): values in (0, 1e11) — 1e11 ms is 1973-03-03, earlier
+ * than this project exists — are treated as seconds and multiplied by 1000; anything else
+ * (0, negative, already milliseconds, undefined) is returned unchanged. Threshold matches the
+ * server's timex.NormalizeMilli. Call when receiving a server record only; never touch
+ * timestamps sent to the server.
+ */
+export function normalizeServerTimestamp(ts: number): number;
+export function normalizeServerTimestamp(ts: number | undefined): number | undefined;
+export function normalizeServerTimestamp(ts: number | undefined): number | undefined {
+  if (ts === undefined) return undefined
+  return ts > 0 && ts < 100_000_000_000 ? ts * 1000 : ts
+}
+
+/**
  * 延迟执行 (让出主线程)
  */
 export const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms))

@@ -1,8 +1,9 @@
 import { blockAliasedRemoteMutation } from "./remote_path_guard";
+import { firstKeepWithoutBaseline } from "./remote_delete_guard";
 import { TFile, TAbstractFile, normalizePath, Platform } from "obsidian";
 
 import { ReceiveFileSyncUpdateMessage, FileUploadMessage, FileSyncChunkDownloadMessage, FileDownloadSession, ReceiveMtimeMessage, ReceivePathMessage, SyncEndData } from "../utils/types";
-import { hashContent, hashArrayBuffer, getPluginDir, dump, dumpError, sleep, isPathExcluded, getSafeCtime, isLargeBinarySyncRisk, describeBinarySyncLimit, showSyncNotice, checkAndNotifyCaseConflict, logMemorySnapshot, hashFileAsync, vaultDelete } from "../utils/helpers";
+import { hashContent, hashArrayBuffer, getPluginDir, dump, dumpError, sleep, isPathExcluded, getSafeCtime, isLargeBinarySyncRisk, describeBinarySyncLimit, showSyncNotice, checkAndNotifyCaseConflict, logMemorySnapshot, hashFileAsync, vaultDelete, normalizeServerTimestamp } from "../utils/helpers";
 import { FileCloudPreview } from "../storage/file_cloud_preview";
 import { SyncLogManager } from "./sync_log_manager";
 import { HttpApiService } from "../api/http_api_service";
@@ -759,8 +760,11 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
       // Temporarily store hash in pending map, update hashManager only after server FileUploadAck
       plugin.pendingUploadHashes.set(data.path, contentHash)
       plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes)
-      // 记录当前文件的 mtime/size 到缓存，以便后续利用
-      plugin.fileHashManager.setFileHash(data.path, contentHash, file.stat.mtime, file.stat.size)
+      // 记录当前文件的 mtime/size 到缓存，以便后续利用。只写缓存：同步基线要等 FileUploadAck，
+      // 否则上传中断后基线会声称服务端已有这份内容（haierkeys/fast-note-sync-service#512）
+      // Cache only: the sync baseline waits for FileUploadAck, or an interrupted upload leaves a
+      // baseline claiming the server already has this content
+      plugin.fileHashManager.setFileHashes([[data.path, contentHash]], () => file.stat)
 
       // 使用外层计算好的 actualTotalChunks
 
@@ -932,10 +936,17 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
             const serverInfo = await apiService.getFileInfo(file.path);
 
             if (serverInfo) {
-              // 核对 path、size、mtime 是否一致
+              // 核对 path、size、mtime 是否一致；还要求服务端内容哈希就是本次上传的内容，
+              // 大小和时间相同的旧记录不能当作"已收到"（haierkeys/fast-note-sync-service#512）；
+              // 服务端历史数据可能存秒级 mtime（#461），比较前归一化为毫秒
+              // Besides path, size and mtime the server must hold the content just uploaded; an older
+              // record with the same size and mtime does not prove the upload arrived
+              // (haierkeys/fast-note-sync-service#512); legacy rows may hold second-scale mtime
+              // (#461), normalize before comparing
               if (serverInfo.path === file.path &&
                 serverInfo.size === file.stat.size &&
-                serverInfo.mtime === file.stat.mtime) {
+                normalizeServerTimestamp(serverInfo.mtime) === file.stat.mtime &&
+                serverInfo.contentHash === contentHash) {
                 dump(`Cloud Preview: Auto delete verified file: ${file.path}`);
                 plugin.addIgnoredFile(file.path);
                 try {
@@ -1030,12 +1041,14 @@ export const receiveFileSyncUpdate = async function (data: ReceiveFileSyncUpdate
 
     dump(`Receive file sync update(download): `, data.path)
     const tempKey = `temp_${data.path}`
+    // 服务端历史数据可能存秒级 mtime/ctime（#461），落盘/比较前先归一化为毫秒
+    // Legacy server rows may hold second-scale mtime/ctime (#461); normalize to milliseconds
     const tempSession: FileDownloadSession = {
       commitGuard: captureDownloadGuard(plugin, data.path),
       path: data.path,
       contentHash: data.contentHash,
-      ctime: data.ctime,
-      mtime: data.mtime,
+      ctime: normalizeServerTimestamp(data.ctime),
+      mtime: normalizeServerTimestamp(data.mtime),
       lastTime: data.lastTime,
       sessionId: "",
       totalChunks: 0,
@@ -1094,6 +1107,17 @@ export const receiveFileSyncDelete = async function (data: ReceivePathMessage, p
           let localHash = plugin.fileHashManager.getValidHash(normalizedPath, file.stat.mtime, file.stat.size)
           if (localHash === null && !isLargeBinarySyncRisk(file.stat.size, plugin)) localHash = await hashFileAsync(plugin.app, normalizedPath)
           changed = localHash !== baseHash
+        }
+        // 无同步基线：服务端从未确认过这份内容，不能按远端删除处理。本连接内首次：保留并重新上传；
+        // 已重传过：只保留（haierkeys/fast-note-sync-service#514 #391）
+        // No sync baseline: the server never confirmed this content, so a remote delete must not remove
+        // it. First time on this connection: keep and upload again; already re-uploaded: keep only
+        if (!changed && baseHash === null) {
+          if (!firstKeepWithoutBaseline(plugin, normalizedPath)) {
+            SyncLogManager.getInstance().addLog('receive', 'FileDeleteConflict', `本地文件尚未同步且已重新上传，等待服务端确认，保留本地: ${normalizedPath}`, 'cancelled', data.path)
+            return
+          }
+          changed = true
         }
         if (changed) {
           SyncLogManager.getInstance().addLog('receive', 'FileDeleteConflict', `本地存在未同步的改动，保留本地并重新上传: ${normalizedPath}`, 'cancelled', data.path)
@@ -1156,7 +1180,11 @@ export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, p
   // Cloud preview does not skip mtime updates: the handler only touches files that already
   // exist locally, and skipping left their mtime stale so every round re-checked them.
 
-  dump(`Receive file sync mtime: `, data.path, data.mtime)
+  // 服务端历史数据可能存秒级 mtime/ctime（#461），落盘/比较前先归一化为毫秒
+  // Legacy server rows may hold second-scale mtime/ctime (#461); normalize to milliseconds
+  const mtime = normalizeServerTimestamp(data.mtime)
+  const ctime = normalizeServerTimestamp(data.ctime)
+  dump(`Receive file sync mtime: `, data.path, mtime)
   const normalizedPath = normalizePath(data.path)
 
   await plugin.lockManager.withLock(normalizedPath, async () => {
@@ -1164,7 +1192,7 @@ export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, p
     if (file) {
       if (isLargeBinarySyncRisk(file.stat.size, plugin)) {
         dump(`Skip binary mtime rewrite for large attachment (${describeBinarySyncLimit()} limit): ${normalizedPath}`, file.stat.size)
-        plugin.lastSyncMtime.set(data.path, data.mtime)
+        plugin.lastSyncMtime.set(data.path, mtime || 0)
         if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
           plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
         }
@@ -1173,9 +1201,9 @@ export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, p
       const content = await plugin.app.vault.readBinary(file)
       plugin.addIgnoredFile(normalizedPath)
       try {
-        await plugin.app.vault.modifyBinary(file, content, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
+        await plugin.app.vault.modifyBinary(file, content, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
         // 记录 mtime
-        plugin.lastSyncMtime.set(data.path, data.mtime)
+        plugin.lastSyncMtime.set(data.path, mtime || 0)
         // 更新同步时间
         if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))) {
           plugin.localStorageManager.setMetadata("lastFileSyncTime", data.lastTime)
@@ -1232,12 +1260,14 @@ export const receiveFileSyncChunkDownload = async function (data: FileSyncChunkD
     dump(`Ignore unsolicited file chunk download reply: ${data.path}`)
     return
   }
+  // 服务端历史数据可能存秒级 mtime/ctime（#461），落盘/比较前先归一化为毫秒
+  // Legacy server rows may hold second-scale mtime/ctime (#461); normalize to milliseconds
   const session: FileDownloadSession = {
     commitGuard: tempSession.commitGuard,
     path: data.path,
     contentHash: data.contentHash,
-    ctime: data.ctime,
-    mtime: data.mtime,
+    ctime: normalizeServerTimestamp(data.ctime),
+    mtime: normalizeServerTimestamp(data.mtime),
     lastTime: tempSession.lastTime,
     sessionId: data.sessionId,
     totalChunks: data.totalChunks,
@@ -1341,6 +1371,17 @@ export const checkAndUploadAttachments = async function (plugin: FastSync) {
       // 如果没有数据，说明服务端不存在
       if (!res) {
         dump(`Cloud Preview: File missing on server, starting upload: ${file.path}`);
+        await fileModify(file, plugin, false);
+        uploadCount++;
+      } else if (file.stat.mtime > (normalizeServerTimestamp(res.mtime) ?? 0)) {
+        // 服务端已有但本地更新：云预览附件不参与常规扫描，离线期间的修改只能在这里补传。
+        // 是否真有改动由 fileModify 判断，内容与同步基线一致（只是 mtime 变了，#256）不会上传；
+        // 服务端历史数据可能存秒级 mtime（#461），比较前归一化为毫秒
+        // The server has it but the local copy is newer: cloud preview attachments skip the regular
+        // scan, so an edit made while offline can only be uploaded here. fileModify decides whether
+        // anything changed; content equal to the sync baseline (mtime only, #256) is not uploaded;
+        // legacy server rows may hold second-scale mtime (#461), normalize before comparing
+        dump(`Cloud Preview: Local copy newer than server, checking upload: ${file.path}`);
         await fileModify(file, plugin, false);
         uploadCount++;
       }
@@ -1471,6 +1512,11 @@ export const receiveFileSyncRename = async function (data: { oldPath: string; pa
 
   dump(`Receive file rename:`, data.oldPath, "->", data.path)
 
+  // 服务端历史数据可能存秒级 mtime/ctime（#461），落盘/比较前先归一化为毫秒
+  // Legacy server rows may hold second-scale mtime/ctime (#461); normalize to milliseconds
+  const mtime = normalizeServerTimestamp(data.mtime)
+  const ctime = normalizeServerTimestamp(data.ctime)
+
   const normalizedOldPath = normalizePath(data.oldPath)
   const normalizedNewPath = normalizePath(data.path)
 
@@ -1515,14 +1561,14 @@ export const receiveFileSyncRename = async function (data: { oldPath: string; pa
 
         await plugin.app.vault.rename(file, normalizedNewPath)
 
-        if (data.mtime) {
+        if (mtime) {
           const renamedFile = plugin.app.vault.getFileByPath(normalizedNewPath)
           if (renamedFile instanceof TFile) {
             if (isLargeBinarySyncRisk(renamedFile.stat.size, plugin)) {
               dump(`Skip renamed binary mtime rewrite for large attachment (${describeBinarySyncLimit()} limit): ${normalizedNewPath}`, renamedFile.stat.size)
             } else {
               const content = await plugin.app.vault.readBinary(renamedFile)
-              await plugin.app.vault.modifyBinary(renamedFile, content, { ...((data.ctime ?? 0) > 0 && { ctime: data.ctime }), ...((data.mtime ?? 0) > 0 && { mtime: data.mtime }) })
+              await plugin.app.vault.modifyBinary(renamedFile, content, { ...((ctime ?? 0) > 0 && { ctime }), ...((mtime ?? 0) > 0 && { mtime }) })
             }
           }
         }
@@ -1752,12 +1798,26 @@ const handleFileChunkDownloadComplete = async function (session: FileDownloadSes
   }
 }
 
-// 收到 FileRenameAck，服务端确认后更新 hashManager（FIFO 出队）并更新 lastFileSyncTime
-// Receive FileRenameAck, update hashManager after server confirmation (FIFO dequeue) and update lastFileSyncTime
-export const receiveFileRenameAck = function (data: { lastTime?: number }, plugin: FastSync) {
-  // 服务端确认重命名成功，FIFO 出队并更新 hashManager
-  // Server confirmed rename success, dequeue FIFO and update hashManager
-  const pending = plugin.pendingFileRenames.shift()
+// 收到 FileRenameAck，按 data.path（服务端下发的新路径）精确匹配待确认条目并更新 hashManager；
+// 老服务端不下发 path 时回退 FIFO；匹配不到时不误删队列其它项，仅记日志（haierkeys/fast-note-sync-service#312）
+// Receive FileRenameAck, match the pending entry precisely by data.path (the new path the server
+// echoes) and update hashManager; falls back to FIFO for legacy servers that omit path; a miss
+// never removes another entry, it just logs (haierkeys/fast-note-sync-service#312)
+export const receiveFileRenameAck = function (data: { lastTime?: number; path?: string }, plugin: FastSync) {
+  let pending: { oldPath: string; newPath: string; contentHash: string } | undefined
+  if (data.path) {
+    const index = plugin.pendingFileRenames.findIndex(entry => entry.newPath === data.path)
+    if (index !== -1) {
+      pending = plugin.pendingFileRenames[index]
+      plugin.pendingFileRenames.splice(index, 1)
+    } else {
+      dump(`FileRenameAck: no pending rename matches path ${data.path}, leaving the queue intact`)
+    }
+  } else {
+    // 老服务端未下发 path，回退 FIFO 出队
+    // Legacy server omits path, fall back to FIFO dequeue
+    pending = plugin.pendingFileRenames.shift()
+  }
   if (pending) {
     const file = plugin.app.vault.getFileByPath(normalizePath(pending.newPath))
     plugin.fileHashManager.setFileHash(pending.newPath, pending.contentHash, file?.stat.mtime || 0, file?.stat.size || 0)

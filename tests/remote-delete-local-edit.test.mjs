@@ -5,7 +5,9 @@ import vm from "node:vm";
 import ts from "typescript";
 
 // #277: a remote delete must not discard unsynced local edits. The note/file is kept and uploaded
-// again; a clean copy, an unknown baseline or a read-only device still deletes.
+// again; a clean copy or a read-only device still deletes. A copy without a baseline was never
+// confirmed by the server and is kept too (haierkeys/fast-note-sync-service#514 #391, see
+// remote-delete-no-baseline.test.mjs).
 const root = path.resolve(import.meta.dirname, "..");
 class TFile { constructor(p) { this.path = p; this.stat = { size: 1, mtime: 9, ctime: 1 }; } }
 const logs = [];
@@ -28,6 +30,7 @@ function load(name) {
       if (id === "obsidian") return { TFile, normalizePath: p => p, Platform: { isMobile: false } };
       if (id === "../utils/helpers") return helpers;
       if (id === "./remote_path_guard") return { blockAliasedRemoteMutation: () => false };
+      if (id === "./remote_delete_guard") return { firstKeepWithoutBaseline: () => true };
       if (id === "./sync_log_manager") return { SyncLogManager: { getInstance: () => ({ addLog: (...a) => logs.push(a) }) } };
       return {};
     },
@@ -76,7 +79,7 @@ for (const kind of ["note", "file"]) {
   else await check("clean copy deletes", { base: "edited" }, false);
   await check("pending upload keeps local", { pending: true, base: kind === "note" ? "synced" : "edited" }, true);
   await check("content diverged keeps local", edited, true);
-  await check("unknown baseline deletes", { content: "edited", base: null }, false);
+  await check("unknown baseline keeps local", { content: "edited", base: null }, true);
   await check("read-only device deletes", { ...edited, pending: true, readonly: true }, false);
 }
 assert(logs.some(l => l[1] === "NoteDeleteConflict") && logs.some(l => l[1] === "FileDeleteConflict"), "kept copies are logged");

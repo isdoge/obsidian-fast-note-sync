@@ -1,8 +1,9 @@
 import { blockAliasedRemoteMutation } from "./remote_path_guard";
+import { firstKeepWithoutBaseline } from "./remote_delete_guard";
 import { TFile, TAbstractFile, normalizePath } from "obsidian";
 
 import { ReceiveMessage, ReceiveMtimeMessage, ReceivePathMessage, SyncEndData } from "../utils/types";
-import { hashContent, hashContentAsync, dump, dumpError, isPathExcluded, getSafeCtime, checkAndNotifyCaseConflict, getPluginDir, showSyncNotice } from "../utils/helpers";
+import { hashContent, hashContentAsync, dump, dumpError, isPathExcluded, getSafeCtime, checkAndNotifyCaseConflict, getPluginDir, showSyncNotice, normalizeServerTimestamp } from "../utils/helpers";
 import { SyncLogManager } from "./sync_log_manager";
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
@@ -332,7 +333,12 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
     plugin.recordSyncCompleted('note', data.pageIndex)
     return
   }
-  dump(`Receive note modify:`, data.path, data.contentHash, data.mtime, data.pathHash)
+  // 服务端历史数据可能存秒级 mtime/ctime（#461），落盘/比较前先归一化为毫秒
+  // Legacy server rows may hold second-scale mtime/ctime (#461); normalize to milliseconds
+  // before writing to disk or comparing
+  const mtime = normalizeServerTimestamp(data.mtime)
+  const ctime = normalizeServerTimestamp(data.ctime)
+  dump(`Receive note modify:`, data.path, data.contentHash, mtime, data.pathHash)
 
   const normalizedPath = normalizePath(data.path)
   // #205：NoteSyncModify 可能是空白笔记探测的结论（服务端已有该笔记），清除在途探测标记
@@ -419,7 +425,7 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
             return
           }
 
-          await plugin.app.vault.modify(file, data.content, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
+          await plugin.app.vault.modify(file, data.content, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
         } else {
           const folder = normalizedPath.split("/").slice(0, -1).join("/")
           if (folder != "") {
@@ -434,7 +440,7 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
               }
             }
           }
-          await plugin.app.vault.create(normalizedPath, data.content, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
+          await plugin.app.vault.create(normalizedPath, data.content, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
         }
         if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {
           plugin.localStorageManager.setMetadata("lastNoteSyncTime", data.lastTime)
@@ -443,9 +449,9 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
         // 服务端推送笔记更新,更新哈希表(使用内容哈希)
         // 注意：由于是服务端推送，我们信任服务端返回的 mtime，并尝试获取本地文件大小
         const updatedFile = plugin.app.vault.getFileByPath(normalizedPath);
-        plugin.fileHashManager.setFileHash(data.path, data.contentHash, data.mtime, updatedFile?.stat.size || 0)
+        plugin.fileHashManager.setFileHash(data.path, data.contentHash, mtime || 0, updatedFile?.stat.size || 0)
         // 记录同步后的 mtime 用于拦截
-        plugin.lastSyncMtime.set(data.path, data.mtime)
+        plugin.lastSyncMtime.set(data.path, mtime || 0)
         // 服务端版本已覆盖本地，清理 pending 避免增量过滤器旁路导致该笔记无限重传
         // Server version overrides local; clear pending to avoid incremental filter bypass loop
         plugin.pendingNoteModifies.delete(data.path)
@@ -586,7 +592,11 @@ export const receiveNoteSyncMtime = async function (data: ReceiveMtimeMessage, p
     plugin.recordSyncCompleted('note', completionPageIndex)
     return
   }
-  dump(`Receive note sync mtime:`, data.path, data.mtime)
+  // 服务端历史数据可能存秒级 mtime/ctime（#461），落盘/比较前先归一化为毫秒
+  // Legacy server rows may hold second-scale mtime/ctime (#461); normalize to milliseconds
+  const mtime = normalizeServerTimestamp(data.mtime)
+  const ctime = normalizeServerTimestamp(data.ctime)
+  dump(`Receive note sync mtime:`, data.path, mtime)
 
   const normalizedPath = normalizePath(data.path)
 
@@ -597,14 +607,14 @@ export const receiveNoteSyncMtime = async function (data: ReceiveMtimeMessage, p
         const content: string = await plugin.app.vault.read(file)
         plugin.addIgnoredFile(normalizedPath)
         try {
-          await plugin.app.vault.modify(file, content, { ...(data.ctime > 0 && { ctime: data.ctime }), ...(data.mtime > 0 && { mtime: data.mtime }) })
+          await plugin.app.vault.modify(file, content, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
           // 记录 mtime
-          plugin.lastSyncMtime.set(data.path, data.mtime)
+          plugin.lastSyncMtime.set(data.path, mtime || 0)
           // 服务端走 UpdateMtime 说明内容 hash 与客户端发送的一致，提交 pending hash 到 hashManager
           // Server UpdateMtime means content hash matches what client sent; commit pending hash to hashManager
           const pendingHash = plugin.pendingNoteModifies.get(data.path)
           if (pendingHash !== undefined) {
-            plugin.fileHashManager.setFileHash(data.path, pendingHash, data.mtime, file.stat.size)
+            plugin.fileHashManager.setFileHash(data.path, pendingHash, mtime || 0, file.stat.size)
             plugin.pendingNoteModifies.delete(data.path)
             plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies)
           }
@@ -671,6 +681,18 @@ export const receiveNoteSyncDelete = async function (data: ReceiveMessage, plugi
             const localHash = plugin.fileHashManager.getValidHash(normalizedPath, file.stat.mtime, file.stat.size)
               ?? await hashContentAsync(await plugin.app.vault.read(file))
             changed = localHash !== baseHash
+          }
+          // 无同步基线：服务端从未确认过这份内容（离线新建、外部工具写入），不能按远端删除处理。
+          // 本连接内首次：保留并重新上传；已重传过：只保留（haierkeys/fast-note-sync-service#514 #391）
+          // No sync baseline: the server never confirmed this content (created offline, written by an
+          // external tool), so a remote delete must not remove it. First time on this connection: keep
+          // and upload again; already re-uploaded: keep only
+          if (!changed && baseHash === null) {
+            if (!firstKeepWithoutBaseline(plugin, normalizedPath)) {
+              SyncLogManager.getInstance().addLog('receive', 'NoteDeleteConflict', `本地文件尚未同步且已重新上传，等待服务端确认，保留本地: ${normalizedPath}`, 'cancelled', data.path)
+              return
+            }
+            changed = true
           }
           if (changed) {
             SyncLogManager.getInstance().addLog('receive', 'NoteDeleteConflict', `本地存在未同步的改动，保留本地并重新上传: ${normalizedPath}`, 'cancelled', data.path)
@@ -746,6 +768,11 @@ export const receiveNoteSyncRename = async function (data: { path: string, oldPa
     return
   }
 
+  // 服务端历史数据可能存秒级 mtime/ctime（#461），落盘/比较前先归一化为毫秒
+  // Legacy server rows may hold second-scale mtime/ctime (#461); normalize to milliseconds
+  const mtime = normalizeServerTimestamp(data.mtime)
+  const ctime = normalizeServerTimestamp(data.ctime)
+
   dump(`Receive note rename:`, data.oldPath, "->", data.path)
 
   const normalizedOldPath = normalizePath(data.oldPath)
@@ -774,13 +801,13 @@ export const receiveNoteSyncRename = async function (data: { path: string, oldPa
           await plugin.app.vault.rename(file, normalizedNewPath)
 
           // 更新元数据
-          if (data.mtime) {
+          if (mtime) {
             const renamedFile = plugin.app.vault.getFileByPath(normalizedNewPath)
             if (renamedFile instanceof TFile) {
               const content = await plugin.app.vault.read(renamedFile)
               const options: { ctime?: number; mtime?: number } = {};
-              if (data.ctime && data.ctime > 0) options.ctime = data.ctime;
-              if (data.mtime && data.mtime > 0) options.mtime = data.mtime;
+              if (ctime && ctime > 0) options.ctime = ctime;
+              if (mtime && mtime > 0) options.mtime = mtime;
               await plugin.app.vault.modify(renamedFile, content, options);
             }
           }
@@ -788,7 +815,7 @@ export const receiveNoteSyncRename = async function (data: { path: string, oldPa
           // 更新哈希表：移除旧路径，添加新路径
           plugin.fileHashManager.removeFileHash(data.oldPath)
           const renamedFile = plugin.app.vault.getFileByPath(normalizedNewPath)
-          plugin.fileHashManager.setFileHash(data.path, data.contentHash, data.mtime || (renamedFile instanceof TFile ? renamedFile.stat.mtime : 0), renamedFile instanceof TFile ? renamedFile.stat.size : 0)
+          plugin.fileHashManager.setFileHash(data.path, data.contentHash, mtime || (renamedFile instanceof TFile ? renamedFile.stat.mtime : 0), renamedFile instanceof TFile ? renamedFile.stat.size : 0)
 
           // 更新同步时间
           if (data.lastTime && data.lastTime > Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))) {

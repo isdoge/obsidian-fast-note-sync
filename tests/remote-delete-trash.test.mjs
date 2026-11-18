@@ -4,12 +4,13 @@ import vm from 'node:vm';
 import ts from 'typescript';
 
 const noop = () => {};
-class TFile { constructor(path) { this.path = path; } }
+class TFile { constructor(path) { this.path = path; this.stat = { size: 1, mtime: 1 }; } }
 class TFolder { constructor(path) { this.path = path; this.children = []; } }
 const helpers = { dump: noop, dumpError: noop, isPathExcluded: () => false,
   isFolderSyncPathExcluded: () => false, configIsPathExcluded: () => false,
   isPathInConfigSyncDirs: () => true, waitForFolderEmpty: async () => true,
-  checkAndNotifyCaseConflict: () => false, isLargeBinarySyncRisk: () => false };
+  checkAndNotifyCaseConflict: () => false, isLargeBinarySyncRisk: () => false,
+  normalizeServerTimestamp: t => t === undefined ? undefined : (t > 0 && t < 1e11 ? t * 1000 : t) };
 let permanentCalls = 0;
 const forbidden = () => { permanentCalls++; throw new Error('permanent deletion must not be used'); };
 function load(file) {
@@ -48,7 +49,7 @@ function fixture(kind, fail = false) {
     lockManager: { withLock: async (_, fn) => fn() },
     addIgnoredFile: noop, removeIgnoredFile: noop, ignoredConfigFiles: new Set(),
     lastSyncPathDeleted: new Set(), lastSyncMtime: new Map(), pendingNoteModifies: new Map(), pendingUploadHashes: new Map(),
-    fileHashManager: { removeFileHash: path => removedHashes.push(path), getPathHash: () => null },
+    fileHashManager: { removeFileHash: path => removedHashes.push(path), getPathHash: () => 'synced', getValidHash: () => 'synced' },
     configHashManager: { isReady: () => true, removeFileHash: path => removedHashes.push(path) },
     configManager: { removeFileState: noop }, folderSnapshotManager: { removeFolder: noop },
     localStorageManager: { savePending: noop, getMetadata: () => 0, setMetadata: noop },

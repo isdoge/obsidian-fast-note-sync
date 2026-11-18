@@ -30,6 +30,7 @@ function load(name) {
     require(id) {
       if (id === "obsidian") return { TFile, TFolder, normalizePath: p => p, Platform: { isMobile: false } };
       if (id === "./remote_path_guard") return { blockAliasedRemoteMutation: () => false };
+      if (id === "./remote_delete_guard") return { firstKeepWithoutBaseline: () => true };
       if (id === "./sync_log_manager") return { SyncLogManager: { getInstance: () => ({ addLog: (...a) => logs.push(a) }) } };
       if (id === "../utils/helpers") return helpers;
       if (id === "../storage/file_cloud_preview") return { FileCloudPreview: { isRestrictedType: () => false } };

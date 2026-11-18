@@ -8,7 +8,7 @@ const source=fs.readFileSync(path.join(root,'src/lib/sync/operator_file.ts'),'ut
 const transpiled=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText;
 const noop=()=>{};class TFile{constructor(p){this.path=p;this.stat={size:1,ctime:1,mtime:100};this.bytes=[0];}}
 const errors=[];const m={exports:{}};
-const helpers={dump:noop,dumpError:(...a)=>errors.push(a.map(String)),isLargeBinarySyncRisk:()=>false,isPathExcluded:()=>false,checkAndNotifyCaseConflict:()=>false,hashArrayBuffer:async b=>String(new Uint8Array(b)[0]),getPluginDir:()=>'.plugin',logMemorySnapshot:noop};
+const helpers={dump:noop,dumpError:(...a)=>errors.push(a.map(String)),isLargeBinarySyncRisk:()=>false,isPathExcluded:()=>false,checkAndNotifyCaseConflict:()=>false,hashArrayBuffer:async b=>String(new Uint8Array(b)[0]),getPluginDir:()=>'.plugin',logMemorySnapshot:noop,normalizeServerTimestamp:t=>t===undefined?undefined:(t>0&&t<1e11?t*1000:t)};
 vm.runInNewContext(transpiled,{module:m,exports:m.exports,console,Uint8Array,ArrayBuffer,Map,Set,Date,window:{setTimeout:()=>1,clearTimeout:noop},require:id=>{
  if(id==='obsidian')return{TFile,normalizePath:p=>p,Platform:{isMobile:false}};
  if(id==='../utils/helpers')return helpers;
