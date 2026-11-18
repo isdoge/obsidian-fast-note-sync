@@ -1554,6 +1554,25 @@ export const receiveFileSyncRename = async function (data: { oldPath: string; pa
       plugin.lastSyncPathRenamed.add(normalizedNewPath)
 
       try {
+        // 目标父目录可能尚不存在（改名/移动到新目录）：rename 不建目录，先按 create 路径的
+        // 同一模式确保存在，否则 vault.rename 抛 ENOENT、改名被丢弃（两端永久不一致）
+        // The target parent folder may not exist yet (rename/move into a new dir): rename
+        // creates no folder, so ensure it with the same pattern as the create path, or
+        // vault.rename throws ENOENT and the rename is dropped (permanent divergence)
+        const targetFolder = normalizedNewPath.split("/").slice(0, -1).join("/")
+        if (targetFolder !== "") {
+          const dirExists = plugin.app.vault.getFolderByPath(targetFolder)
+          if (dirExists == null) {
+            try {
+              await plugin.app.vault.createFolder(targetFolder)
+            } catch (e) {
+              // 并发竞争时只有一个调用成功，另一方忽略"已存在"错误
+              // In concurrent race only one call succeeds; ignore "already exists" error
+              if (!plugin.app.vault.getFolderByPath(targetFolder)) throw e
+            }
+          }
+        }
+
         const targetFile = plugin.app.vault.getFileByPath(normalizedNewPath)
         if (targetFile && targetFile !== file) {
           await plugin.app.fileManager.trashFile(targetFile)

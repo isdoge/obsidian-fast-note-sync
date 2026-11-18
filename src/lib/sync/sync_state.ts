@@ -82,8 +82,43 @@ export class SyncState {
   isWaitClearSync = false;
   /** 当前同步类型 / Current sync type */
   currentSyncType: "full" | "incremental" = "incremental";
+  /**
+   * 本机已作废的历史同步 context（最近 16 个）。活跃 context 被置空或被新轮替换时，
+   * 旧值进此集合：websocket_manager 据此区分「本机上一轮的迟到应答」（照旧丢弃）与
+   * 「其它设备的实时广播 / 无 context 应答」（延后到本轮结束再处理）。
+   * Recently retired sync contexts of this client (last 16). When the active context is
+   * cleared or superseded, the old value lands here so websocket_manager can tell late
+   * replies of this client's own old rounds (discard) apart from other devices' live
+   * broadcasts and contextless replies (defer until the round ends).
+   */
+  retiredSyncContexts = new Set<string>();
+  /**
+   * 活跃 context 被置空/替换时触发一次（在置空的调用栈里同步调用）；回放方必须异步调度，
+   * 不能在该调用栈里同步重入消息分发。由 websocket_manager 构造时注册。
+   * Fired once when the active context is cleared or superseded (synchronously in the
+   * clearing call stack); the replay side must schedule asynchronously and must not
+   * re-enter message dispatch synchronously. Registered by websocket_manager.
+   */
+  onSyncContextRetired?: () => void;
+
+  private _activeSyncContext: string | null = null;
   /** 当前活跃的同步上下文 UUID / Current active sync context UUID */
-  activeSyncContext: string | null = null;
+  get activeSyncContext(): string | null { return this._activeSyncContext; }
+  set activeSyncContext(value: string | null) {
+    const old = this._activeSyncContext;
+    this._activeSyncContext = value;
+    if (old !== null && old !== value) {
+      this.retiredSyncContexts.add(old);
+      // Set 迭代序即插入序：重复 add 不改变位置，淘汰最旧的即近似 FIFO / Set iteration
+      // order is insertion order: re-adding keeps position, evicting the first is approx. FIFO
+      while (this.retiredSyncContexts.size > 16) {
+        const oldest = this.retiredSyncContexts.values().next().value as string | undefined;
+        if (oldest === undefined) break;
+        this.retiredSyncContexts.delete(oldest);
+      }
+      this.onSyncContextRetired?.();
+    }
+  }
   /** 用户通过 ribbon 手动触发的待执行同步类型（断开时暂存，重连成功后执行）
    *  Pending sync type triggered manually via ribbon (stored when disconnected, executed after reconnect) */
   pendingSyncType: 'incremental' | 'full' | null = null;

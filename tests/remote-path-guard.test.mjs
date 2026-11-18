@@ -80,6 +80,10 @@ async function check(kind, operation, mode, alias = "notes/A\u00a0B.md") {
     settings: { syncEnabled: true, cloudPreviewEnabled: false },
     app: { vault: {
       adapter, getFileByPath: p => files.get(p), getAbstractFileByPath: p => files.get(p),
+      // rename 接收路径会先确保目标父目录存在（缺失时创建）：桩里目录一律视为已存在
+      // The receive-rename path ensures the target parent folder exists; treat folders as always present
+      getFolderByPath: p => (p === "" || p.includes("/") ? {} : {}),
+      createFolder: async () => {},
       trash: async f => deleted.push(f.path),
       rename: async (f, p) => { renamed.push(p); files.delete(f.path); f.path = p; files.set(p, f); },
     }, fileManager: { trashFile: async f => deleted.push(f.path) } },

@@ -125,7 +125,12 @@ function fixture(content = 'same', base = 'same', pending = true) {
   });
   const manager = Object.create(WebSocketManager.prototype);
   manager.client = { notifyActivity: noop };
-  manager.plugin = { settings: { vault: 'test' }, syncState: { activeSyncContext: 'current' }, pendingNoteModifies: new Map([['test.md', 'hash']]) };
+  manager.deferredMessages = [];
+  manager.deferredBytes = 0;
+  manager.replayScheduled = false;
+  // 'old' 是本机上一轮的作废 context：这类迟到应答照旧丢弃；'foreign' 是别的设备的 context：延后处理
+  // 'old' is a retired context of this client: late replies stay discarded; 'foreign' is another device's: deferred
+  manager.plugin = { settings: { vault: 'test' }, syncState: { activeSyncContext: 'current', retiredSyncContexts: new Set(['old']) }, pendingNoteModifies: new Map([['test.md', 'hash']]) };
   manager.handleStructuredMessage('NoteSyncMtime', { code: 200, vault: 'test', data: { path: 'test.md' } });
   assert.equal(received.length, 1, 'legacy contextless ACK for pending upload must be accepted');
   manager.handleStructuredMessage('NoteSyncMtime', { code: 200, context: 'old', data: { path: 'test.md' } });
@@ -160,7 +165,10 @@ console.log('PASS: queue recovery, mtime ACK release/page attribution/context ro
   });
   const manager = Object.create(WebSocketManager.prototype);
   manager.client = { notifyActivity: noop };
-  manager.plugin = { settings: { vault: 'test' }, syncState: { activeSyncContext: 'one' } };
+  manager.deferredMessages = [];
+  manager.deferredBytes = 0;
+  manager.replayScheduled = false;
+  manager.plugin = { settings: { vault: 'test' }, syncState: { activeSyncContext: 'one', retiredSyncContexts: new Set() } };
   const packet = { code: 200, context: 'one', pageIndex: 16, data: { path: 'file.png' } };
   for (let i = 0; i < 1000; i++) manager.handleStructuredMessage('FileSyncUpdate', packet);
   assert.equal(received.length, 1, '1000 retransmissions must enqueue one download');
