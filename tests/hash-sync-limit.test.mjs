@@ -256,6 +256,20 @@ function mkPlugin(fileList, hashSyncLimit = 2) {
   assert.equal(p.meta.get('lastNoteSyncTime'), 950, 'non-truncated note type still advances normally');
 }
 
+// 1c. 上限填 0 视为不限制：不截断、不提示，游标正常推进
+{
+  notices.length = 0;
+  logs.length = 0;
+  const files = [new TFile('x.md', 'md'), new TFile('y.md', 'md'), new TFile('z.md', 'md')];
+  const p = mkPlugin(files, 0);
+  await op.handleSync(p, true);
+  assert.equal(notices.filter(m => m.includes('ui.notice.hash_limit_exceeded')).length, 0, 'limit 0 means unlimited: no notice');
+  p.syncState.pendingSyncEndTime.set('lastNoteSyncTime', 800);
+  p.done.note = true;
+  op.settleSyncTimes(p);
+  assert.equal(p.meta.get('lastNoteSyncTime'), 800, 'limit 0 does not block lastNoteSyncTime');
+}
+
 // 2. 设置页与所有语言文案中的默认值必须与 DEFAULT_SETTINGS.hashSyncLimit (50000) 一致
 {
   const settingSrc = fs.readFileSync('src/setting.tsx', 'utf8');

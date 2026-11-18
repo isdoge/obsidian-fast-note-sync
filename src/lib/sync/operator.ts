@@ -847,7 +847,10 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
 
       // --- PERF: Limit hash computations per sync cycle ---
       // Prevents V8 heap exhaustion on first full scan of large vaults.
-      const MAX_HASH_PER_CYCLE = plugin.settings.hashSyncLimitEnabled !== false ? (plugin.settings.hashSyncLimit ?? 50000) : Infinity;
+      // 上限填 0 视为不限制：按字面当作"一个都不算"会让未缓存的文件永远同步不上（#302）
+      // A limit of 0 means unlimited: taking it literally would never hash any uncached file
+      const hashSyncLimit = plugin.settings.hashSyncLimit ?? 50000;
+      const MAX_HASH_PER_CYCLE = plugin.settings.hashSyncLimitEnabled !== false && hashSyncLimit > 0 ? hashSyncLimit : Infinity;
       let hashComputeCount = 0;
       let truncatedNoteCount = 0;
       let truncatedFileCount = 0;
