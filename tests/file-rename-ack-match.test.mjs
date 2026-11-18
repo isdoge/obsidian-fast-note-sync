@@ -138,3 +138,18 @@ for (const type of ['file', 'note']) {
   assert.equal(limiter.activeKeys.has('unrelated'), true, `${type}: unrelated FIFO entry survives`);
 }
 console.log('PASS: note/file rename slots follow matched pending entries, including legacy and unmatched ACKs');
+
+// Retry-owned ACKs settle by action/path, never advance the scan cursor or guess FIFO.
+{
+  const f = fixture([{ oldPath: 'a.png', newPath: 'b.png', contentHash: 'h' }]);
+  const calls = [];
+  f.plugin.retryQueue = {
+    matchesAck: (action, path) => action === 'FileRenameAck' && path === 'b.png',
+    acknowledge: (action, path) => { calls.push([action, path]); return true; },
+  };
+  f.plugin.localStorageManager.setMetadata = () => assert.fail('retry ACK must not advance sync time');
+  ops.receiveFileRenameAck({ lastTime: 999 }, f.plugin);
+  assert.equal(f.plugin.pendingFileRenames.length, 1, 'queue cannot guess a pathless ACK');
+  ops.receiveFileRenameAck({ path: 'b.png', lastTime: 999 }, f.plugin);
+  assert.deepEqual(calls, [['FileRenameAck', 'b.png']]);
+}

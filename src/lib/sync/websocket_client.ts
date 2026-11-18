@@ -383,6 +383,7 @@ export class WebSocketClient {
     }
 
     await this.waitForBufferDrain();
+    if (before && before()) return true;
 
     this.Send(action, data, () => {
       after?.();

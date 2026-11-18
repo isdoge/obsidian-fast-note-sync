@@ -532,7 +532,7 @@ export const fileDelete = async function (file: TAbstractFile, plugin: FastSync,
         pathHash: hashContent(file.path),
       }
       if (!await plugin.concurrencyLimiter.waitForSlot(file.path)) return
-      void plugin.websocket.SendMessage("FileDelete", data, undefined, () => {
+      await plugin.websocket.SendMessage("FileDelete", data, undefined, () => {
         // 消息真正写入 TCP 缓冲区后加入 pending set，等待 FileDeleteAck 再删 hash
         // Add to pending set only after message is actually buffered; remove hash only on FileDeleteAck
         plugin.pendingFileDeleteAcks.add(file.path)
@@ -548,7 +548,7 @@ export const fileDelete = async function (file: TAbstractFile, plugin: FastSync,
  * 按路径字符串发送文件删除消息（用于无法获取 TFile 对象的场景，如 rename 后旧路径已不存在）
  * Send file delete message by path string (for scenarios where TFile object is unavailable, e.g., old path after rename)
  */
-export const fileDeleteByPath = async function (filePath: string, plugin: FastSync) {
+export const fileDeleteByPath = async function (filePath: string, plugin: FastSync, retryGuard?: () => boolean) {
   if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
   if (filePath.endsWith(".md")) return
   if (isPathExcluded(filePath, plugin)) return
@@ -556,6 +556,7 @@ export const fileDeleteByPath = async function (filePath: string, plugin: FastSy
   if (plugin.lastSyncPathDeleted.has(filePath)) return
 
   await plugin.lockManager.withLock(filePath, async () => {
+    if (retryGuard && !retryGuard()) return
     // 如果该文件正在上传或在队列中，则标记为取消，且不再发送服务端删除消息
     // If the file is being uploaded or in the queue, cancel and skip server delete
     if (activeUploadsMap.has(filePath)) {
@@ -574,11 +575,12 @@ export const fileDeleteByPath = async function (filePath: string, plugin: FastSy
     plugin.addIgnoredFile(filePath)
     try {
       if (!await plugin.concurrencyLimiter.waitForSlot(filePath)) return
-      void plugin.websocket.SendMessage("FileDelete", {
+      if (retryGuard && !retryGuard()) { plugin.concurrencyLimiter.releaseSlot(filePath); return }
+      await plugin.websocket.SendMessage("FileDelete", {
         vault: plugin.settings.vault,
         path: filePath,
         pathHash: hashContent(filePath),
-      }, undefined, () => {
+      }, () => retryGuard ? !retryGuard() : false, () => {
         // 消息真正写入 TCP 缓冲区后加入 pending set，等待 FileDeleteAck 再删 hash
         // Add to pending set only after message is actually buffered; remove hash only on FileDeleteAck
         plugin.pendingFileDeleteAcks.add(filePath)
@@ -593,7 +595,7 @@ export const fileDeleteByPath = async function (filePath: string, plugin: FastSy
 /**
  * 文件重命名事件处理
  */
-export const fileRename = async function (file: TAbstractFile, oldfile: string, plugin: FastSync, eventEnter: boolean = false) {
+export const fileRename = async function (file: TAbstractFile, oldfile: string, plugin: FastSync, eventEnter: boolean = false, retryGuard?: () => boolean, retryBaselineHash?: string) {
   if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
   if (file.path.endsWith(".md")) return
   if (plugin.isIgnoredFile(file.path) && eventEnter) return
@@ -629,6 +631,7 @@ export const fileRename = async function (file: TAbstractFile, oldfile: string, 
   }
 
   await plugin.lockManager.withLock(file.path, async () => {
+    if (retryGuard && !retryGuard()) return
     plugin.addIgnoredFile(file.path)
     try {
       dump(`File rename`, oldfile, file.path)
@@ -641,7 +644,7 @@ export const fileRename = async function (file: TAbstractFile, oldfile: string, 
         dump(`Upload cancelled due to file rename: ${oldfile}`);
       } else {
 
-        let contentHash = plugin.fileHashManager.getPathHash(oldfile)
+        let contentHash = retryBaselineHash || plugin.fileHashManager.getPathHash(oldfile)
         if (contentHash == null) {
           // 尝试新路径哈希缓存 (Try new path cache)
           contentHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size);
@@ -661,11 +664,15 @@ export const fileRename = async function (file: TAbstractFile, oldfile: string, 
           path: file.path,
           pathHash: hashContent(file.path),
         }
+        if (retryGuard && !retryGuard()) return
         // 将重命名推入待确认队列，等待服务端 FileRenameAck 后再更新 hashManager
         // Push rename to pending queue; hashManager will be updated after server FileRenameAck
-        plugin.pendingFileRenames.push({ oldPath: oldfile, newPath: file.path, contentHash })
+        if (!plugin.pendingFileRenames.some(entry => entry.oldPath === oldfile && entry.newPath === file.path)) {
+          plugin.pendingFileRenames.push({ oldPath: oldfile, newPath: file.path, contentHash })
+        }
         if (!await plugin.concurrencyLimiter.waitForSlot(file.path, true)) return
-        void plugin.websocket.SendMessage("FileRename", data)
+        if (retryGuard && !retryGuard()) { plugin.concurrencyLimiter.releaseSlot(file.path); return }
+        await plugin.websocket.SendMessage("FileRename", data, () => retryGuard ? !retryGuard() : false)
       }
     } finally {
       plugin.removeIgnoredFile(file.path)
@@ -1820,6 +1827,8 @@ const handleFileChunkDownloadComplete = async function (session: FileDownloadSes
 // echoes) and update hashManager; falls back to FIFO for legacy servers that omit path; a miss
 // never removes another entry, it just logs (haierkeys/fast-note-sync-service#312)
 export const receiveFileRenameAck = function (data: { lastTime?: number; path?: string }, plugin: FastSync) {
+  if (plugin.retryQueue && !data.path) return
+  const retryAck = plugin.retryQueue?.matchesAck("FileRenameAck", data.path) ?? false
   let pending: { oldPath: string; newPath: string; contentHash: string } | undefined
   if (data.path) {
     const index = plugin.pendingFileRenames.findIndex(entry => entry.newPath === data.path)
@@ -1839,9 +1848,10 @@ export const receiveFileRenameAck = function (data: { lastTime?: number; path?: 
     plugin.fileHashManager.setFileHash(pending.newPath, pending.contentHash, file?.stat.mtime || 0, file?.stat.size || 0)
     plugin.fileHashManager.removeFileHash(pending.oldPath)
   }
-  advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
+  if (!retryAck) advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
   dump(`FileRenameAck: lastFileSyncTime updated to`, data.lastTime)
   if (pending) plugin.concurrencyLimiter.releaseSlot(pending.newPath)
+  if (retryAck && pending) plugin.retryQueue.acknowledge("FileRenameAck", data.path)
 }
 
 // 收到 FileUploadAck，将 pending hash 转移到正式 hashManager 并更新 lastFileSyncTime
@@ -1884,14 +1894,16 @@ export const receiveFileUploadAck = function (data: { lastTime?: number; path?: 
 // 收到 FileDeleteAck，仅当路径仍在 pending set 中时才从 hashManager 移除
 // Receive FileDeleteAck; only remove from hashManager if path is still pending
 export const receiveFileDeleteAck = function (data: { lastTime?: number; path?: string }, plugin: FastSync) {
+  const retryAck = plugin.retryQueue?.matchesAck("FileDeleteAck", data.path) ?? false
   if (data.path && plugin.pendingFileDeleteAcks.has(data.path)) {
     plugin.fileHashManager.removeFileHash(data.path)
     plugin.pendingFileDeleteAcks.delete(data.path)
   }
-  advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
+  if (!retryAck) advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
   if (data.path) {
     plugin.concurrencyLimiter.releaseSlot(data.path)
   }
+  if (retryAck) plugin.retryQueue.acknowledge("FileDeleteAck", data.path)
 }
 
 /**

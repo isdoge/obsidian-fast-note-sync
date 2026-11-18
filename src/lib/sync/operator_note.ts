@@ -211,7 +211,7 @@ export const noteDelete = async function (file: TAbstractFile, plugin: FastSync,
         pathHash: hashContent(file.path),
       }
       if (!await plugin.concurrencyLimiter.waitForSlot(file.path)) return
-      void plugin.websocket.SendMessage("NoteDelete", data, undefined, () => {
+      await plugin.websocket.SendMessage("NoteDelete", data, undefined, () => {
         // 消息真正写入 TCP 缓冲区后加入 pending set，等待 NoteDeleteAck 再删 hash
         // Add to pending set only after message is actually buffered; remove hash only on NoteDeleteAck
         plugin.pendingNoteDeleteAcks.add(file.path)
@@ -228,13 +228,14 @@ export const noteDelete = async function (file: TAbstractFile, plugin: FastSync,
  * 按路径字符串发送笔记删除消息（用于无法获取 TFile 对象的场景，如 rename 后旧路径已不存在）
  * Send note delete message by path string (for scenarios where TFile object is unavailable, e.g., old path after rename)
  */
-export const noteDeleteByPath = async function (filePath: string, plugin: FastSync) {
+export const noteDeleteByPath = async function (filePath: string, plugin: FastSync, retryGuard?: () => boolean) {
   if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
   if (!filePath.endsWith(".md")) return
   if (isPathExcluded(filePath, plugin)) return
   if (plugin.lastSyncPathDeleted.has(filePath)) return
 
   await plugin.lockManager.withLock(filePath, async () => {
+    if (retryGuard && !retryGuard()) return
     // 清理可能存在的待确认上传记录，避免 pending map 内存泄漏
     // Clean up any pending note modify record to avoid memory leak
     plugin.pendingNoteModifies.delete(filePath)
@@ -242,11 +243,12 @@ export const noteDeleteByPath = async function (filePath: string, plugin: FastSy
     plugin.addIgnoredFile(filePath)
     try {
       if (!await plugin.concurrencyLimiter.waitForSlot(filePath)) return
-      void plugin.websocket.SendMessage("NoteDelete", {
+      if (retryGuard && !retryGuard()) { plugin.concurrencyLimiter.releaseSlot(filePath); return }
+      await plugin.websocket.SendMessage("NoteDelete", {
         vault: plugin.settings.vault,
         path: filePath,
         pathHash: hashContent(filePath),
-      }, undefined, () => {
+      }, () => retryGuard ? !retryGuard() : false, () => {
         // 消息真正写入 TCP 缓冲区后加入 pending set，等待 NoteDeleteAck 再删 hash
         // Add to pending set only after message is actually buffered; remove hash only on NoteDeleteAck
         plugin.pendingNoteDeleteAcks.add(filePath)
@@ -261,7 +263,7 @@ export const noteDeleteByPath = async function (filePath: string, plugin: FastSy
 /**
  * 笔记重命名事件处理
  */
-export const noteRename = async function (file: TAbstractFile, oldfile: string, plugin: FastSync, eventEnter: boolean = false) {
+export const noteRename = async function (file: TAbstractFile, oldfile: string, plugin: FastSync, eventEnter: boolean = false, retryGuard?: () => boolean, retryBaselineHash?: string) {
   if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
   if (!(file instanceof TFile)) return
   if (!file.path.endsWith(".md")) return
@@ -297,9 +299,10 @@ export const noteRename = async function (file: TAbstractFile, oldfile: string, 
 
   // 重命名涉及两个路径，我们锁定新路径，旧路径由调用方或原子性保证
   await plugin.lockManager.withLock(file.path, async () => {
+    if (retryGuard && !retryGuard()) return
     plugin.addIgnoredFile(file.path)
     try {
-      let contentHash = plugin.fileHashManager.getPathHash(oldfile)
+      let contentHash = retryBaselineHash || plugin.fileHashManager.getPathHash(oldfile)
       if (contentHash == null) {
         const content: string = await plugin.app.vault.read(file)
         contentHash = await hashContentAsync(content)
@@ -313,11 +316,13 @@ export const noteRename = async function (file: TAbstractFile, oldfile: string, 
         oldPathHash: hashContent(oldfile),
       }
 
+      if (retryGuard && !retryGuard()) return
       // 将重命名信息存入 Map（key 为 newPath），等待服务端 NoteRenameAck 按 path 精确匹配后再更新 hashManager
       // Store rename info in Map (keyed by newPath), update hashManager only after server NoteRenameAck matches by path
       plugin.pendingNoteRenames.set(file.path, { oldPath: oldfile, newPath: file.path, contentHash })
       if (!await plugin.concurrencyLimiter.waitForSlot(file.path, true)) return
-      void plugin.websocket.SendMessage("NoteRename", data)
+      if (retryGuard && !retryGuard()) { plugin.concurrencyLimiter.releaseSlot(file.path); return }
+      await plugin.websocket.SendMessage("NoteRename", data, () => retryGuard ? !retryGuard() : false)
       dump(`Note rename send`, data.path, data.pathHash)
     } finally {
       plugin.removeIgnoredFile(file.path)
@@ -920,6 +925,8 @@ export const receiveNoteModifyAck = function (data: { lastTime?: number; path?: 
 // 收到 NoteRenameAck，按 data.path 精确匹配待确认条目并更新 hashManager；老服务端不下发 path 时回退 FIFO
 // Receive NoteRenameAck, match pending entry precisely by data.path and update hashManager; falls back to FIFO when legacy server omits path
 export const receiveNoteRenameAck = function (data: { lastTime?: number; path?: string }, plugin: FastSync) {
+  if (plugin.retryQueue && !data.path) return
+  const retryAck = plugin.retryQueue?.matchesAck("NoteRenameAck", data.path) ?? false
   let pending: { oldPath: string; newPath: string; contentHash: string } | undefined
   if (data.path) {
     pending = plugin.pendingNoteRenames.get(data.path)
@@ -939,13 +946,15 @@ export const receiveNoteRenameAck = function (data: { lastTime?: number; path?: 
     const file = plugin.app.vault.getFileByPath(normalizePath(pending.newPath))
     plugin.fileHashManager.setFileHash(pending.newPath, pending.contentHash, file?.stat.mtime || 0, file?.stat.size || 0)
   }
-  advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
+  if (!retryAck) advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
   if (pending) plugin.concurrencyLimiter.releaseSlot(pending.newPath)
+  if (retryAck && pending) plugin.retryQueue.acknowledge("NoteRenameAck", data.path)
 }
 
 // 收到 NoteDeleteAck，仅当路径仍在 pending set 中时才从 hashManager 移除
 // Receive NoteDeleteAck; only remove from hashManager if path is still pending
 export const receiveNoteDeleteAck = function (data: { lastTime?: number; path?: string }, plugin: FastSync) {
+  const retryAck = plugin.retryQueue?.matchesAck("NoteDeleteAck", data.path) ?? false
   if (data.path && plugin.pendingNoteDeleteAcks.has(data.path)) {
     plugin.fileHashManager.removeFileHash(data.path)
     plugin.pendingNoteDeleteAcks.delete(data.path)
@@ -955,5 +964,6 @@ export const receiveNoteDeleteAck = function (data: { lastTime?: number; path?: 
   if (data.path) {
     plugin.concurrencyLimiter.releaseSlot(data.path)
   }
-  advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
+  if (!retryAck) advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
+  if (retryAck) plugin.retryQueue.acknowledge("NoteDeleteAck", data.path)
 }

@@ -57,8 +57,10 @@ export const folderDelete = async function (folder: TFolder, plugin: FastSync, e
                 path: folder.path,
                 pathHash: hashContent(folder.path),
             }
-            void plugin.websocket.SendMessage("FolderDelete", data, undefined, () => {
-                plugin.folderSnapshotManager.removeFolder(folder.path)
+            const queued = plugin.retryQueue?.canSend("FolderDelete", data) ?? false
+            if (queued && !await plugin.concurrencyLimiter.waitForSlot(folder.path)) return
+            await plugin.websocket.SendMessage("FolderDelete", data, undefined, () => {
+                if (!queued) plugin.folderSnapshotManager.removeFolder(folder.path)
             })
             dump(`Folder delete send`, folder.path)
         } finally {
@@ -71,12 +73,13 @@ export const folderDelete = async function (folder: TFolder, plugin: FastSync, e
  * 按路径字符串发送文件夹删除消息（用于无法获取 TFolder 对象的场景，如 rename 后旧路径已不存在）
  * Send folder delete message by path string (for scenarios where TFolder object is unavailable, e.g., old path after rename)
  */
-export const folderDeleteByPath = async function (folderPath: string, plugin: FastSync) {
+export const folderDeleteByPath = async function (folderPath: string, plugin: FastSync, retryGuard?: () => boolean) {
     if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
     if (isFolderSyncPathExcluded(folderPath, plugin)) return
     if (plugin.lastSyncPathDeleted.has(folderPath)) return
 
     await plugin.lockManager.withLock(folderPath, async () => {
+        if (retryGuard && !retryGuard()) return
         plugin.addIgnoredFile(folderPath)
         try {
             const data = {
@@ -84,8 +87,11 @@ export const folderDeleteByPath = async function (folderPath: string, plugin: Fa
                 path: folderPath,
                 pathHash: hashContent(folderPath),
             }
-            void plugin.websocket.SendMessage("FolderDelete", data, undefined, () => {
-                plugin.folderSnapshotManager.removeFolder(folderPath)
+            const queued = plugin.retryQueue?.canSend("FolderDelete", data) ?? false
+            if (queued && !await plugin.concurrencyLimiter.waitForSlot(folderPath)) return
+            if (retryGuard && !retryGuard()) { plugin.concurrencyLimiter.releaseSlot(folderPath); return }
+            await plugin.websocket.SendMessage("FolderDelete", data, () => retryGuard ? !retryGuard() : false, () => {
+                if (!queued) plugin.folderSnapshotManager.removeFolder(folderPath)
             })
             dump('Folder delete by path send', folderPath)
         } finally {
@@ -97,7 +103,7 @@ export const folderDeleteByPath = async function (folderPath: string, plugin: Fa
 /**
  * 文件夹重命名事件处理
  */
-export const folderRename = async function (folder: TFolder, oldPath: string, plugin: FastSync, eventEnter: boolean = false) {
+export const folderRename = async function (folder: TFolder, oldPath: string, plugin: FastSync, eventEnter: boolean = false, retryGuard?: () => boolean) {
     if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
     if (eventEnter && plugin.isIgnoredFile(folder.path)) return
     const newExcluded = isFolderSyncPathExcluded(folder.path, plugin)
@@ -130,6 +136,7 @@ export const folderRename = async function (folder: TFolder, oldPath: string, pl
     }
 
     await plugin.lockManager.withLock(folder.path, async () => {
+        if (retryGuard && !retryGuard()) return
         plugin.addIgnoredFile(folder.path)
         try {
             const now = Date.now();
@@ -140,9 +147,14 @@ export const folderRename = async function (folder: TFolder, oldPath: string, pl
                 oldPath: oldPath,
                 oldPathHash: hashContent(oldPath),
             }
-            void plugin.websocket.SendMessage("FolderRename", data, undefined, () => {
-                plugin.folderSnapshotManager.removeFolder(oldPath)
-                plugin.folderSnapshotManager.setFolderMtime(folder.path, now)
+            const queued = plugin.retryQueue?.canSend("FolderRename", data) ?? false
+            if (queued && !await plugin.concurrencyLimiter.waitForSlot(folder.path)) return
+            if (retryGuard && !retryGuard()) { plugin.concurrencyLimiter.releaseSlot(folder.path); return }
+            await plugin.websocket.SendMessage("FolderRename", data, () => retryGuard ? !retryGuard() : false, () => {
+                if (!queued) {
+                    plugin.folderSnapshotManager.removeFolder(oldPath)
+                    plugin.folderSnapshotManager.setFolderMtime(folder.path, now)
+                }
             })
             dump(`Folder rename send`, data.path, data.pathHash)
         } finally {
@@ -404,4 +416,18 @@ export const receiveFolderSyncEnd = async function (data: unknown, plugin: FastS
     // End arrives before the details: stash lastTime; settleSyncTimes persists it once the type finished without failures
     plugin.syncState.pendingSyncEndTime.set("lastFolderSyncTime", syncData.lastTime)
     plugin.syncTypeCompleteCount++
+}
+
+/** Folder mutations have path-bearing ACKs too; retry ownership never advances scan time. */
+export const receiveFolderRetryAck = function (action: "FolderDeleteAck" | "FolderRenameAck", data: { path?: string }, plugin: FastSync) {
+    const queue = plugin.retryQueue;
+    if (!queue?.matchesAck(action, data.path)) return;
+    const entry = queue.entries.find(e => e.objectType === "folder" && e.path === data.path);
+    if (!entry) return;
+    if (action === "FolderDeleteAck") plugin.folderSnapshotManager.removeFolder(entry.path);
+    else {
+        plugin.folderSnapshotManager.removeFolder(entry.oldPath!);
+        plugin.folderSnapshotManager.setFolderMtime(entry.path, Date.now());
+    }
+    queue.acknowledge(action, data.path);
 }

@@ -4,7 +4,7 @@ import { noteModify, noteDelete, noteRename, noteDeleteByPath } from "../sync/op
 import { fileModify, fileDelete, fileRename, fileDeleteByPath } from "../sync/operator_file";
 import { folderModify, folderDelete, folderRename } from "../sync/operator_folder";
 import { NoteHistoryModal } from "../../views/note-history/history-modal";
-import { dump, isPathInConfigSyncDirs } from "./helpers";
+import { dump, isPathInConfigSyncDirs, isPathExcluded, isFolderSyncPathExcluded } from "./helpers";
 import { ShareModal } from "../../views/share-modal";
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
@@ -15,6 +15,7 @@ export class EventManager {
   private rawEventTimers: Map<string, number> = new Map()
   //保存待处理的重命名文件的路径，用于跳过同时触发的 modify 事件
   private pendingRenamePaths: Set<string> = new Set()
+  private deferredRenameModifies: Set<string> = new Set()
   private blurTimer: number | null = null
   private resumeTimer: number | null = null
   // 注册/认证/抢锁重试定时器，stop()（含插件卸载）时统一清理
@@ -47,7 +48,7 @@ export class EventManager {
     const { app } = this.plugin
 
     // --- Vault Events ---
-    this.plugin.registerEvent(app.vault.on("create", this.watchModify))
+    this.plugin.registerEvent(app.vault.on("create", this.watchCreate))
     this.plugin.registerEvent(app.vault.on("modify", this.watchModify))
     this.plugin.registerEvent(app.vault.on("delete", this.watchDelete))
     this.plugin.registerEvent(app.vault.on("rename", this.watchRename))
@@ -86,6 +87,7 @@ export class EventManager {
     this.retryTimers.forEach((timer) => window.clearTimeout(timer))
     this.retryTimers.clear()
     this.pendingRenamePaths.clear()
+    this.deferredRenameModifies.clear()
     if (this.blurTimer) {
       window.clearTimeout(this.blurTimer)
       this.blurTimer = null
@@ -201,6 +203,23 @@ export class EventManager {
     this.retryTimers.add(timer)
   }
 
+  private watchCreate = (file: TAbstractFile) => {
+    // Only a locally observed create cancels a tombstone. Remote landing is protected by
+    // ignoredFiles while its async create/modify event is being delivered.
+    if (this.plugin.retryQueue && !this.plugin.isIgnoredFile(file.path)) {
+      this.plugin.retryQueue.onLocalCreate(file.path)
+    }
+    this.watchModify(file)
+  }
+
+  public resumeQueuedRename(path: string) {
+    this.scheduleRetry(() => {
+      if (!this.deferredRenameModifies.delete(path)) return
+      const file = this.plugin.app.vault.getAbstractFileByPath(path)
+      if (file) this.watchModify(file)
+    }, 0)
+  }
+
   private watchModify = (file: TAbstractFile, ctx?: unknown) => {
     // 检查 WebSocket 认证状态
     if (!this.plugin.websocket || !this.plugin.websocket.isAuth) {
@@ -210,6 +229,10 @@ export class EventManager {
     if (this.plugin.settings.manualSyncEnabled || this.plugin.settings.readonlySyncEnabled) return
 
     // 重命名会同时触发 rename 和 modify 事件，但只需要发送 rename 消息即可完成处理，因此跳过 modify 事件
+    if (this.plugin.retryQueue?.entries.some(e => e.operation === "rename" && e.path === file.path && e.attempts === 0)) {
+      this.deferredRenameModifies.add(file.path)
+      return
+    }
     if (this.pendingRenamePaths.has(file.path)) {
       dump(`Modify skipped due to pending rename: ${file.path}`)
       return
@@ -229,6 +252,11 @@ export class EventManager {
   }
 
   private watchDelete = (file: TAbstractFile, ctx?: unknown) => {
+    if (this.plugin.retryQueue) {
+      const kind = file instanceof TFolder ? "folder" : file.path.endsWith(".md") ? "note" : "file"
+      this.plugin.retryQueue.observe(kind, "delete", file.path)
+      return
+    }
     // 检查 WebSocket 认证状态
     if (!this.plugin.websocket || !this.plugin.websocket.isAuth) {
       this.retryWhenAuthed("delete", file, this.watchDelete, 0)
@@ -250,6 +278,22 @@ export class EventManager {
   }
 
   private watchRename = (file: TAbstractFile, oldFile: string, ctx?: unknown) => {
+    if (this.plugin.retryQueue) {
+      this.clearTimer(oldFile)
+      const kind = file instanceof TFolder ? "folder" : file.path.endsWith(".md") ? "note" : "file"
+      const oldKind = file instanceof TFolder ? "folder" : oldFile.endsWith(".md") ? "note" : "file"
+      const extensionChanged = file instanceof TFile && file.extension !== (oldFile.match(/\.([^.]+)$/)?.[1] ?? "")
+      if (kind !== oldKind || extensionChanged) {
+        this.plugin.retryQueue.observe(oldKind, "delete", oldFile)
+        this.watchModify(file)
+      } else {
+        this.plugin.retryQueue.observe(kind, "rename", file.path, oldFile)
+        // A move into the sync scope is a create, and still uses the existing modify path.
+        const oldExcluded = kind === "folder" ? isFolderSyncPathExcluded(oldFile, this.plugin) : isPathExcluded(oldFile, this.plugin)
+        if (oldExcluded) this.watchModify(file)
+      }
+      return
+    }
     // 检查 WebSocket 认证状态
     if (!this.plugin.websocket || !this.plugin.websocket.isAuth) {
       this.retryWhenAuthed("rename", file, (f) => this.watchRename(f, oldFile), 0)

@@ -223,6 +223,8 @@ async function initManagers(plugin) {
   assert.equal(files.get(SYNC_STATE_MIRROR).includes(p1.settings.apiToken), false, "镜像文件不得包含明文 apiToken");
   assert.equal(helpers.configIsPathExcluded(SYNC_STATE_MIRROR, p1), true, "syncState.json 必须被配置同步排除（含白名单开启时）");
 
+  assert.equal(helpers.configIsPathExcluded(`${MIRROR_DIR}/retryQueue.json`, p1), true, "retryQueue.json 必须被配置同步排除（含白名单开启时）");
+
   // 模拟 iOS 清空 localStorage
   ls.clear();
   const p2 = makePlugin(ls, files);
