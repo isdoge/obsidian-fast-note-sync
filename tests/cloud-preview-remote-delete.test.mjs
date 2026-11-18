@@ -33,7 +33,7 @@ function fixture(restricted) {
       fileManager: { trashFile: async f => deleted.push(f.path) } },
     lockManager: { withLock: async (_k, fn) => fn() },
     addIgnoredFile: noop, removeIgnoredFile: noop, lastSyncPathDeleted: new Set(), lastSyncMtime: new Map(),
-    fileHashManager: { removeFileHash: noop, getPathHash: () => null }, pendingUploadHashes: new Map(), concurrencyLimiter: { releaseSlot: noop },
+    fileHashManager: { removeFileHash: noop, getPathHash: () => 'synced', getValidHash: () => 'synced' }, pendingUploadHashes: new Map(), concurrencyLimiter: { releaseSlot: noop },
     localStorageManager: { getMetadata: k => k === 'isInitSync' ? true : 0, setMetadata: noop },
     fileSyncTasks: { failed: 0 }, recordSyncCompleted: (...a) => completed.push(a),
     syncState: { pendingFilePushPageIndex: new Map() },

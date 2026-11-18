@@ -1,4 +1,5 @@
 import { blockAliasedRemoteMutation } from "./remote_path_guard";
+import { firstKeepWithoutBaseline } from "./remote_delete_guard";
 import { TFile, TAbstractFile, normalizePath, Platform } from "obsidian";
 
 import { ReceiveFileSyncUpdateMessage, FileUploadMessage, FileSyncChunkDownloadMessage, FileDownloadSession, ReceiveMtimeMessage, ReceivePathMessage, SyncEndData } from "../utils/types";
@@ -1094,6 +1095,17 @@ export const receiveFileSyncDelete = async function (data: ReceivePathMessage, p
           let localHash = plugin.fileHashManager.getValidHash(normalizedPath, file.stat.mtime, file.stat.size)
           if (localHash === null && !isLargeBinarySyncRisk(file.stat.size, plugin)) localHash = await hashFileAsync(plugin.app, normalizedPath)
           changed = localHash !== baseHash
+        }
+        // 无同步基线：服务端从未确认过这份内容，不能按远端删除处理。本连接内首次：保留并重新上传；
+        // 已重传过：只保留（haierkeys/fast-note-sync-service#514 #391）
+        // No sync baseline: the server never confirmed this content, so a remote delete must not remove
+        // it. First time on this connection: keep and upload again; already re-uploaded: keep only
+        if (!changed && baseHash === null) {
+          if (!firstKeepWithoutBaseline(plugin, normalizedPath)) {
+            SyncLogManager.getInstance().addLog('receive', 'FileDeleteConflict', `本地文件尚未同步且已重新上传，等待服务端确认，保留本地: ${normalizedPath}`, 'cancelled', data.path)
+            return
+          }
+          changed = true
         }
         if (changed) {
           SyncLogManager.getInstance().addLog('receive', 'FileDeleteConflict', `本地存在未同步的改动，保留本地并重新上传: ${normalizedPath}`, 'cancelled', data.path)

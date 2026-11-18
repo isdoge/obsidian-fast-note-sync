@@ -31,6 +31,7 @@ function load(name) {
     require(id) {
       if (id === "obsidian") return { TFile, TFolder, normalizePath, Platform: { isMobile: false } };
       if (id === "./remote_path_guard") return load("remote_path_guard");
+      if (id === "./remote_delete_guard") return load("remote_delete_guard");
       if (id === "./sync_log_manager") return { SyncLogManager: logger };
       if (id === "../utils/helpers") return helpers;
       if (id === "../storage/file_cloud_preview") return { FileCloudPreview: { isRestrictedType: () => false } };
@@ -86,7 +87,7 @@ async function check(kind, operation, mode, alias = "notes/A\u00a0B.md") {
     addIgnoredFile: p => ignored.push(p), removeIgnoredFile() {},
     lastSyncPathDeleted: new Set(), lastSyncPathRenamed: new Set(), lastSyncMtime: new Map(),
     pendingNoteModifies: pending, fileDownloadSessions: new Map(),
-    fileHashManager: { removeFileHash: p => removedHashes.push(p), setFileHash() {}, getPathHash: () => null },
+    fileHashManager: { removeFileHash: p => removedHashes.push(p), setFileHash() {}, getPathHash: () => "synced", getValidHash: () => "synced" },
     pendingUploadHashes: new Map(),
     folderSnapshotManager: { removeFolder() {}, setFolderMtime() {} },
     localStorageManager: { getMetadata: () => 0, setMetadata() {}, savePending() {} },
