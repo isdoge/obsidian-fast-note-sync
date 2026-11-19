@@ -81,6 +81,11 @@ const MAX_DOWNLOAD_BUFFER_BYTES = 20 * 1024 * 1024
 // 上传中的文件追踪，用于删除时取消上传
 const activeUploadsMap = new Map<string, { cancelled: boolean; checkpointKey?: string }>()
 
+/** 该路径是否仍在分片上传中（只读，供并发名额清扫把它判为忙）。 / Read-only busy check for the slot sweep. */
+export function isAttachmentUploadActive(path: string): boolean {
+  return activeUploadsMap.has(path)
+}
+
 // 全局中止信号，用于插件卸载时
 export let isPluginUnloading = false;
 
@@ -936,6 +941,10 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
           return;
         }
 
+        // 每真正发出一个分片就续期，避免大文件上传被名额清扫误判为无人归还
+        // Refresh on every chunk actually sent so a long upload is not swept as abandoned
+        plugin.concurrencyLimiter.touch(data.path);
+
         // 如果被取消,立即退出循环并释放槽位
         if (uploadState.cancelled) {
           // Deletion/recovery settled the old task. A delayed send callback may
@@ -1479,6 +1488,9 @@ export const handleFileChunkDownload = async function (buf: ArrayBuffer | Blob, 
     return
   }
   session.lastActivityAt = Date.now()
+  // 每收到一个分片就为下载名额续期（下载会话本身也由 isBusy 排除，双保险）
+  // Refresh the download slot on every received chunk (download sessions are also kept busy)
+  plugin.concurrencyLimiter.touch(session.initialSlotKey || `download_${session.path}`)
 
   try {
     if (chunkIndex >= session.totalChunks) {

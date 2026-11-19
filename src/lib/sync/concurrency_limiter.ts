@@ -11,7 +11,15 @@ export class ConcurrencyLimiter {
     private activeKeys: Set<string> = new Set();
     // 槽位归属固定在申请时，空闲编辑不计入后来开始的同步。 / Slot ownership survives a later sync start.
     private slotContexts = new Map<string, string | null>();
-    
+    // 每个活跃键最近一次"有动静"的时间，供 sweepStale 找出长期无人归还的名额。
+    // Last activity time of each active key; sweepStale uses it to find slots nobody returns.
+    private keyActivityAt = new Map<string, number>();
+    // 已清扫、但没有路径的 FIFO 确认可能迟到的键：后续无路径确认先消耗这里，
+    // 避免错放另一个仍在等待确认的 FIFO 名额。
+    // Keys swept while a pathless FIFO ack may still be late: later pathless acks consume
+    // these first so they never release another waiting FIFO key's slot.
+    private sweptFifoKeys: string[] = [];
+
     // 针对 FIFO 类型的 ACK（如重命名消息），记录其对应的 Key 顺序
     private fifoKeys: string[] = [];
 
@@ -37,6 +45,7 @@ export class ConcurrencyLimiter {
         if (this.activeKeys.size < this.plugin.settings.maxConcurrentUploads) {
             this.activeKeys.add(key);
             this.slotContexts.set(key, context);
+            this.keyActivityAt.set(key, Date.now());
             if (isFifo) this.fifoKeys.push(key);
             dump(`Concurrency: Slot acquired immediately for ${key} (Priority: ${priority}). Active: ${this.activeKeys.size}`);
             return true;
@@ -50,6 +59,7 @@ export class ConcurrencyLimiter {
                 resolve: () => {
                     this.activeKeys.add(key);
                     this.slotContexts.set(key, context);
+                    this.keyActivityAt.set(key, Date.now());
                     if (isFifo) this.fifoKeys.push(key);
                     dump(`Concurrency: Slot acquired from queue for ${key}. Active: ${this.activeKeys.size}`);
                     resolve(true);
@@ -67,6 +77,48 @@ export class ConcurrencyLimiter {
     }
 
     /**
+     * 为仍在干活的任务续期，避免刚发过数据的名额被 sweepStale 当成无人归还。
+     * Refresh an in-progress key so a slot that just did work is not swept as abandoned.
+     */
+    public touch(key: string, now: number = Date.now()): void {
+        if (!this.plugin.settings.concurrencyControlEnabled) {
+            return;
+        }
+        if (this.activeKeys.has(key)) {
+            this.keyActivityAt.set(key, now);
+        }
+    }
+
+    /**
+     * 清扫超过 maxIdleMs 没有动静、且 isBusy 判定为不忙的活跃名额。
+     * 只归还名额，不碰任何同步进度记账；迟到的确认对已不存在的键本就是空操作。
+     * Sweep active slots idle longer than maxIdleMs unless isBusy says otherwise. Only slots
+     * are returned; sync progress accounting is untouched, and late acks for absent keys no-op.
+     */
+    public sweepStale(maxIdleMs: number, isBusy?: (key: string) => boolean, now: number = Date.now()): string[] {
+        if (!this.plugin.settings.concurrencyControlEnabled) {
+            return [];
+        }
+        const stale: string[] = [];
+        for (const key of this.activeKeys) {
+            const lastActive = this.keyActivityAt.get(key) ?? now;
+            if (now - lastActive <= maxIdleMs) continue;
+            if (isBusy?.(key)) continue;
+            stale.push(key);
+        }
+        for (const key of stale) {
+            const idleMs = now - (this.keyActivityAt.get(key) ?? now);
+            const wasFifo = this.fifoKeys.includes(key);
+            dump(`Concurrency: Sweeping slot ${key} after ${idleMs}ms without activity`);
+            this.releaseSlot(key);
+            // releaseSlot 会把它移出 fifoKeys；保留一条已清扫记录，供迟到的无路径确认消耗
+            // releaseSlot removed it from fifoKeys; keep a swept marker for a late pathless ack
+            if (wasFifo) this.sweptFifoKeys.push(key);
+        }
+        return stale;
+    }
+
+    /**
      * 释放指定任务的并发槽位
      * @param key 任务标识
      */
@@ -75,9 +127,17 @@ export class ConcurrencyLimiter {
             return;
         }
 
+        // 该键若已被清扫、其迟到确认此刻才到，消耗对应的清扫记录
+        // If the key was swept and its ack only arrives now, consume the swept marker
+        const sweptIndex = this.sweptFifoKeys.indexOf(key);
+        if (sweptIndex !== -1) {
+            this.sweptFifoKeys.splice(sweptIndex, 1);
+        }
+
         if (this.activeKeys.has(key)) {
             this.activeKeys.delete(key);
             this.slotContexts.delete(key);
+            this.keyActivityAt.delete(key);
             // 同时从 FIFO 队列中移除该 key (如果存在)
             const fifoIndex = this.fifoKeys.indexOf(key);
             if (fifoIndex !== -1) {
@@ -99,10 +159,19 @@ export class ConcurrencyLimiter {
             return;
         }
 
+        // 已被清扫的 FIFO 键迟到的确认：没有名额可放，也不能顺延到别的键
+        // A late ack for an already-swept FIFO key: no slot to return and no shift onto another key
+        if (this.sweptFifoKeys.length > 0) {
+            const sweptKey = this.sweptFifoKeys.shift();
+            dump(`Concurrency: FIFO ack matched already-swept key ${sweptKey}; no slot released.`);
+            return;
+        }
+
         const key = this.fifoKeys.shift();
         if (key) {
             this.activeKeys.delete(key);
             this.slotContexts.delete(key);
+            this.keyActivityAt.delete(key);
             dump(`Concurrency: FIFO slot released for ${key}. Remaining active: ${this.activeKeys.size}`);
             this.processQueue();
         }
@@ -139,6 +208,8 @@ export class ConcurrencyLimiter {
         }
         this.activeKeys.clear();
         this.slotContexts.clear();
+        this.keyActivityAt.clear();
+        this.sweptFifoKeys = [];
         this.fifoKeys = [];
     }
 
