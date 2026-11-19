@@ -54,6 +54,8 @@ function makePlugin({ max = 1 } = {}) {
       getPathHash: p => baselines.get(p) ?? null,
       getValidHash: () => null,
       setFileHash: (p, h) => baselines.set(p, h),
+      setFileHashes: noop,
+      removeFileHash: noop,
     },
     lastSyncMtime: new Map(),
     pendingUploadHashes: new Map(),
@@ -120,4 +122,28 @@ console.log('PASS: queued checks cannot be skipped by ambiguous or legacy path-o
   await ops.receiveFileUploadAck({ path: file.path }, plugin);
   assert.equal(baselines.get(file.path), 'B', 'HTTP metadata confirms recovered B without requiring a new ACK field');
   assert.equal(plugin.pendingUploadHashes.has(file.path), false);
+}
+
+// Same content confirmed by a paged upload while the check waits must skip the redundant check.
+{
+  const { plugin, sent, baselines, files } = makePlugin();
+  const file = new TFile('confirmed-while-queued.bin'); files.set(file.path, file);
+  state.hash = 'H'; state.remoteHash = 'H';
+  await plugin.concurrencyLimiter.waitForSlot('busy');
+  const modify = ops.fileModify(file, plugin, true);
+  for (let i = 0; i < 20 && plugin.concurrencyLimiter.queue.length === 0; i++) await tick();
+  assert.equal(plugin.concurrencyLimiter.queue.length, 1, 'check queues behind the busy slot');
+  void ops.receiveFileUpload({ path: file.path, pathHash: `ph:${file.path}`, sessionId: 'S1', chunkSize: 1024 * 1024, pageIndex: 1 }, plugin);
+  assert.equal(plugin.concurrencyLimiter.queue.length, 2, 'paged upload queues on the same path');
+  plugin.concurrencyLimiter.releaseSlot('busy');
+  const queuedTimers = timers.length;
+  for (let i = 0; i < 50 && timers.length === queuedTimers; i++) await tick();
+  assert.equal(timers.length, queuedTimers + 1, 'paged upload sent every chunk and armed its ack timer');
+  await tick(); await tick();
+  await ops.receiveFileUploadAck({ path: file.path, lastTime: 1 }, plugin);
+  await modify;
+  assert.equal(sent.filter(s => s.action === 'FileUploadCheck').length, 0, 'no redundant check for content already confirmed while queued');
+  assert.equal(baselines.get(file.path), 'H');
+  assert.equal(plugin.pendingUploadHashes.has(file.path), false);
+  assert.equal(plugin.concurrencyLimiter.activeKeys.size, 0, 'queued check returns its slot when it skips');
 }

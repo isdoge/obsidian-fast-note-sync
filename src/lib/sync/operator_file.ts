@@ -495,6 +495,23 @@ export const fileModify = async function (file: TAbstractFile, plugin: FastSync,
       plugin.pendingUploadHashes.set(file.path, contentHash)
       plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes)
       if (!await plugin.concurrencyLimiter.waitForSlot(file.path)) return
+      // 排队期间完全相同的 contentHash 可能已被分页上传无歧义地确认并落入基线：
+      // 此时基线已等于本题内容、无 pending、也没有超时恢复留下的歧义标记，再发 FileUploadCheck 纯属冗余。
+      // 3.7.0 对无需更新的检查不回包，冗余检查会让名额占满 60s 后超时重入（1000 附件测试组合 2 的积压根因）。
+      // 三个条件任一不成立都必须照常发送：排队的是新编辑 B（pending 为 B）、ACK 无法证明内容（无 sent 记录）、
+      // 或发生过 60s 超时恢复（ambiguous 标记）。
+      // While queued, the exact same content may be unambiguously confirmed by a paged upload and
+      // land in the baseline. Then this check is pure redundancy: 3.7.0 does not answer checks that
+      // need no update, and the slot sits idle for the full 60s before the timeout re-enters.
+      // Any of the three conditions failing means we must still send (queued newer edit, ACK that
+      // cannot prove content, or an ambiguous post-recovery ACK).
+      if (!ambiguousUploadAcks.has(file.path) &&
+        !plugin.pendingUploadHashes.has(file.path) &&
+        plugin.fileHashManager.getPathHash(file.path) === contentHash) {
+        dump(`File modify check skipped (exact content already confirmed while queued): ${file.path}`, contentHash)
+        if (!activeUploadsMap.has(file.path)) plugin.concurrencyLimiter.releaseSlot(file.path)
+        return
+      }
       // Path-only ACKs cannot prove which content was confirmed. Always send this check.
       plugin.pendingUploadHashes.set(file.path, contentHash)
       plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes)
