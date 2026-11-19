@@ -537,6 +537,9 @@ export class WebSocketManager {
         } else if (data.data && typeof data.data.path === "string") {
           const path = data.data.path;
           this.plugin.concurrencyLimiter.releaseSlot(path);
+          // 下载占用的是 download_<路径> 名额，出错回应只带路径时也要一并放掉
+          // Downloads hold a download_<path> slot; release it too when the error only carries the path
+          this.plugin.concurrencyLimiter.releaseSlot("download_" + path);
           this.plugin.fileSyncTasks.completed++;
         }
       }

@@ -235,6 +235,19 @@ function assertSingleFallback(plugin, manager, client, noticeStart, logStart) {
   assert.equal(notices.at(-1), "Service Error: Code=305 Message=参数验证失败 Details=Invalid message format");
 }
 
+// An error reply that only carries a path releases both the uplink slot and the download slot.
+{
+  const releases = [];
+  const { plugin, client } = fixture();
+  plugin.fileSyncTasks = { completed: 0 };
+  plugin.concurrencyLimiter = { clear: noop, releaseSlot: key => releases.push(key) };
+  authenticate(client);
+  client.options.onMessage(client, "FileSyncUpdate", { code: 500, message: "内部错误", data: { path: "attachments/a.png" } });
+  assert.deepEqual(releases, ["attachments/a.png", "download_attachments/a.png"],
+    "a path-only error releases a download_<path> slot as well");
+  assert.equal(plugin.fileSyncTasks.completed, 1, "the failed item is still counted as completed");
+}
+
 // Exercise the real WebSocketClient binary message path, not only the manager's deserialize callback.
 {
   const clientModule = { exports: {} };
