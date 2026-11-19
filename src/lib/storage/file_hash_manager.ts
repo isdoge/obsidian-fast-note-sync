@@ -318,8 +318,10 @@ export class FileHashManager {
   /**
    * 添加或更新单个文件的对齐基准哈希值 (在 Ack 确认或收到推送时调用)
    */
-  setFileHash(path: string, hash: string, mtime: number = 0, size: number = 0): void {
-    this.hashMap.set(path, { hash, mtime, size });
+  setFileHash(path: string, hash: string, mtime: number = 0, size: number = 0, cacheContent = true): void {
+    // A rename confirms the server baseline, not the current local bytes.
+    if (cacheContent) this.hashMap.set(path, { hash, mtime, size });
+    else this.hashMap.delete(path);
     this.syncHashMap.set(path, hash);
     this.scheduleSave();
   }

@@ -184,7 +184,9 @@ console.log('PASS: queue recovery, mtime ACK release/page attribution/context ro
     hashFileAsync: async () => 'hash', sleep: async () => {}, getSafeCtime: () => 1,
     normalizeServerTimestamp: t => t === undefined ? undefined : (t > 0 && t < 1e11 ? t * 1000 : t) });
   const timers = new Map(); let timerId = 0;
-  const fileOps = load('src/lib/sync/operator_file.ts', {}, {
+  const fileOps = load('src/lib/sync/operator_file.ts', {
+    '../api/http_api_service': { HttpApiService: class { async getFileInfo() { return { contentHash: 'hash' }; } } }
+  }, {
     TextEncoder, window: { setTimeout: fn => { timers.set(++timerId, fn); return timerId; },
       clearTimeout: id => timers.delete(id) }
   });
@@ -216,7 +218,7 @@ console.log('PASS: queue recovery, mtime ACK release/page attribution/context ro
   await fileOps.receiveFileUpload({ path: file.path, pathHash: 'pathhash', sessionId: 'b'.repeat(36) }, p);
   await flush();
   assert.equal(p.concurrencyLimiter.queue.length, 0, 'upload check hands off its slot without deadlocking at capacity');
-  fileOps.receiveFileUploadAck({ path: file.path, pathHash: 'pathhash' }, p);
+  await fileOps.receiveFileUploadAck({ path: file.path, pathHash: 'pathhash' }, p);
   assert.deepEqual(completed, [['file', 15]], 'renewal preserves original page attribution');
   assert.equal(timers.size, 0, 'ACK clears watchdog');
   assert.equal(p.concurrencyLimiter.activeKeys.size, 0);
@@ -243,7 +245,9 @@ console.log('PASS: queue recovery, mtime ACK release/page attribution/context ro
     hashFileAsync: async () => 'hash', sleep: async () => {}, getSafeCtime: () => 1,
     normalizeServerTimestamp: t => t === undefined ? undefined : (t > 0 && t < 1e11 ? t * 1000 : t) });
   const timers = new Map(); let timerId = 0;
-  const fileOps = load('src/lib/sync/operator_file.ts', {}, {
+  const fileOps = load('src/lib/sync/operator_file.ts', {
+    '../api/http_api_service': { HttpApiService: class { async getFileInfo() { return { contentHash: 'hash' }; } } }
+  }, {
     TextEncoder, window: { setTimeout: fn => { timers.set(++timerId, fn); return timerId; },
       clearTimeout: id => timers.delete(id) }
   });

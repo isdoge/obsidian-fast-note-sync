@@ -925,8 +925,8 @@ export const receiveNoteModifyAck = function (data: { lastTime?: number; path?: 
 // 收到 NoteRenameAck，按 data.path 精确匹配待确认条目并更新 hashManager；老服务端不下发 path 时回退 FIFO
 // Receive NoteRenameAck, match pending entry precisely by data.path and update hashManager; falls back to FIFO when legacy server omits path
 export const receiveNoteRenameAck = function (data: { lastTime?: number; path?: string }, plugin: FastSync) {
-  if (plugin.retryQueue && !data.path) return
-  const retryAck = plugin.retryQueue?.matchesAck("NoteRenameAck", data.path) ?? false
+  const ackPath = data.path || Array.from(plugin.pendingNoteRenames.keys())[0]
+  const retryAck = plugin.retryQueue?.matchesAck("NoteRenameAck", ackPath) ?? false
   let pending: { oldPath: string; newPath: string; contentHash: string } | undefined
   if (data.path) {
     pending = plugin.pendingNoteRenames.get(data.path)
@@ -942,13 +942,12 @@ export const receiveNoteRenameAck = function (data: { lastTime?: number; path?: 
   }
   if (pending) {
     plugin.fileHashManager.removeFileHash(pending.oldPath)
-    // 重命名 Ack 时，内容哈希未变，尝试获取新路径的文件信息
-    const file = plugin.app.vault.getFileByPath(normalizePath(pending.newPath))
-    plugin.fileHashManager.setFileHash(pending.newPath, pending.contentHash, file?.stat.mtime || 0, file?.stat.size || 0)
+    // ACK 只确认服务端基线；本地新路径可能已编辑，必须重新计算缓存。
+    plugin.fileHashManager.setFileHash(pending.newPath, pending.contentHash, 0, 0, false)
   }
   if (!retryAck) advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
   if (pending) plugin.concurrencyLimiter.releaseSlot(pending.newPath)
-  if (retryAck && pending) plugin.retryQueue.acknowledge("NoteRenameAck", data.path)
+  if (retryAck && pending) plugin.retryQueue.acknowledge("NoteRenameAck", ackPath)
 }
 
 // 收到 NoteDeleteAck，仅当路径仍在 pending set 中时才从 hashManager 移除

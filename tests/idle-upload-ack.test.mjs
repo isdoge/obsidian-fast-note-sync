@@ -108,7 +108,7 @@ for (const [action, handler] of [['NoteModifyAck', noteOps.receiveNoteModifyAck]
   await Promise.resolve();
   assert.equal(acquired, true, `${action}: idle ACKs free capacity immediately`);
   await waiting;
-  assert.equal(baselines.length, 5, `${action}: old uploads commit their own baselines`);
+  assert.equal(baselines.length, action === 'FileUploadAck' ? 0 : 5, `${action}: old uploads commit their own baselines`);
   assert.equal(m.deferredMessages.length, 0);
   assert.equal(p.concurrencyLimiter.activeKeys.size, 1);
   // 已取消轮次的确认优先丢弃，不能因槽位匹配而绕过 context 过滤。
@@ -163,6 +163,7 @@ for (const [action, handler, pendingKey] of [
   p.settings = { vault: 'test', concurrencyControlEnabled: true, maxConcurrentUploads: 1 };
   p.concurrencyLimiter = new ConcurrencyLimiter(p);
   await p.concurrencyLimiter.waitForSlot('idle', true);
+  p.retryQueue = { matchesAck: () => false, shouldIgnoreAck: () => false };
   const entry = { oldPath: 'old', newPath: 'idle', contentHash: 'hash' };
   p[pendingKey] = action === 'FileRenameAck' ? [entry] : action === 'NoteRenameAck' ? new Map([['idle', entry]]) : new Set(['idle']);
   const changed = [];

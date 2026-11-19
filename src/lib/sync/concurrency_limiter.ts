@@ -13,6 +13,7 @@ export class ConcurrencyLimiter {
     private slotContexts = new Map<string, string | null>();
     // 每个活跃键最近一次"有动静"的时间，供 sweepStale 找出长期无人归还的名额。
     // Last activity time of each active key; sweepStale uses it to find slots nobody returns.
+    private sending = new Map<string, Set<object>>();
     private keyActivityAt = new Map<string, number>();
 
     // 针对 FIFO 类型的 ACK（如重命名消息），记录其对应的 Key 顺序
@@ -84,6 +85,20 @@ export class ConcurrencyLimiter {
         }
     }
 
+    /** Buffer-drain and final validation are live work, regardless of their duration. */
+    public protectSending(key: string): () => void {
+        const owners = this.sending.get(key) || new Set<object>();
+        const owner = {};
+        owners.add(owner);
+        this.sending.set(key, owners);
+        return () => {
+            owners.delete(owner);
+            if (this.sending.get(key) !== owners) return;
+            if (!owners.size) this.sending.delete(key);
+            this.touch(key);
+        };
+    }
+
     /**
      * 清扫超过 maxIdleMs 没有动静、且 isBusy 判定为不忙的活跃名额。
      * 只归还名额，不碰任何同步进度记账；迟到的确认对已不存在的键本就是空操作。
@@ -98,7 +113,7 @@ export class ConcurrencyLimiter {
         for (const key of this.activeKeys) {
             const lastActive = this.keyActivityAt.get(key) ?? now;
             if (now - lastActive <= maxIdleMs) continue;
-            if (isBusy?.(key)) continue;
+            if (this.sending.has(key) || isBusy?.(key)) continue;
             stale.push(key);
         }
         for (const key of stale) {
@@ -172,6 +187,12 @@ export class ConcurrencyLimiter {
         }
     }
 
+    public cancelQueued(key: string): void {
+        const cancelled = this.queue.filter(item => item.key === key);
+        this.queue = this.queue.filter(item => item.key !== key);
+        for (const item of cancelled) item.cancel();
+    }
+
     /**
      * 清空所有并发状态（通常用于断网或重连）
      */
@@ -186,6 +207,7 @@ export class ConcurrencyLimiter {
         this.activeKeys.clear();
         this.slotContexts.clear();
         this.keyActivityAt.clear();
+        this.sending.clear();
         this.fifoKeys = [];
     }
 

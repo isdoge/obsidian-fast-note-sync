@@ -1,5 +1,5 @@
 import type FastSync from "../../main";
-import { LocalStateFileMirror, computeMirrorDigest, generateUUID, dump, isPathExcluded, isFolderSyncPathExcluded, hashContentAsync, hashFileAsync } from "../utils/helpers";
+import { LocalStateFileMirror, computeMirrorDigest, generateUUID, dump, isPathExcluded, isFolderSyncPathExcluded, hashContentAsync, hashFileAsync, showSyncNotice } from "../utils/helpers";
 import { HttpApiService } from "../api/http_api_service";
 import { SyncLogManager } from "./sync_log_manager";
 import { noteDeleteByPath, noteRename } from "./operator_note";
@@ -8,6 +8,10 @@ import { folderDeleteByPath, folderRename } from "./operator_folder";
 
 export const RETRY_QUEUE_MAX_ENTRIES = 2000;
 export const RETRY_QUEUE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+// pkg/code/common.go: invalid input, invalid credentials/restrictions, disabled access,
+// invalid storage configuration and an occupied rename target need user intervention.
+export const DETERMINISTIC_MUTATION_ERRORS = new Set([305, 306, 307, 308, 309, 310,
+    312, 313, 314, 315, 411, 414, 422, 423, 438, 444]);
 const RETRY_DELAYS = [2000, 5000, 15000, 60000];
 type ObjectType = "note" | "file" | "folder";
 type Operation = "delete" | "rename";
@@ -263,6 +267,43 @@ export class RetryQueue {
                     && (!("stat" in target) || JSON.stringify(target.stat) === targetStat)
                     && vault.getAbstractFileByPath(e.oldPath!) === source
                     && (!source || !("stat" in source) || JSON.stringify(source.stat) === sourceStat));
+    }
+
+    /** Last remote check runs after the path lock, slot and socket buffer wait. */
+    async beforeSend(action: string, data: { path?: string; oldPath?: string }): Promise<boolean> {
+        const e = this.active;
+        const guard = this.sendGuard(action, data);
+        if (!e || !guard || !guard()) return false;
+        if (e.operation !== "delete" || e.objectType === "folder") return true;
+        let safe = false;
+        try {
+            const source = await this.api.getRetryQueueState(e.objectType, e.path);
+            safe = !!source && source.contentHash === e.baselineHash;
+        } catch (error) { dump("[RetryQueue] Final state check failed", e.path, error); }
+        if (!guard()) return false;
+        if (safe) return true;
+        dump("[RetryQueue] Remote state changed before send; discarding operation", e.path);
+        SyncLogManager.getInstance().addLog("send", "RetryQueueDiscard", "Final remote state check failed; operation cancelled", "cancelled", e.path);
+        this.recoveryPaths.set(e.path, e.objectType);
+        this.remove(e);
+        this.persist();
+        return false;
+    }
+
+    /** The queue is serial; legacy replies identify its active sent operation by action. */
+    reject(action: string, path: string | undefined, code: number, message: string): boolean {
+        if (path && this.shouldIgnoreAck(action, path)) return true;
+        const e = this.active;
+        if (!e || e.attempts === 0 || (path && path !== e.path)) return false;
+        const expected = `${e.objectType[0].toUpperCase() + e.objectType.slice(1)}${e.operation === "delete" ? "Delete" : "Rename"}`;
+        if (action !== expected && action !== `${expected}Ack`) return false;
+        if (!DETERMINISTIC_MUTATION_ERRORS.has(code)) return true;
+        this.recoveryPaths.set(e.oldPath || e.path, e.objectType);
+        this.remove(e);
+        this.persist();
+        showSyncNotice(`Service rejected ${expected}: ${e.path} (Code=${code}) ${message}`);
+        this.kick();
+        return true;
     }
 
     canSend(action: string, data: { path?: string; oldPath?: string }): boolean {

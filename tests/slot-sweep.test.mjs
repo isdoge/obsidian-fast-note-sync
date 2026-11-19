@@ -9,6 +9,7 @@ import ts from "typescript";
 const noop = () => {};
 const dumps = [];
 const activeUploads = new Set();
+const bufferTimers = [];
 const helpers = new Proxy({
   dump: (...args) => dumps.push(args.map(String).join(" ")),
 }, { get: (target, key) => target[key] ?? noop });
@@ -21,7 +22,7 @@ function load(file, extra = {}) {
   vm.runInNewContext(code, {
     module, exports: module.exports, console, Map, Set, JSON, Promise, Object, Array, Date, Math,
     TextEncoder, Uint8Array, ArrayBuffer, DataView, WebSocket: { OPEN: 1 },
-    window: { setTimeout: () => 1, clearTimeout: noop, clearInterval: noop },
+    window: { setTimeout: fn => { bufferTimers.push(fn); return bufferTimers.length; }, clearTimeout: noop, clearInterval: noop },
     require: id => id === "obsidian"
       ? { normalizePath: p => p, TFile: class {}, TFolder: class {}, Platform: { isMobile: false } }
       : id.includes("helpers") ? helpers
@@ -185,3 +186,26 @@ const MAX_IDLE = 60_000;
 }
 
 console.log("concurrency slot sweep tests passed");
+
+// A real SendMessage remains alive while waiting for the WebSocket buffer to drain.
+{
+  const { WebSocketClient } = load('src/lib/sync/websocket_client.ts');
+  const { plugin, limiter } = makeLimiter({ max: 1 });
+  plugin.concurrencyLimiter = limiter;
+  const client = Object.create(WebSocketClient.prototype);
+  client.plugin = plugin; client.ws = { readyState: 1, bufferedAmount: 6 * 1024 * 1024 };
+  const sent = []; client.Send = (action, data) => sent.push([action, data]);
+  await limiter.waitForSlot('buffered.md');
+  const send = client.SendMessage('NoteModify', { path: 'buffered.md' });
+  await tick();
+  limiter.keyActivityAt.set('buffered.md', 0);
+  let granted = false;
+  const queued = limiter.waitForSlot('next.md').then(() => { granted = true; });
+  assert.deepEqual([...limiter.sweepStale(180000, undefined, Date.now())], [], 'buffer wait owns the slot');
+  assert.equal(granted, false); assert.equal(sent.length, 0);
+  client.ws.bufferedAmount = 0;
+  bufferTimers.shift()(); await send;
+  assert.equal(sent.length, 1); assert.equal(limiter.activeKeys.has('buffered.md'), true);
+  limiter.releaseSlot('buffered.md'); await queued;
+  assert.equal(granted, true);
+}
