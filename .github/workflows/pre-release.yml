@@ -79,23 +79,16 @@ jobs:
         id: prepare
         if: steps.check_version.outputs.should_release == 'true'
         run: |
-          # 获取提交文本信息
+          # 获取触发发布的提交说明原文（合并提交里直接写中英对照）
           msg=$(git log -1 --pretty=%B)
 
-          # 设置 Python 进行翻译
-          pip install deep-translator > /dev/null 2>&1 || true
-
-          # 运行翻译脚本
-          export COMMIT_MSG="$msg"
-
-          echo "commit_msg<<EOF" >> $GITHUB_OUTPUT
-          if [ -f "scripts/translate_commit.py" ]; then
-              python3 scripts/translate_commit.py >> $GITHUB_OUTPUT
-          else
-              echo "未找到翻译脚本，使用原始消息"
-              echo "$msg" >> $GITHUB_OUTPUT
-          fi
-          echo "EOF" >> $GITHUB_OUTPUT
+          # 以随机分隔符写入多行输出，避免正文内容与分隔符冲突
+          delimiter="EOF_$(openssl rand -hex 16)"
+          {
+            echo "commit_msg<<${delimiter}"
+            printf '%s\n' "$msg"
+            echo "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
       - name: Build
         id: build
         # 只有在 check_version 步骤输出 should_release 为 true 时才执行
