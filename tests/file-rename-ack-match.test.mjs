@@ -52,6 +52,7 @@ function fixture(entries) {
   const hashLog = [];
   const files = new Map(entries.map(e => [e.newPath, new TFile(e.newPath)]));
   const plugin = {
+    retryQueue: { matchesAck: () => false },
     settings: { syncEnabled: true, readonlySyncEnabled: false, vault: "v" },
     app: { vault: { getFileByPath: p => files.get(p) ?? null } },
     pendingFileRenames: entries.map(e => ({ ...e })),
@@ -139,7 +140,7 @@ for (const type of ['file', 'note']) {
 }
 console.log('PASS: note/file rename slots follow matched pending entries, including legacy and unmatched ACKs');
 
-// Retry-owned ACKs settle by action/path, never advance the scan cursor or guess FIFO.
+// A pathless ACK uses the same FIFO pending identity even when the retry queue exists.
 {
   const f = fixture([{ oldPath: 'a.png', newPath: 'b.png', contentHash: 'h' }]);
   const calls = [];
@@ -149,7 +150,6 @@ console.log('PASS: note/file rename slots follow matched pending entries, includ
   };
   f.plugin.localStorageManager.setMetadata = () => assert.fail('retry ACK must not advance sync time');
   ops.receiveFileRenameAck({ lastTime: 999 }, f.plugin);
-  assert.equal(f.plugin.pendingFileRenames.length, 1, 'queue cannot guess a pathless ACK');
-  ops.receiveFileRenameAck({ path: 'b.png', lastTime: 999 }, f.plugin);
+  assert.equal(f.plugin.pendingFileRenames.length, 0, 'legacy FIFO ACK settles the matching queue operation');
   assert.deepEqual(calls, [['FileRenameAck', 'b.png']]);
 }

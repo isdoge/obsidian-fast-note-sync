@@ -7,7 +7,7 @@ import ts from 'typescript';
 let now = 1000000, timerId = 0;
 const timers = new Map();
 const window = { setTimeout(fn, ms) { const id = ++timerId; timers.set(id, { fn, at: now + ms }); return id; },
-  clearTimeout: id => timers.delete(id) };
+  clearTimeout: id => timers.delete(id), setInterval: () => 1, clearInterval: () => {} };
 const noop = () => {};
 class TFile { constructor(path, content = 'same') { this.path = path; this.content = content; this.stat = { size: 4, mtime: 10 }; this.extension = path.split('.').pop(); } }
 class TFolder { constructor(path) { this.path = path; this.children = []; } }
@@ -15,6 +15,7 @@ const obsidian = { TFile, TFolder, normalizePath: p => p, Platform: {}, Notice: 
 const logManager = { getInstance: () => ({ addLog: noop, addOrUpdateLog: noop, logSentMessage: noop, logReceivedMessage: noop }) };
 const cache = new Map();
 const modificationCalls = [];
+const notices = [];
 let helpers;
 const startupSyncCalls = [];
 const startupSync = async p => startupSyncCalls.push(p);
@@ -39,18 +40,19 @@ function load(rel) {
       async getRetryQueueState(kind, p) { return this.p.remote.get(p) ?? null; }
     } };
     if (id.includes('websocket_action')) return new Proxy({}, { get: (_, k) => k });
-    if (['./sync_state', './concurrency_limiter', './operator_note', './operator_file', './operator_folder'].includes(id)) return load(path.resolve(path.dirname(file), id + '.ts'));
+    if (['./sync_state', './concurrency_limiter', './operator_note', './operator_file', './operator_folder', '../storage/file_hash_manager'].includes(id)) return load(path.resolve(path.dirname(file), id + '.ts'));
     return {};
   };
   vm.runInNewContext(ts.transpileModule(fs.readFileSync(file, 'utf8'), { compilerOptions: {
     module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020,
   } }).outputText, { module, exports: module.exports, require, window, console, URLSearchParams, TextEncoder,
-    ArrayBuffer, Uint8Array, crypto: globalThis.crypto, activeDocument: undefined,
+    ArrayBuffer, Uint8Array, WebSocket: { OPEN: 1 }, sleep: async () => {}, crypto: globalThis.crypto, activeDocument: undefined,
     Date: class extends Date { static now() { return now; } } });
   return module.exports;
 }
-helpers = { ...load('src/lib/utils/helpers.ts'), isPathExcluded: () => false, isFolderSyncPathExcluded: () => false };
+helpers = { ...load('src/lib/utils/helpers.ts'), isPathExcluded: () => false, isFolderSyncPathExcluded: () => false, showSyncNotice: message => notices.push(message) };
 const { RetryQueue } = load('src/lib/sync/retry_queue.ts');
+const { FileHashManager } = load('src/lib/storage/file_hash_manager.ts');
 const { EventManager } = load('src/lib/utils/events_manager.ts');
 const { ConcurrencyLimiter } = load('src/lib/sync/concurrency_limiter.ts');
 const { WebSocketManager } = load('src/lib/sync/websocket_manager.ts');
@@ -85,9 +87,11 @@ function fixture(disk = new Map()) {
   const manager = Object.create(WebSocketManager.prototype);
   Object.assign(manager, { plugin, deferredMessages: [], deferredBytes: 0, replayScheduled: false, receivedFileDetails: new Set(),
     client: { isAuth: false, isOpen: false, notifyActivity: noop,
-      async SendMessage(action, data, before, after) {
+      async SendMessage(action, data, before, after, finalCheck) {
         if (before?.()) return true;
         if (plugin.drain) await plugin.drain;
+        if (before?.()) return true;
+        if (finalCheck && !await finalCheck()) return true;
         if (before?.()) return true;
         if (!this.isOpen) return;
         sent.push({ action, ...data }); after?.();
@@ -97,6 +101,27 @@ function fixture(disk = new Map()) {
   plugin.retryQueue = new RetryQueue(plugin);
   plugin.events = plugin.eventManager = new EventManager(plugin);
   return plugin;
+}
+async function scanAfterRename(p, path, expectedHash) {
+  const { SyncState } = load('src/lib/sync/sync_state.ts');
+  p.syncState = new SyncState();
+  p.lastSyncMtime = new Map(); p.pendingConfigDeleteAcks = new Set();
+  for (const key of ['pendingDeleteNotePaths', 'pendingDeleteFilePaths', 'pendingDeleteFolderPaths', 'pendingDeleteConfigPaths']) p[key] = new Set();
+  for (const key of ['scannedNoteHashes', 'scannedFileHashes', 'scannedConfigHashes', 'syncPageStateMap']) p[key] = new Map();
+  p.menuManager = { ribbonIconStatus: true };
+  p.progressTracker = { reset: noop, recordHashProgress: noop };
+  p.resetSyncTasks = noop; p.updateStatusBar = noop;
+  p.settings.syncUpChunkNum = 100; p.settings.pipelineWindowUp = 0;
+  p.localStorageManager.getMetadata = key => key.startsWith('last') ? 10000 : true;
+  p.app.vault.getAllLoadedFiles = () => [...p.local.values()];
+  p.app.vault.adapter.exists = async () => false;
+  p.folderSnapshotManager.isReady = () => false;
+  p.websocket.client.ws = { readyState: 1, bufferedAmount: 0 };
+  const { handleSync } = load('src/lib/sync/operator.ts');
+  await handleSync(p, true);
+  const action = path.endsWith('.md') ? 'NoteSync' : 'FileSync';
+  const items = p.sent.find(s => s.action === action)?.[path.endsWith('.md') ? 'notes' : 'files'];
+  assert.equal(items?.find(f => f.path === path)?.contentHash, expectedHash, 'next incremental scan reports current content even below the cursor');
 }
 async function auth(p) { p.websocket.client.isAuth = p.websocket.client.isOpen = true; void p.retryQueue.onAuthenticated(); await settle(); }
 function ack(p, action, path, context) {
@@ -210,9 +235,12 @@ for (const mode of ['failure', 'disconnect']) {
   const disk = new Map(), p = fixture(disk); await p.retryQueue.initialize();
   p.baseline.set('a.md', 'original'); p.events.watchRename(new TFile('b.md'), 'a.md'); await settle(); p.retryQueue.stop();
   const q = fixture(disk); q.local.set('b.md', new TFile('b.md', 'edited after rename'));
+  q.fileHashManager = new FileHashManager(q);
   q.remote.set('a.md', { path: 'a.md', contentHash: 'original' }); await q.retryQueue.initialize(); await auth(q);
   assert.equal(q.pendingNoteRenames.get('b.md').contentHash, 'original');
-  ack(q, 'NoteRenameAck', 'b.md'); assert.equal(q.baseline.get('b.md'), 'original');
+  ack(q, 'NoteRenameAck'); assert.equal(q.fileHashManager.getPathHash('b.md'), 'original');
+  assert.equal(q.fileHashManager.getValidHash('b.md', 10, 4), null, 'rename ACK must invalidate local content cache');
+  await scanAfterRename(q, 'b.md', await helpers.hashContentAsync('edited after rename'));
   q.retryQueue.stop(); timers.clear();
 }
 // Cancellation while waiting for a real concurrency slot settles the stale waiter safely.
@@ -297,3 +325,94 @@ for (const operation of ['delete', 'rename']) {
   p.retryQueue.stop(); timers.clear();
 }
 console.log('retry-queue-integration.test.mjs: real event/send/ACK/mirror/scan scenarios passed');
+
+// Remote changes during slot or buffer waits must cancel a restored deletion at the final send boundary.
+for (const kind of ['note', 'file']) for (const wait of ['slot', 'buffer']) {
+  const p = fixture(); await p.retryQueue.initialize(); await auth(p);
+  const path = kind === 'note' ? 'final.md' : 'final.bin';
+  p.baseline.set(path, 'old'); p.remote.set(path, { contentHash: 'old' });
+  let release;
+  if (wait === 'slot') { p.settings.maxConcurrentUploads = 1; await p.concurrencyLimiter.waitForSlot('busy'); }
+  else p.drain = new Promise(r => { release = r; });
+  p.events.watchDelete(new TFile(path)); await settle();
+  p.remote.set(path, { contentHash: 'new' });
+  if (wait === 'slot') p.concurrencyLimiter.releaseSlot('busy'); else release();
+  await settle();
+  assert.equal(p.sent.length, 0, `${kind}/${wait}: changed remote content cannot be deleted`);
+  assert.equal(p.retryQueue.entries.length, 0);
+  assert.equal(p.concurrencyLimiter.getSlotContext(path), undefined);
+  p.retryQueue.stop(); timers.clear();
+}
+// Deterministic refusal terminates the exact queued operation, including pathless legacy replies.
+for (const code of [305, 306, 307, 308, 309, 310, 312, 313, 314, 315, 411, 414, 422, 423, 438, 444]) for (const legacy of [false, true]) {
+  const p = fixture(); await p.retryQueue.initialize(); await auth(p);
+  p.events.watchDelete(new TFolder('denied')); await settle();
+  assert.equal(p.sent.length, 1);
+  const noticesBefore = notices.length;
+  p.websocket.handleStructuredMessage('FolderDeleteAck', { code, data: legacy ? undefined : { path: 'denied' } });
+  assert.equal(notices.length, noticesBefore + 1, 'refusal is shown once');
+  await settle();
+  assert.equal(p.retryQueue.entries.length, 0, `${code}/${legacy}: refusal must dequeue`);
+  assert.equal(p.concurrencyLimiter.getSlotContext('denied'), undefined);
+  await advance(60000); assert.equal(p.sent.length, 1, 'no retry after deterministic refusal');
+  p.retryQueue.stop(); timers.clear();
+}
+
+{
+  const disk = new Map(), p = fixture(disk); await p.retryQueue.initialize();
+  p.baseline.set('a.bin', 'original'); p.events.watchRename(new TFile('b.bin'), 'a.bin'); await settle(); p.retryQueue.stop();
+  const q = fixture(disk), file = new TFile('b.bin', 'edited attachment'); q.local.set(file.path, file);
+  q.fileHashManager = new FileHashManager(q);
+  q.app.vault.adapter.stat = async () => file.stat;
+  q.app.vault.adapter.readBinary = async () => new TextEncoder().encode(file.content).buffer;
+  q.remote.set('a.bin', { contentHash: 'original' }); await q.retryQueue.initialize(); await auth(q);
+  ack(q, 'FileRenameAck');
+  assert.equal(q.fileHashManager.getPathHash(file.path), 'original');
+  assert.equal(q.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size), null);
+  await scanAfterRename(q, file.path, await helpers.hashFileAsync(q.app, file.path));
+  q.retryQueue.stop(); timers.clear();
+}
+
+// Legacy parameter errors carry no action or path; a unique sent request supplies identity.
+{
+  const p = fixture(); await p.retryQueue.initialize(); await auth(p);
+  p.events.watchDelete(new TFolder('invalid')); await settle();
+  p.websocket.handleStructuredMessage('', { code: 305 }); await settle();
+  assert.equal(p.retryQueue.entries.length, 0);
+  assert.equal(p.concurrencyLimiter.getSlotContext('invalid'), undefined);
+  p.retryQueue.stop(); timers.clear();
+}
+// Temporary server failures stay queued; unrelated path/action errors cannot cancel the entry.
+{
+  const p = fixture(); await p.retryQueue.initialize(); await auth(p);
+  p.events.watchDelete(new TFolder('retry')); await settle();
+  for (const code of [300, 301, 302, 303]) {
+    p.websocket.handleStructuredMessage('FolderDeleteAck', { code });
+    assert.equal(p.retryQueue.entries.length, 1);
+  }
+  p.fileSyncTasks = { completed: 0 };
+  p.websocket.handleStructuredMessage('NoteDeleteAck', { code: 315, data: { path: 'other' } });
+  assert.equal(p.retryQueue.entries.length, 1);
+  p.retryQueue.stop(); timers.clear();
+}
+
+// A codec failure is recoverable through JSON fallback, not a permanent invalid-params refusal.
+{
+  const p = fixture(); await p.retryQueue.initialize(); await auth(p);
+  p.events.watchDelete(new TFolder('codec')); await settle();
+  let fallbacks = 0;
+  p.settings.protobufEnabled = true;
+  p.websocket.fallbackToJsonAfterProtobufDecodeFailure = () => { fallbacks++; };
+  p.websocket.handleStructuredMessage('', { code: 305, details: 'Protobuf decode failed: invalid payload' });
+  assert.equal(p.retryQueue.entries.length, 1); assert.equal(fallbacks, 1);
+  p.retryQueue.stop(); timers.clear();
+}
+// Protocol boundary: anonymous errors with multiple outstanding requests cannot be guessed.
+{
+  const p = fixture(); await p.retryQueue.initialize(); await auth(p);
+  p.events.watchDelete(new TFolder('anonymous')); await settle();
+  p.websocket.sentRequests.set('NoteModify:other.md', { action: 'NoteModify', path: 'other.md' });
+  p.websocket.handleStructuredMessage('', { code: 305 });
+  assert.equal(p.retryQueue.entries.length, 1, 'unknown identity cannot cancel another operation');
+  p.retryQueue.stop(); timers.clear();
+}

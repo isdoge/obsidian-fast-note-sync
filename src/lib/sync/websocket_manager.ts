@@ -110,6 +110,7 @@ export class WebSocketManager {
 
   // --- 轻量事件总线，用于分批发送时等待服务端 BatchAck ---
   // Lightweight event bus for awaiting server BatchAck during batch send
+  private sentRequests = new Map<string, { action: string; path?: string }>();
   private _listeners: Map<string, Set<(...args: unknown[]) => void>> = new Map();
 
   /**
@@ -231,6 +232,7 @@ export class WebSocketManager {
 
   /** 主动与被动断线共用清理，保留本地待上传改动。 / Shared disconnect cleanup preserves pending edits. */
   private cleanupDisconnectedSync(): void {
+    this.sentRequests?.clear();
     this.plugin.retryQueue?.onDisconnected();
     if (this.plugin.isSyncing) {
       this.plugin.isSyncing = false;
@@ -357,12 +359,17 @@ export class WebSocketManager {
       if (guard && !guard()) return true;
       return before?.() ?? false;
     }, () => {
+      const path = (data as { path?: string })?.path;
+      this.sentRequests ??= new Map();
+      if (/^(Note|File|Folder|Setting)(Modify|Delete|Rename|UploadCheck)$/.test(action)) {
+        this.sentRequests.set(`${action}:${path || ""}`, { action, path });
+      }
       if (guard) queue.onSent(action, data as { path?: string; oldPath?: string });
       // Record the send event in sync logs
       // 在同步日志中记录发送事件
       SyncLogManager.getInstance().logSentMessage(action, injectedData as object | string, this.plugin.currentSyncType);
       after?.();
-    });
+    }, guard ? () => queue.beforeSend(action, data as { path?: string; oldPath?: string }) : undefined);
   }
   public Send(action: WSAction.WSSendAction, data: unknown, after?: () => void, context?: string) {
     const injectedData = this.injectContext(data, context);
@@ -492,11 +499,20 @@ export class WebSocketManager {
     }
 
     if (data.code <= 0 || data.code >= 300) {
-      if ((!data.vault || data.vault === this.plugin.settings.vault) && !data.context
-        && typeof data.data?.path === "string" && this.plugin.retryQueue?.ownsPendingPath(data.data.path)) {
-        dump("[RetryQueue] Mutation rejected; retaining operation", data.code, data.data.path);
+      const isProtobufDecodeError = /(?:^|,\s*)(?:body:\s*)?Protobuf decode failed:/i.test(data.details || "");
+      const errorPath = typeof data.data?.path === "string" ? data.data.path : undefined;
+      // Old validation errors omit both path and action. Only a unique outstanding request
+      // can identify one safely; named legacy Ack errors match the serial queue by action.
+      const [onlyRequest] = this.sentRequests?.size === 1 ? this.sentRequests.values() : [];
+      const pathRequest = errorPath ? [...(this.sentRequests?.values() || [])].filter(r => r.path === errorPath) : [];
+      const errorAction = (!msgAction || msgAction === "Error")
+        ? (pathRequest.length === 1 ? pathRequest[0].action : onlyRequest?.action || "") : msgAction;
+      if (!isProtobufDecodeError && (!data.vault || data.vault === this.plugin.settings.vault) && !data.context
+        && this.plugin.retryQueue?.reject?.(errorAction, errorPath || (!msgAction ? onlyRequest?.path : undefined), data.code, data.message || "")) {
+        this.sentRequests?.delete(`${errorAction.replace(/Ack$/, "")}:${errorPath || onlyRequest?.path || ""}`);
         return;
       }
+      if (!isProtobufDecodeError && !data.context && errorPath && this.plugin.retryQueue?.ownsPendingPath(errorPath)) return;
       // 处理冲突相关错误码
       if (data.code === ERROR_SYNC_CONFLICT) {
         void this.handleConflictError(data);
@@ -518,7 +534,6 @@ export class WebSocketManager {
         const errorDetails = data.details ? " Details=" + data.details : "";
         // 服务端已成功解码外层响应，但客户端上行 protobuf 的内层 DTO 解码失败。
         // The server decoded this error envelope, but rejected our uplink protobuf DTO.
-        const isProtobufDecodeError = /(?:^|,\s*)(?:body:\s*)?Protobuf decode failed:/i.test(data.details || "");
         if (isProtobufDecodeError) {
           // 仅这类解码错误区别对待：protobuf 仍启用则回退到 JSON；已回退则静默忽略迟到的同类错误。
           // Only decode errors are special-cased: fall back while protobuf is still enabled,
@@ -601,7 +616,7 @@ export class WebSocketManager {
       // 回放中的新实时消息排到队尾，控制消息仍立即处理。
       // Queue live arrivals behind the replay backlog; control messages remain immediate.
       const isControlMsg = msgAction === WSAction.ClientReceiveAuth || msgAction === WSAction.ClientReceiveInfo;
-      if (!fromReplay && !isControlMsg && !this.plugin.syncState.activeSyncContext
+      if (!fromReplay && !isControlMsg && !(isLocalAck && idleSlot) && !msgAction.endsWith("Ack") && !this.plugin.syncState.activeSyncContext
         && (this.replayScheduled || this.deferredMessages.length > 0)) {
         this.enqueueDeferredMessage(msgAction, data);
         this.scheduleDeferredReplay();
@@ -647,6 +662,11 @@ export class WebSocketManager {
         // Retransmission must not enqueue the same page item again while it is
         // waiting for a slot or already processed. Non-paged live edits bypass this.
         const path = (payload as { path?: string })?.path;
+        const requestAction = msgAction === WSAction.FileUpload || msgAction === WSAction.FileSyncMtime || msgAction === WSAction.FileUploadAck
+          ? "FileUploadCheck" : msgAction === WSAction.NoteSyncMtime ? "NoteModify" : msgAction.replace(/Ack$/, "");
+        const requestPath = path || (msgAction === WSAction.NoteRenameAck ? [...this.plugin.pendingNoteRenames.keys()][0]
+          : msgAction === WSAction.FileRenameAck ? this.plugin.pendingFileRenames[0]?.newPath : undefined);
+        if (requestPath) this.sentRequests?.delete(`${requestAction}:${requestPath}`);
         const detailKey = context && pageIndex !== undefined && typeof path === 'string'
           && [WSAction.FileSyncUpdate, WSAction.FileUpload, WSAction.FileSyncMtime,
               WSAction.FileSyncDelete, WSAction.FileSyncRename].includes(msgAction)

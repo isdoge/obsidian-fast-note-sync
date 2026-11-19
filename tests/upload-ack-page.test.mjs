@@ -107,6 +107,32 @@ function fixture() {
 
 const cases = [];
 function test(name, run) { cases.push([name, run]); }
+test('duplicate session while queued and awaiting ACK starts one upload', async () => {
+  const f = fixture(); f.p.settings.maxConcurrentUploads = 1;
+  await f.p.concurrencyLimiter.waitForSlot('busy');
+  f.upload(session(99)); f.upload(session(99)); await tick();
+  assert.equal(f.p.concurrencyLimiter.queue.length, 1, 'same session queues once');
+  f.p.concurrencyLimiter.releaseSlot('busy'); await tick(); await tick();
+  assert.equal(f.reads.length, 1);
+  f.upload(session(99)); await tick(); await tick();
+  assert.equal(f.reads.length, 1, 'sent session remains registered until ACK');
+  f.ack();
+});
+test('cancelled queued session can be requested again', async () => {
+  const f = fixture(); f.p.settings.maxConcurrentUploads = 1;
+  await f.p.concurrencyLimiter.waitForSlot('busy');
+  f.upload(session(98)); await tick();
+  f.p.concurrencyLimiter.clear(); await tick();
+  f.upload(session(98)); await tick(); await tick();
+  assert.equal(f.reads.length, 1, 'cancel removes session ownership before a new request');
+  f.ack();
+});
+test('failed send ends session deduplication', async () => {
+  const f = fixture(); f.p.websocket.SendBinary = async () => 'closed';
+  f.upload(session(97)); await tick(); await tick();
+  f.upload(session(97)); await tick(); await tick();
+  assert.equal(f.reads.length, 2, 'failed session can be retried');
+});
 for (const [name, idle, pending, context, expected, deferred] of [
   ['a: idle slot, pending page, contextless ACK', true, true, undefined, [['file', 0]], 0],
   ['b: round slot, pending page, contextless ACK', false, true, undefined, [['file', 0]], 0],
@@ -127,7 +153,7 @@ for (const [name, idle, pending, context, expected, deferred] of [
     assert.equal(m.deferredMessages.length, deferred);
     assert.equal(p.syncState.pendingFilePushPageIndex.has('a.bin'), pending && !!deferred);
     assert.equal(p.concurrencyLimiter.activeKeys.has('a.bin'), !!deferred);
-    assert.equal(p.pendingUploadHashes.has('a.bin'), !!deferred);
+    assert.equal(p.pendingUploadHashes.has('a.bin'), true, 'unsent synthetic pending hash stays unconfirmed');
     assert.equal(f.cursorCalls.length, !deferred && !idle ? 1 : 0,
       'outsideRound still controls cursor advancement');
   });

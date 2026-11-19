@@ -146,3 +146,26 @@ console.log('PASS: async deferred handlers and new live messages execute seriall
   assert.deepEqual(order, ['old-running', 'new']);
 }
 console.log('PASS: deferred replay pauses for a new round and invalidates old drains on disconnect');
+
+// Real limiter dependency: replay waits for a slot held by a local modify; its Ack must bypass replay.
+{
+  const { ConcurrencyLimiter } = load('src/lib/sync/concurrency_limiter.ts');
+  const m = makeManager('round');
+  Object.assign(m.plugin.settings, { concurrencyControlEnabled: true, maxConcurrentUploads: 1 });
+  const limiter = m.plugin.concurrencyLimiter = new ConcurrencyLimiter(m.plugin);
+  const order = [];
+  receiveOperators.set('FileSyncUpdate', async () => {
+    order.push('waiting'); await limiter.waitForSlot('download_y'); order.push('download');
+    limiter.releaseSlot('download_y');
+  });
+  receiveOperators.set('NoteModifyAck', data => { order.push('ack'); limiter.releaseSlot(data.path); });
+  m.handleStructuredMessage('FileSyncUpdate', { code: 200, data: { path: 'y' } });
+  m.plugin.syncState.activeSyncContext = null;
+  await limiter.waitForSlot('x.md');
+  const drain = timers.shift()(); await new Promise(setImmediate);
+  assert.deepEqual(order, ['waiting']);
+  m.handleStructuredMessage('NoteModifyAck', { code: 200, data: { path: 'x.md' } });
+  await new Promise(setImmediate);
+  assert.deepEqual(order, ['waiting', 'ack', 'download'], 'local ACK must release the slot during replay');
+  await drain;
+}

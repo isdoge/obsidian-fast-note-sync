@@ -973,6 +973,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
               if (isLoadLastTime
                 && file.stat.mtime < Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))
                 && plugin.fileHashManager.getPathHash(file.path) !== null
+                && plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size) === plugin.fileHashManager.getPathHash(file.path)
                 && !plugin.pendingNoteModifies.has(file.path)
                 && !plugin.syncState.conflictedPaths.has(file.path)) continue;
 
@@ -1033,6 +1034,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
               if (isLoadLastTime
                 && file.stat.mtime < Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))
                 && plugin.fileHashManager.getPathHash(file.path) !== null
+                && plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size) === plugin.fileHashManager.getPathHash(file.path)
                 && !plugin.pendingUploadHashes.has(file.path)) continue;
 
               const cachedFileHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size);
