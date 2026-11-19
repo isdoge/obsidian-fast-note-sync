@@ -86,6 +86,8 @@ The following items have been removed in this independently maintained edition. 
     - Provides sync exclusion and whitelist functions, allowing you to customize your own sync strategies.
 - 🔄 **Multi-device Sync**:
     - Supports Mac, Windows, Android, iOS, and other platforms.
+    - Sync state has a file mirror, allowing it to be restored if the system clears mobile local storage, without falling back to a full sync.
+    - Deletions and renames not delivered before a disconnect or restart are retried after reconnection; server content is checked before retrying, and the operation is abandoned if it does not match to avoid deleting newer content from other devices.
 - 📝 **Note History**:
     - Provides note history functionality, letting you view detailed historical modification records of your notes.
     - You can restore notes to historical versions.
