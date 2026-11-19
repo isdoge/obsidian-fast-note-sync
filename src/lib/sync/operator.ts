@@ -192,6 +192,7 @@ function restartStalledSync(plugin: FastSync, intervalId?: number): void {
   plugin.syncPageStateMap.clear();
   plugin.syncState.pendingNotePushPageIndex.clear();
   plugin.syncState.pendingFilePushPageIndex.clear();
+  plugin.syncState.completedFileUploadSessions?.clear();
   plugin.syncState.pendingConfigPushPageIndex.clear();
   plugin.totalFilesToDownload = 0;
   plugin.downloadedFilesCount = 0;
@@ -798,6 +799,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     // comment), preventing stale entries from misattributing completions in the new round
     plugin.syncState.pendingNotePushPageIndex.clear()
     plugin.syncState.pendingFilePushPageIndex.clear()
+    plugin.syncState.completedFileUploadSessions?.clear()
     plugin.syncState.pendingConfigPushPageIndex.clear()
     // 注意：不清空 pendingConfigModifies，与 pendingNoteModifies 对齐——
     // 该集合记录扫描期间用户本地新改动的配置路径，需保留到扫描阶段用于跳过判断，
@@ -1425,6 +1427,7 @@ export function cancelSync(plugin: FastSync): void {
   plugin.pendingConfigDeleteAcks.clear();
   plugin.syncState.pendingNotePushPageIndex.clear();
   plugin.syncState.pendingFilePushPageIndex.clear();
+  plugin.syncState.completedFileUploadSessions?.clear();
   plugin.syncState.pendingConfigPushPageIndex.clear();
   plugin.pendingConfigModifies.clear();
   plugin.localStorageManager.clearPending('pendingConfigModifies');

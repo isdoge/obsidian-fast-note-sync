@@ -427,7 +427,7 @@ export const fileModify = async function (file: TAbstractFile, plugin: FastSync,
   if (isPathExcluded(file.path, plugin)) return
 
   if (isLargeBinarySyncRisk(file.stat.size, plugin)) {
-    dump(`Skip file modify for large attachment (${describeBinarySyncLimit()} limit): ${file.path}`, file.stat.size)
+    dump(`Skip file modify for large attachment (${describeBinarySyncLimit(plugin)} limit): ${file.path}`, file.stat.size)
     notifyLargeFileSkipped(plugin, file.path, file.stat.size, `Fast Note Sync skipped large file: ${file.path}`)
     return
   }
@@ -480,6 +480,29 @@ export const fileModify = async function (file: TAbstractFile, plugin: FastSync,
       plugin.pendingUploadHashes.set(file.path, contentHash)
       plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes)
       if (!await plugin.concurrencyLimiter.waitForSlot(file.path)) return
+      // 排队结束后复查：pending 已消失且基线就是本次内容，说明等待期间服务端已确认相同内容
+      // （如另一路上传的 FileUploadAck / FileSyncMtime 已同步消费 pending 并提交基线）。此时
+      // 不再发送 FileUploadCheck，也不 arm 60 秒超时——配老服务端时会白占名额等一个不会来的
+      // 回包。名额归属：确认处理先清 activeUploadsMap 再 releaseSlot，processQueue 同步唤醒
+      // 本任务，故唤醒时若无同路径在途上传，名额必是本任务新占的，由这里释放；若微任务间隙
+      // 里另一路 FileUpload 已用同 key 登记 activeUploadsMap（waitForSlot 对 active key 立即
+      // 返回、共用名额），名额属于该上传，由其终态路径释放，这里不释放。
+      // Recheck after the wait: pending gone and the baseline already equals this content means
+      // the server confirmed identical content while we queued (e.g. another upload's
+      // FileUploadAck / FileSyncMtime synchronously consumed the pending and committed the
+      // baseline). Skip the FileUploadCheck and the 60s timeout — against an older server it
+      // would hold the slot waiting for a reply that never comes. Slot ownership: confirmation
+      // handlers clear activeUploadsMap and releaseSlot before processQueue wakes this task, so
+      // with no in-flight upload under the same path the slot is newly ours to release; if
+      // another FileUpload registered the same key in a microtask gap (waitForSlot returns
+      // immediately for active keys, sharing the slot), the slot belongs to that upload and is
+      // released by its terminal paths, not here.
+      if (!plugin.pendingUploadHashes.has(file.path) &&
+        plugin.fileHashManager.getPathHash(file.path) === contentHash) {
+        dump(`File modify check skipped (content already confirmed while queued): ${file.path}`, contentHash)
+        if (!activeUploadsMap.has(file.path)) plugin.concurrencyLimiter.releaseSlot(file.path)
+        return
+      }
       uploadContexts.set(file.path, plugin.syncState.activeSyncContext)
       armUploadAckTimeout(file.path, plugin)
       void plugin.websocket.SendMessage("FileUploadCheck", data)
@@ -650,7 +673,7 @@ export const fileRename = async function (file: TAbstractFile, oldfile: string, 
           contentHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size);
           if (contentHash == null) {
             if (isLargeBinarySyncRisk(file.stat.size, plugin)) {
-              dump(`Skip rename hash for large attachment (${describeBinarySyncLimit()} limit): ${file.path}`, file.stat.size)
+              dump(`Skip rename hash for large attachment (${describeBinarySyncLimit(plugin)} limit): ${file.path}`, file.stat.size)
               return
             }
             contentHash = await hashFileAsync(plugin.app, file.path)
@@ -696,8 +719,24 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
     if (!outsideRound) plugin.recordSyncCompleted('file', data.pageIndex)
     return
   }
+  // 旧服务端可能复用已确认并移除的会话；只有相同会话 ID 才能直接完成，不能凭基线哈希跳过。
+  // Older servers may reuse an acknowledged, removed session; skip only that session ID, never a baseline hash match.
+  if (plugin.syncState.completedFileUploadSessions?.has(data.sessionId)) {
+    dump(`File upload request targets an already acknowledged session, settled without re-upload: `, data.path, data.sessionId)
+    if (!outsideRound) plugin.recordSyncCompleted('file', data.pageIndex)
+    return
+  }
   dump(`Receive file need upload (queued): `, data.path, data.sessionId)
   const previousSession = pathToSessionIdMap.get(data.path)
+  // 同一会话仍在上传时只补登记页归属，由唯一的确认完成记账，不再启动第二路分片。
+  // While the same session is uploading, attach page ownership and let its single Ack settle it without resending chunks.
+  if (previousSession === data.sessionId && activeUploadsMap.has(data.path)) {
+    dump(`File upload request duplicates the in-flight session, waiting for its Ack: `, data.path, data.sessionId)
+    if (!outsideRound && data.pageIndex !== undefined) {
+      plugin.syncState.pendingFilePushPageIndex.set(data.path, data.pageIndex)
+    }
+    return
+  }
   if (previousSession) sessionIdToPathMap.delete(previousSession)
   sessionIdToPathMap.set(data.sessionId, data.path)
   pathToSessionIdMap.set(data.path, data.sessionId)
@@ -709,7 +748,7 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
     return
   }
   if (isLargeBinarySyncRisk(file.stat.size, plugin)) {
-    dump(`Skip file upload for large attachment (${describeBinarySyncLimit()} limit): ${data.path}`, file.stat.size)
+    dump(`Skip file upload for large attachment (${describeBinarySyncLimit(plugin)} limit): ${data.path}`, file.stat.size)
     notifyLargeFileSkipped(plugin, data.path, file.stat.size, `Fast Note Sync skipped large file upload: ${data.path}`)
     if (!outsideRound) plugin.recordSyncCompleted('file', data.pageIndex)
     return
@@ -1006,7 +1045,7 @@ export const receiveFileSyncUpdate = async function (data: ReceiveFileSyncUpdate
     return
   }
   if (isLargeBinarySyncRisk(data.size, plugin)) {
-    dump(`Skip file download for large attachment (${describeBinarySyncLimit()} limit): ${data.path}`, data.size)
+    dump(`Skip file download for large attachment (${describeBinarySyncLimit(plugin)} limit): ${data.path}`, data.size)
     notifyLargeFileSkipped(plugin, data.path, data.size, `Fast Note Sync skipped large file download: ${data.path}`)
     plugin.recordSyncCompleted('file', data.pageIndex);
     return
@@ -1197,7 +1236,7 @@ export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, p
     const file = plugin.app.vault.getFileByPath(normalizedPath)
     if (file) {
       if (isLargeBinarySyncRisk(file.stat.size, plugin)) {
-        dump(`Skip binary mtime rewrite for large attachment (${describeBinarySyncLimit()} limit): ${normalizedPath}`, file.stat.size)
+        dump(`Skip binary mtime rewrite for large attachment (${describeBinarySyncLimit(plugin)} limit): ${normalizedPath}`, file.stat.size)
         plugin.lastSyncMtime.set(data.path, mtime || 0)
         if (!outsideRound) advanceLiveSyncTime(plugin, "lastFileSyncTime", data.lastTime)
         return
@@ -1592,7 +1631,7 @@ export const receiveFileSyncRename = async function (data: { oldPath: string; pa
           const renamedFile = plugin.app.vault.getFileByPath(normalizedNewPath)
           if (renamedFile instanceof TFile) {
             if (isLargeBinarySyncRisk(renamedFile.stat.size, plugin)) {
-              dump(`Skip renamed binary mtime rewrite for large attachment (${describeBinarySyncLimit()} limit): ${normalizedNewPath}`, renamedFile.stat.size)
+              dump(`Skip renamed binary mtime rewrite for large attachment (${describeBinarySyncLimit(plugin)} limit): ${normalizedNewPath}`, renamedFile.stat.size)
             } else {
               const content = await plugin.app.vault.readBinary(renamedFile)
               await plugin.app.vault.modifyBinary(renamedFile, content, { ...((ctime ?? 0) > 0 && { ctime }), ...((mtime ?? 0) > 0 && { mtime }) })
@@ -1620,7 +1659,7 @@ export const receiveFileSyncRename = async function (data: { oldPath: string; pa
         const sizeMatch = data.size === undefined || targetFile.stat.size === data.size
         if (sizeMatch) {
           if (isLargeBinarySyncRisk(targetFile.stat.size, plugin)) {
-            dump(`Skip rename target hash for large attachment (${describeBinarySyncLimit()} limit): ${data.path}`, targetFile.stat.size)
+            dump(`Skip rename target hash for large attachment (${describeBinarySyncLimit(plugin)} limit): ${data.path}`, targetFile.stat.size)
             plugin.recordSyncCompleted('file', data.pageIndex)
             return
           }
@@ -1669,7 +1708,7 @@ const handleFileChunkDownloadComplete = async function (session: FileDownloadSes
   session.committing = true
   try {
     if (isLargeBinarySyncRisk(session.size, plugin)) {
-      dump(`Skip assembling large downloaded attachment (${describeBinarySyncLimit()} limit): ${session.path}`, session.size)
+      dump(`Skip assembling large downloaded attachment (${describeBinarySyncLimit(plugin)} limit): ${session.path}`, session.size)
       await cleanupFileDownloadSession(plugin, session)
       return
     }
@@ -1860,6 +1899,17 @@ export const receiveFileUploadAck = function (data: { lastTime?: number; path?: 
   // 服务端确认上传成功，将 pending hash 转移到正式 hashManager
   // Server confirmed upload success, move pending hash to formal hashManager
   if (data.path) {
+    // 清理映射前记住已确认会话，供随后到达的分页上传请求去重；按插入顺序淘汰最早项。
+    // Remember the acknowledged session before clearing mappings for later paged requests; evict oldest entries first.
+    const sessionId = pathToSessionIdMap.get(data.path)
+    if (sessionId) {
+      const completedSessions = plugin.syncState.completedFileUploadSessions ??= new Set<string>()
+      completedSessions.add(sessionId)
+      if (completedSessions.size > 5000) {
+        const [oldestSession] = completedSessions
+        completedSessions.delete(oldestSession)
+      }
+    }
     clearUploadTracking(data.path)
     uploadRetries.delete(data.path)
     uploadContexts.delete(data.path)
@@ -1882,11 +1932,10 @@ export const receiveFileUploadAck = function (data: { lastTime?: number; path?: 
   if (data.path) {
     plugin.concurrencyLimiter.releaseSlot(data.path)
   }
-  if (outsideRound) return
-  // 查表归账所属下载页（NeedPush=FileUpload 驱动）；查不到说明是本地用户自发编辑触发的上传 Ack，走旧路径
-  // Look up the owning download page (NeedPush=FileUpload-driven); a miss means a local
-  // user-initiated edit triggered this upload Ack, falls back to the legacy path
+  // 本轮按路径等待的页必须消费确认，即使该确认来自空闲请求；轮外且无等待页时仍不记账。
+  // Settle the round's pending page by path even for an idle-request Ack; outside-round misses still do not count.
   const pushPageIndex = data.path ? plugin.syncState.pendingFilePushPageIndex.get(data.path) : undefined;
+  if (outsideRound && pushPageIndex === undefined) return
   if (data.path) plugin.syncState.pendingFilePushPageIndex.delete(data.path)
   plugin.recordSyncCompleted('file', pushPageIndex)
 }
