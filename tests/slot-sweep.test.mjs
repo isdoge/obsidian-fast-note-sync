@@ -101,20 +101,20 @@ const MAX_IDLE = 60_000;
   assert.deepEqual([...limiter.sweepStale(MAX_IDLE, undefined, base + 2 * MAX_IDLE + 1)], []);
 }
 
-// (d) FIFO 键被清后，迟到的无路径确认不会错放另一个 FIFO 键
+// (d) FIFO 键被清扫后离开名额，排队任务被唤醒；迟到的 releaseSlot 是空操作
 {
-  const { limiter } = makeLimiter({ max: 2 });
+  const { limiter } = makeLimiter({ max: 1 });
   const base = Date.now();
   await limiter.waitForSlot("renamed-a.md", true);
-  await limiter.waitForSlot("renamed-b.md", true);
-  limiter.touch("renamed-b.md", base + 1);
+  let queuedGranted = false;
+  const queued = limiter.waitForSlot("renamed-b.md").then(granted => { queuedGranted = granted; return granted; });
   assert.deepEqual([...limiter.sweepStale(MAX_IDLE, undefined, base + MAX_IDLE + 1)], ["renamed-a.md"]);
-  assert.deepEqual([...limiter.activeKeys], ["renamed-b.md"]);
-  limiter.releaseFifoSlot();
-  assert.deepEqual([...limiter.activeKeys], ["renamed-b.md"], "(d) swept FIFO key's late ack must not release another key");
-  // 第二条无路径确认才轮到仍在等待的 renamed-b.md
-  limiter.releaseFifoSlot();
-  assert.equal(limiter.activeKeys.size, 0, "(d) the live FIFO key's own ack still releases it");
+  await queued;
+  await tick();
+  assert.equal(queuedGranted, true, "(d) the queued task is woken by the swept FIFO slot");
+  assert.deepEqual([...limiter.activeKeys], ["renamed-b.md"], "(d) only the woken task holds a slot");
+  limiter.releaseSlot("renamed-a.md");
+  assert.deepEqual([...limiter.activeKeys], ["renamed-b.md"], "(d) a late release of the swept FIFO key is a no-op");
 }
 
 // (e) 并发控制关闭时什么都不做
