@@ -83,7 +83,7 @@ function fixture(files, baselines = {}) {
     },
     pendingUploadHashes: new Map(), pendingFileDeleteAcks: new Set(), lastSyncMtime: new Map(),
     localStorageManager: { getMetadata: () => 0, setMetadata: noop, savePending: noop },
-    concurrencyLimiter: { waitForSlot: async () => true, releaseSlot: noop },
+    concurrencyLimiter: { waitForSlot: async () => true, releaseSlot: noop, touch: noop },
     syncState: { activeSyncContext: null, pendingFilePushPageIndex: new Map() },
     isIgnoredFile: () => false, addIgnoredFile: noop, removeIgnoredFile: noop,
     fileSyncTasks: { failed: 0 }, totalChunksToUpload: 0, uploadedChunksCount: 0, recordSyncCompleted: noop,

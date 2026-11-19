@@ -1,6 +1,6 @@
 import { TFolder, TFile, normalizePath } from "obsidian";
 
-import { receiveFileUpload, receiveFileSyncUpdate, receiveFileSyncDelete, receiveFileSyncMtime, receiveFileSyncChunkDownload, receiveFileSyncEnd, checkAndUploadAttachments, receiveFileSyncRename, receiveFileRenameAck, receiveFileUploadAck, receiveFileDeleteAck, isPluginUnloading, sweepStalledDownloadSessions, invalidateFileDownloads } from "./operator_file";
+import { receiveFileUpload, receiveFileSyncUpdate, receiveFileSyncDelete, receiveFileSyncMtime, receiveFileSyncChunkDownload, receiveFileSyncEnd, checkAndUploadAttachments, receiveFileSyncRename, receiveFileRenameAck, receiveFileUploadAck, receiveFileDeleteAck, isPluginUnloading, sweepStalledDownloadSessions, invalidateFileDownloads, isAttachmentUploadActive } from "./operator_file";
 import { hashContent, hashContentAsync, dump, isPathExcluded, isFolderSyncPathExcluded, configIsPathExcluded, getConfigSyncCustomDirs, generateUUID, showSyncNotice, isLargeBinarySyncRisk, describeBinarySyncLimit, hashFileAsync, formatFileSize, yieldToMain, getPluginDir } from "../utils/helpers";
 import { receiveConfigSyncModify, receiveConfigUpload, receiveConfigSyncMtime, receiveConfigSyncDelete, receiveConfigSyncEnd, configAllPaths, receiveConfigSyncClear, receiveConfigModifyAck, receiveConfigDeleteAck } from "./operator_config";
 import { receiveNoteSyncModify, receiveNoteUpload, receiveNoteSyncMtime, receiveNoteSyncDelete, receiveNoteSyncEnd, receiveNoteSyncRename, receiveNoteModifyAck, receiveNoteRenameAck, receiveNoteDeleteAck } from "./operator_note";
@@ -111,6 +111,25 @@ export const SYNC_STALL_RESTART_MS = 300000;
 // Stall restart backoff: wait 5 minutes, doubling (5/10/20 min), at most 3 in a row; a further stall
 // stops automatic restarts and reports in the status bar. The count resets on completion or give-up.
 export const SYNC_STALL_MAX_RESTARTS = 3;
+// 并发名额超过这个时间没有动静，就当作确认丢失、无人归还并清扫。取 3 分钟，比停滞阈值短，
+// 清扫后名额归零，停滞检测才能按原来的 5 分钟逻辑重启一轮。
+// A concurrency slot untouched for this long is treated as an abandoned (lost-ack) slot and
+// swept. Three minutes, shorter than the stall threshold, so emptying the slots lets the
+// existing five-minute stall watchdog restart the round.
+export const SYNC_SLOT_STALE_MS = 180000;
+
+// 清扫名额时的"仍忙碌"判断：正在上传的附件和还有下载会话的键不能收回。
+// 其它等待确认的键（笔记/配置的修改、删除、改名）没有超时，正是要清扫的泄漏来源。
+// Busy predicate for the slot sweep: in-progress attachment uploads and keys still owned by a
+// download session must be kept. The other acks (note/config modify, delete, rename) have no
+// timeout and are exactly the leaks this sweep targets.
+function isConcurrencyKeyBusy(plugin: FastSync, key: string): boolean {
+  if (isAttachmentUploadActive(key)) return true;
+  for (const session of plugin.fileDownloadSessions.values()) {
+    if ((session.initialSlotKey || `download_${session.path}`) === key) return true;
+  }
+  return false;
+}
 const syncStallState: { context?: string; signature: string; lastProgressAt: number; restarts: number; restartTimer?: number } = { signature: "", lastProgressAt: 0, restarts: 0 };
 
 export function isSyncStalled(plugin: FastSync, ownerContext: string | undefined, now = Date.now()): boolean {
@@ -237,9 +256,15 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, _sync
 
   void sweepStalledDownloadSessions(plugin);
 
-  if (ownerContext && isSyncStalled(plugin, ownerContext)) {
-    restartStalledSync(plugin, intervalId);
-    return;
+  if (ownerContext) {
+    // 先清扫长期无人归还的名额，再判断停滞：漏掉的名额否则会让 activeKeys 永远非空
+    // Sweep long-abandoned slots before the stall check; a leaked slot would otherwise keep
+    // activeKeys non-empty forever and the watchdog would never fire
+    plugin.concurrencyLimiter.sweepStale?.(SYNC_SLOT_STALE_MS, key => isConcurrencyKeyBusy(plugin, key));
+    if (isSyncStalled(plugin, ownerContext)) {
+      restartStalledSync(plugin, intervalId);
+      return;
+    }
   }
   settleSyncTimes(plugin);
   const ws = plugin.websocket.ws;
