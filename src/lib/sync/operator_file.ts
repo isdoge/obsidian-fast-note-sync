@@ -719,8 +719,24 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
     if (!outsideRound) plugin.recordSyncCompleted('file', data.pageIndex)
     return
   }
+  // 旧服务端可能复用已确认并移除的会话；只有相同会话 ID 才能直接完成，不能凭基线哈希跳过。
+  // Older servers may reuse an acknowledged, removed session; skip only that session ID, never a baseline hash match.
+  if (plugin.syncState.completedFileUploadSessions?.has(data.sessionId)) {
+    dump(`File upload request targets an already acknowledged session, settled without re-upload: `, data.path, data.sessionId)
+    if (!outsideRound) plugin.recordSyncCompleted('file', data.pageIndex)
+    return
+  }
   dump(`Receive file need upload (queued): `, data.path, data.sessionId)
   const previousSession = pathToSessionIdMap.get(data.path)
+  // 同一会话仍在上传时只补登记页归属，由唯一的确认完成记账，不再启动第二路分片。
+  // While the same session is uploading, attach page ownership and let its single Ack settle it without resending chunks.
+  if (previousSession === data.sessionId && activeUploadsMap.has(data.path)) {
+    dump(`File upload request duplicates the in-flight session, waiting for its Ack: `, data.path, data.sessionId)
+    if (!outsideRound && data.pageIndex !== undefined) {
+      plugin.syncState.pendingFilePushPageIndex.set(data.path, data.pageIndex)
+    }
+    return
+  }
   if (previousSession) sessionIdToPathMap.delete(previousSession)
   sessionIdToPathMap.set(data.sessionId, data.path)
   pathToSessionIdMap.set(data.path, data.sessionId)
@@ -1883,6 +1899,17 @@ export const receiveFileUploadAck = function (data: { lastTime?: number; path?: 
   // 服务端确认上传成功，将 pending hash 转移到正式 hashManager
   // Server confirmed upload success, move pending hash to formal hashManager
   if (data.path) {
+    // 清理映射前记住已确认会话，供随后到达的分页上传请求去重；按插入顺序淘汰最早项。
+    // Remember the acknowledged session before clearing mappings for later paged requests; evict oldest entries first.
+    const sessionId = pathToSessionIdMap.get(data.path)
+    if (sessionId) {
+      const completedSessions = plugin.syncState.completedFileUploadSessions ??= new Set<string>()
+      completedSessions.add(sessionId)
+      if (completedSessions.size > 5000) {
+        const [oldestSession] = completedSessions
+        completedSessions.delete(oldestSession)
+      }
+    }
     clearUploadTracking(data.path)
     uploadRetries.delete(data.path)
     uploadContexts.delete(data.path)
@@ -1905,11 +1932,10 @@ export const receiveFileUploadAck = function (data: { lastTime?: number; path?: 
   if (data.path) {
     plugin.concurrencyLimiter.releaseSlot(data.path)
   }
-  if (outsideRound) return
-  // 查表归账所属下载页（NeedPush=FileUpload 驱动）；查不到说明是本地用户自发编辑触发的上传 Ack，走旧路径
-  // Look up the owning download page (NeedPush=FileUpload-driven); a miss means a local
-  // user-initiated edit triggered this upload Ack, falls back to the legacy path
+  // 本轮按路径等待的页必须消费确认，即使该确认来自空闲请求；轮外且无等待页时仍不记账。
+  // Settle the round's pending page by path even for an idle-request Ack; outside-round misses still do not count.
   const pushPageIndex = data.path ? plugin.syncState.pendingFilePushPageIndex.get(data.path) : undefined;
+  if (outsideRound && pushPageIndex === undefined) return
   if (data.path) plugin.syncState.pendingFilePushPageIndex.delete(data.path)
   plugin.recordSyncCompleted('file', pushPageIndex)
 }

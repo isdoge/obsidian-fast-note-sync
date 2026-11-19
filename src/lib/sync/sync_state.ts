@@ -100,8 +100,14 @@ export class SyncState {
    * a page in the first place.
    */
   pendingNotePushPageIndex = new Map<string, number>();
+  // 文件页归属只在轮次边界清空；即使 Ack 来自空闲请求，也须按路径消费本轮等待项。
+  // File page ownership is cleared at round boundaries; even idle-request Acks must settle pending paths.
   pendingFilePushPageIndex = new Map<string, number>();
   pendingConfigPushPageIndex = new Map<string, number>();
+
+  // 首次上传确认时按需创建，最多保留 5000 个会话，并在文件页归属清空时一并清空。
+  // Created on the first upload Ack, capped at 5000 sessions and cleared with file page ownership.
+  completedFileUploadSessions?: Set<string>;
 
   // ─── Sync-session control flags ──────────────────────────────────────────────
   /** 是否正在执行同步流程 / Whether sync process is running */

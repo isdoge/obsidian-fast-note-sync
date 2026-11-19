@@ -584,7 +584,12 @@ export class WebSocketManager {
         const isPendingMtimeAck = msgAction === WSAction.NoteSyncMtime && !data.context
           && typeof data.data?.path === 'string'
           && this.plugin.pendingNoteModifies.has(data.data.path);
-        if (!isControlMsg && !outsideRound && !isPendingMtimeAck && data.context !== this.plugin.syncState.activeSyncContext) {
+        // 旧服务端复用上传会话时可能丢失本轮 context；按路径等待的文件确认不能延后，否则分页永远无法结束。
+        // Older servers may lose the round context when reusing uploads; pending file Acks must settle now or the page cannot finish.
+        const isPendingFileUploadAck = msgAction === WSAction.FileUploadAck && !data.context
+          && typeof data.data?.path === 'string'
+          && this.plugin.syncState.pendingFilePushPageIndex.has(data.data.path);
+        if (!isControlMsg && !outsideRound && !isPendingMtimeAck && !isPendingFileUploadAck && data.context !== this.plugin.syncState.activeSyncContext) {
           this.enqueueDeferredMessage(msgAction, data);
           return;
         }
