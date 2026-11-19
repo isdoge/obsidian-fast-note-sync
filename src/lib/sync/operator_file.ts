@@ -480,6 +480,29 @@ export const fileModify = async function (file: TAbstractFile, plugin: FastSync,
       plugin.pendingUploadHashes.set(file.path, contentHash)
       plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes)
       if (!await plugin.concurrencyLimiter.waitForSlot(file.path)) return
+      // 排队结束后复查：pending 已消失且基线就是本次内容，说明等待期间服务端已确认相同内容
+      // （如另一路上传的 FileUploadAck / FileSyncMtime 已同步消费 pending 并提交基线）。此时
+      // 不再发送 FileUploadCheck，也不 arm 60 秒超时——配老服务端时会白占名额等一个不会来的
+      // 回包。名额归属：确认处理先清 activeUploadsMap 再 releaseSlot，processQueue 同步唤醒
+      // 本任务，故唤醒时若无同路径在途上传，名额必是本任务新占的，由这里释放；若微任务间隙
+      // 里另一路 FileUpload 已用同 key 登记 activeUploadsMap（waitForSlot 对 active key 立即
+      // 返回、共用名额），名额属于该上传，由其终态路径释放，这里不释放。
+      // Recheck after the wait: pending gone and the baseline already equals this content means
+      // the server confirmed identical content while we queued (e.g. another upload's
+      // FileUploadAck / FileSyncMtime synchronously consumed the pending and committed the
+      // baseline). Skip the FileUploadCheck and the 60s timeout — against an older server it
+      // would hold the slot waiting for a reply that never comes. Slot ownership: confirmation
+      // handlers clear activeUploadsMap and releaseSlot before processQueue wakes this task, so
+      // with no in-flight upload under the same path the slot is newly ours to release; if
+      // another FileUpload registered the same key in a microtask gap (waitForSlot returns
+      // immediately for active keys, sharing the slot), the slot belongs to that upload and is
+      // released by its terminal paths, not here.
+      if (!plugin.pendingUploadHashes.has(file.path) &&
+        plugin.fileHashManager.getPathHash(file.path) === contentHash) {
+        dump(`File modify check skipped (content already confirmed while queued): ${file.path}`, contentHash)
+        if (!activeUploadsMap.has(file.path)) plugin.concurrencyLimiter.releaseSlot(file.path)
+        return
+      }
       uploadContexts.set(file.path, plugin.syncState.activeSyncContext)
       armUploadAckTimeout(file.path, plugin)
       void plugin.websocket.SendMessage("FileUploadCheck", data)
