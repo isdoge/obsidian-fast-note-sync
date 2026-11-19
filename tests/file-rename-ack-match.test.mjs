@@ -35,11 +35,24 @@ vm.runInNewContext(code, {
   },
 });
 const ops = module.exports;
+function loadLocal(file) {
+  const module = { exports: {} };
+  vm.runInNewContext(ts.transpileModule(fs.readFileSync(path.join(root, file), 'utf8'), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }
+  }).outputText, { module, exports: module.exports, console, Map, Set,
+    require: id => id.includes('helpers') ? helpers
+      : id === 'obsidian' ? { TFile, normalizePath: p => p }
+      : id.includes('sync_state') ? { advanceLiveSyncTime: noop } : {} });
+  return module.exports;
+}
+const { ConcurrencyLimiter } = loadLocal('src/lib/sync/concurrency_limiter.ts');
+const noteOps = loadLocal('src/lib/sync/operator_note.ts');
 
 function fixture(entries) {
   const hashLog = [];
   const files = new Map(entries.map(e => [e.newPath, new TFile(e.newPath)]));
   const plugin = {
+    retryQueue: { matchesAck: () => false },
     settings: { syncEnabled: true, readonlySyncEnabled: false, vault: "v" },
     app: { vault: { getFileByPath: p => files.get(p) ?? null } },
     pendingFileRenames: entries.map(e => ({ ...e })),
@@ -49,7 +62,7 @@ function fixture(entries) {
       getPathHash: () => null, getValidHash: () => null,
     },
     localStorageManager: { getMetadata: () => 0, setMetadata: noop },
-    concurrencyLimiter: { releaseFifoSlot: noop },
+    concurrencyLimiter: { releaseSlot: noop, releaseFifoSlot: noop },
   };
   return { plugin, hashLog };
 }
@@ -100,3 +113,43 @@ function fixture(entries) {
 }
 
 console.log("PASS: file rename acks match pending entries by path, FIFO fallback for legacy, misses consume nothing");
+
+// 槽位与精确匹配项一致；无路径回退只消费该类型的首个待确认项。
+for (const type of ['file', 'note']) {
+  const f = fixture([
+    { oldPath: 'a', newPath: 'A', contentHash: 'ha' },
+    { oldPath: 'b', newPath: 'B', contentHash: 'hb' },
+  ]);
+  f.plugin.settings.concurrencyControlEnabled = true;
+  f.plugin.settings.maxConcurrentUploads = 5;
+  f.plugin.pendingNoteRenames = new Map(f.plugin.pendingFileRenames.map(e => [e.newPath, e]));
+  f.plugin.concurrencyLimiter = new ConcurrencyLimiter(f.plugin);
+  const limiter = f.plugin.concurrencyLimiter;
+  await limiter.waitForSlot('unrelated', true);
+  await limiter.waitForSlot('A', true);
+  await limiter.waitForSlot('B', true);
+  const ack = type === 'file' ? ops.receiveFileRenameAck : noteOps.receiveNoteRenameAck;
+  ack({ path: 'B' }, f.plugin);
+  assert.equal(limiter.activeKeys.has('B'), false, `${type}: release matched B slot`);
+  assert.equal(limiter.activeKeys.has('A'), true, `${type}: A remains active`);
+  ack({ path: 'missing' }, f.plugin);
+  assert.equal(limiter.activeKeys.has('A'), true, `${type}: unmatched ack consumes no slot`);
+  ack({}, f.plugin);
+  assert.equal(limiter.activeKeys.has('A'), false, `${type}: legacy ack releases matched first entry`);
+  assert.equal(limiter.activeKeys.has('unrelated'), true, `${type}: unrelated FIFO entry survives`);
+}
+console.log('PASS: note/file rename slots follow matched pending entries, including legacy and unmatched ACKs');
+
+// A pathless ACK uses the same FIFO pending identity even when the retry queue exists.
+{
+  const f = fixture([{ oldPath: 'a.png', newPath: 'b.png', contentHash: 'h' }]);
+  const calls = [];
+  f.plugin.retryQueue = {
+    matchesAck: (action, path) => action === 'FileRenameAck' && path === 'b.png',
+    acknowledge: (action, path) => { calls.push([action, path]); return true; },
+  };
+  f.plugin.localStorageManager.setMetadata = () => assert.fail('retry ACK must not advance sync time');
+  ops.receiveFileRenameAck({ lastTime: 999 }, f.plugin);
+  assert.equal(f.plugin.pendingFileRenames.length, 0, 'legacy FIFO ACK settles the matching queue operation');
+  assert.deepEqual(calls, [['FileRenameAck', 'b.png']]);
+}

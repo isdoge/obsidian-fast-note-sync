@@ -105,10 +105,12 @@ export class WebSocketManager {
   private deferredMessages: { action: string; data: StructuredMessageData }[] = [];
   private deferredBytes = 0;
   private replayScheduled = false;
+  private replayGeneration = 0;
   private deferredOverflowed = false;
 
   // --- 轻量事件总线，用于分批发送时等待服务端 BatchAck ---
   // Lightweight event bus for awaiting server BatchAck during batch send
+  private sentRequests = new Map<string, { action: string; path?: string }>();
   private _listeners: Map<string, Set<(...args: unknown[]) => void>> = new Map();
 
   /**
@@ -194,42 +196,10 @@ export class WebSocketManager {
       onClose: (client, code, reason) => {
         SyncLogManager.getInstance().addLog('error', 'ConnectionClosed',
           `WebSocket closed: ${code} ${reason}`, 'error');
-        if (this.plugin.isSyncing) {
-          this.plugin.isSyncing = false;
-          this.plugin.isSyncRequesting = false;
-          // 连接断开后本轮同步已不可能继续：一并作废其 context，让仍在跑的扫描循环
-          // 在下一个让出点自行退出，否则它会一直扫到底并用作废的 context 发一轮数据
-          // The round can't continue once the socket is gone: invalidate its context so an
-          // in-flight scan bails out at its next yield point instead of scanning to completion
-          // and sending a full round under a dead context.
-          this.plugin.syncState.activeSyncContext = null;
-          // 本轮未完成：已推进的同步时间回到本轮基线 / Unfinished round: sync times return to the baseline
-          settleSyncTimes(this.plugin, true);
-        }
-        // 旧连接上的延后消息不该在新连接上处理（其 vault/会话前提可能已失效）；
-        // 断线后本轮游标回基线，重连的增量同步会重新拉这些变更
-        // Deferred messages from the closed connection must not run on a new one (their
-        // vault/session assumptions may be stale); the round's cursor fell back to its
-        // baseline, so the post-reconnect incremental sync re-pulls those changes
-        this.clearDeferredMessages();
-        this.receivedFileDetails.clear();
-        // 断线即失去"本连接已对齐"的保证：单条消息推进游标的许可随连接失效（service#101）
-        // Disconnect voids the "this connection is aligned" guarantee: the per-item cursor
-        // advance permission expires with the connection (service#101)
-        this.plugin.syncState.hasSyncedThisConnection = false;
-        // #205：断线后空白笔记探测的结论不会再到达，作废在途/已确认标记，重连后重新探测
-        // #205: no probe verdict can arrive after the drop; void the marks so reconnect re-probes
-        clearEmptyNoteProbes(this.plugin);
-        // Downloads requested on the closed connection may no longer commit.
-        invalidateFileDownloads(this.plugin);
-        clearUploadQueue();
-        this.plugin.concurrencyLimiter.clear();
-        // 断线：清空所有在途上行批发送窗口会话的重传 timer（设计稿 §3.2 异常路径表）；
-        // W==0/旧路径下没有会话注册，no-op
-        settleAllBatchSendSessionsOnClose();
+        this.cleanupDisconnectedSync();
       },
       onMessage: (client, action, data) => {
-        this.handleStructuredMessage(action, data);
+        void this.handleStructuredMessage(action, data);
       },
       serializeMessage: (action, payload) => {
         // 防御性守卫：client.useProtobuf 与设置变更都会在发送前挡住此回调，正常不可达；
@@ -258,6 +228,45 @@ export class WebSocketManager {
     this.client.registerBinaryHandler(BINARY_PREFIX_FILE_SYNC, (data) => {
       void handleFileChunkDownload(data, this.plugin);
     });
+  }
+
+  /** 主动与被动断线共用清理，保留本地待上传改动。 / Shared disconnect cleanup preserves pending edits. */
+  private cleanupDisconnectedSync(): void {
+    this.sentRequests?.clear();
+    this.plugin.retryQueue?.onDisconnected();
+    if (this.plugin.isSyncing) {
+      this.plugin.isSyncing = false;
+      this.plugin.isSyncRequesting = false;
+      // 连接断开后本轮同步已不可能继续：一并作废其 context，让仍在跑的扫描循环
+      // 在下一个让出点自行退出，否则它会一直扫到底并用作废的 context 发一轮数据
+      // The round can't continue once the socket is gone: invalidate its context so an
+      // in-flight scan bails out at its next yield point instead of scanning to completion
+      // and sending a full round under a dead context.
+      this.plugin.syncState.activeSyncContext = null;
+      // 本轮未完成：已推进的同步时间回到本轮基线 / Unfinished round: sync times return to the baseline
+      settleSyncTimes(this.plugin, true);
+    }
+    // 旧连接上的延后消息不该在新连接上处理（其 vault/会话前提可能已失效）；
+    // 断线后本轮游标回基线，重连的增量同步会重新拉这些变更
+    // Deferred messages from the closed connection must not run on a new one (their
+    // vault/session assumptions may be stale); the round's cursor fell back to its
+    // baseline, so the post-reconnect incremental sync re-pulls those changes
+    this.clearDeferredMessages();
+    this.receivedFileDetails.clear();
+    // 断线即失去"本连接已对齐"的保证：单条消息推进游标的许可随连接失效（service#101）
+    // Disconnect voids the "this connection is aligned" guarantee: the per-item cursor
+    // advance permission expires with the connection (service#101)
+    this.plugin.syncState.hasSyncedThisConnection = false;
+    // #205：断线后空白笔记探测的结论不会再到达，作废在途/已确认标记，重连后重新探测
+    // #205: no probe verdict can arrive after the drop; void the marks so reconnect re-probes
+    clearEmptyNoteProbes(this.plugin);
+    // Downloads requested on the closed connection may no longer commit.
+    invalidateFileDownloads(this.plugin);
+    clearUploadQueue();
+    this.plugin.concurrencyLimiter.clear();
+    // 断线：清空所有在途上行批发送窗口会话的重传 timer（设计稿 §3.2 异常路径表）；
+    // W==0/旧路径下没有会话注册，no-op
+    settleAllBatchSendSessionsOnClose();
   }
 
   private isProtobufEnabled(): boolean {
@@ -333,6 +342,7 @@ export class WebSocketManager {
   }
   public unRegister(setUnregistered = false) {
     this.client.unRegister(setUnregistered);
+    this.cleanupDisconnectedSync();
   }
   public isConnected(): boolean {
     return this.client.isConnected();
@@ -341,13 +351,25 @@ export class WebSocketManager {
     this.client.triggerReconnect();
   }
   public SendMessage(action: WSAction.WSSendAction, data: unknown, before?: () => boolean, after?: () => void, context?: string) {
-    const injectedData = this.injectContext(data, context);
-    return this.client.SendMessage(action, injectedData, before, () => {
+    const queue = this.plugin.retryQueue;
+    const guard = queue?.sendGuard(action, data as { path?: string; oldPath?: string });
+    // Explicitly contextless: retry ACKs never belong to a scan round.
+    const injectedData = guard ? { ...(data as object), context: "" } : this.injectContext(data, context);
+    return this.client.SendMessage(action, injectedData, () => {
+      if (guard && !guard()) return true;
+      return before?.() ?? false;
+    }, () => {
+      const path = (data as { path?: string })?.path;
+      this.sentRequests ??= new Map();
+      if (/^(Note|File|Folder|Setting)(Modify|Delete|Rename|UploadCheck)$/.test(action)) {
+        this.sentRequests.set(`${action}:${path || ""}`, { action, path });
+      }
+      if (guard) queue.onSent(action, data as { path?: string; oldPath?: string });
       // Record the send event in sync logs
       // 在同步日志中记录发送事件
       SyncLogManager.getInstance().logSentMessage(action, injectedData as object | string, this.plugin.currentSyncType);
       after?.();
-    });
+    }, guard ? () => queue.beforeSend(action, data as { path?: string; oldPath?: string }) : undefined);
   }
   public Send(action: WSAction.WSSendAction, data: unknown, after?: () => void, context?: string) {
     const injectedData = this.injectContext(data, context);
@@ -388,7 +410,7 @@ export class WebSocketManager {
     return typeof record.code === "number";
   }
 
-  private handleStructuredMessage(msgAction: string, data: unknown) {
+  private handleStructuredMessage(msgAction: string, data: unknown, fromReplay = false) {
     if (!this.isStructuredMessageData(data)) {
       return;
     }
@@ -477,6 +499,20 @@ export class WebSocketManager {
     }
 
     if (data.code <= 0 || data.code >= 300) {
+      const isProtobufDecodeError = /(?:^|,\s*)(?:body:\s*)?Protobuf decode failed:/i.test(data.details || "");
+      const errorPath = typeof data.data?.path === "string" ? data.data.path : undefined;
+      // Old validation errors omit both path and action. Only a unique outstanding request
+      // can identify one safely; named legacy Ack errors match the serial queue by action.
+      const [onlyRequest] = this.sentRequests?.size === 1 ? this.sentRequests.values() : [];
+      const pathRequest = errorPath ? [...(this.sentRequests?.values() || [])].filter(r => r.path === errorPath) : [];
+      const errorAction = (!msgAction || msgAction === "Error")
+        ? (pathRequest.length === 1 ? pathRequest[0].action : onlyRequest?.action || "") : msgAction;
+      if (!isProtobufDecodeError && (!data.vault || data.vault === this.plugin.settings.vault) && !data.context
+        && this.plugin.retryQueue?.reject?.(errorAction, errorPath || (!msgAction ? onlyRequest?.path : undefined), data.code, data.message || "")) {
+        this.sentRequests?.delete(`${errorAction.replace(/Ack$/, "")}:${errorPath || onlyRequest?.path || ""}`);
+        return;
+      }
+      if (!isProtobufDecodeError && !data.context && errorPath && this.plugin.retryQueue?.ownsPendingPath(errorPath)) return;
       // 处理冲突相关错误码
       if (data.code === ERROR_SYNC_CONFLICT) {
         void this.handleConflictError(data);
@@ -498,7 +534,6 @@ export class WebSocketManager {
         const errorDetails = data.details ? " Details=" + data.details : "";
         // 服务端已成功解码外层响应，但客户端上行 protobuf 的内层 DTO 解码失败。
         // The server decoded this error envelope, but rejected our uplink protobuf DTO.
-        const isProtobufDecodeError = /(?:^|,\s*)(?:body:\s*)?Protobuf decode failed:/i.test(data.details || "");
         if (isProtobufDecodeError) {
           // 仅这类解码错误区别对待：protobuf 仍启用则回退到 JSON；已回退则静默忽略迟到的同类错误。
           // Only decode errors are special-cased: fall back while protobuf is still enabled,
@@ -517,6 +552,9 @@ export class WebSocketManager {
         } else if (data.data && typeof data.data.path === "string") {
           const path = data.data.path;
           this.plugin.concurrencyLimiter.releaseSlot(path);
+          // 下载占用的是 download_<路径> 名额，出错回应只带路径时也要一并放掉
+          // Downloads hold a download_<path> slot; release it too when the error only carries the path
+          this.plugin.concurrencyLimiter.releaseSlot("download_" + path);
           this.plugin.fileSyncTasks.completed++;
         }
       }
@@ -543,6 +581,20 @@ export class WebSocketManager {
         dump(`[SyncContext] Discard message ${msgAction} due to mismatched context. Expected: ${this.plugin.syncState.activeSyncContext}, Got: ${data.context}`);
         return;
       }
+      if (this.plugin.retryQueue?.shouldIgnoreAck(msgAction, typeof data.data?.path === "string" ? data.data.path : undefined)) return;
+      // 仅本机空闲时申请的槽位允许提前确认；已作废 context 已在上方丢弃。
+      // Only this client's idle-owned slots may settle early; retired contexts were rejected above.
+      const ackPath = typeof data.data?.path === "string" && data.data.path ? data.data.path
+        : msgAction === WSAction.NoteRenameAck ? Array.from(this.plugin.pendingNoteRenames?.keys() ?? [])[0]
+        : msgAction === WSAction.FileRenameAck ? this.plugin.pendingFileRenames?.[0]?.newPath : undefined;
+      const idleSlot = !data.context && ackPath !== undefined
+        && this.plugin.concurrencyLimiter?.getSlotContext?.(ackPath) === null;
+      const isLocalAck = [WSAction.NoteModifyAck, WSAction.FileUploadAck, WSAction.SettingModifyAck,
+        WSAction.NoteSyncMtime, WSAction.FileSyncMtime, WSAction.FileUpload,
+        WSAction.NoteRenameAck, WSAction.FileRenameAck, WSAction.NoteDeleteAck,
+        WSAction.FileDeleteAck, WSAction.SettingDeleteAck].includes(msgAction);
+      const queueAck = !data.context && this.plugin.retryQueue?.matchesAck(msgAction, typeof data.data?.path === "string" ? data.data.path : undefined);
+      const outsideRound = !!queueAck || (!!this.plugin.syncState.activeSyncContext && idleSlot && isLocalAck);
       if (this.plugin.syncState.activeSyncContext) {
         const isControlMsg = msgAction === WSAction.ClientReceiveAuth || msgAction === WSAction.ClientReceiveInfo;
         // Older servers omit context on the UpdateMtime response to NoteModify.
@@ -550,13 +602,27 @@ export class WebSocketManager {
         const isPendingMtimeAck = msgAction === WSAction.NoteSyncMtime && !data.context
           && typeof data.data?.path === 'string'
           && this.plugin.pendingNoteModifies.has(data.data.path);
-        if (!isControlMsg && !isPendingMtimeAck && data.context !== this.plugin.syncState.activeSyncContext) {
+        // 旧服务端复用上传会话时可能丢失本轮 context；按路径等待的文件确认不能延后，否则分页永远无法结束。
+        // Older servers may lose the round context when reusing uploads; pending file Acks must settle now or the page cannot finish.
+        const isPendingFileUploadAck = msgAction === WSAction.FileUploadAck && !data.context
+          && typeof data.data?.path === 'string'
+          && this.plugin.syncState.pendingFilePushPageIndex.has(data.data.path);
+        if (!isControlMsg && !outsideRound && !isPendingMtimeAck && !isPendingFileUploadAck && data.context !== this.plugin.syncState.activeSyncContext) {
           this.enqueueDeferredMessage(msgAction, data);
           return;
         }
       }
 
-      this.dispatchReceiveMessage(msgAction, data);
+      // 回放中的新实时消息排到队尾，控制消息仍立即处理。
+      // Queue live arrivals behind the replay backlog; control messages remain immediate.
+      const isControlMsg = msgAction === WSAction.ClientReceiveAuth || msgAction === WSAction.ClientReceiveInfo;
+      if (!fromReplay && !isControlMsg && !(isLocalAck && idleSlot) && !msgAction.endsWith("Ack") && !this.plugin.syncState.activeSyncContext
+        && (this.replayScheduled || this.deferredMessages.length > 0)) {
+        this.enqueueDeferredMessage(msgAction, data);
+        this.scheduleDeferredReplay();
+        return;
+      }
+      return this.dispatchReceiveMessage(msgAction, data, outsideRound);
     }
   }
 
@@ -567,7 +633,7 @@ export class WebSocketManager {
    * tail of handleStructuredMessage): vault filtering already happened upstream; this does
    * the pageIndex conversion, context merge, retransmission dedup and handler invocation.
    */
-  private dispatchReceiveMessage(msgAction: string, data: StructuredMessageData) {
+  private dispatchReceiveMessage(msgAction: string, data: StructuredMessageData, outsideRound = false) {
     const handler = receiveOperators.get(msgAction);
     if (!handler) return;
     // WSResponse 信封 pageIndex 转换（设计稿 §4.3，唯一转换点）：线上 1-based，
@@ -596,17 +662,23 @@ export class WebSocketManager {
         // Retransmission must not enqueue the same page item again while it is
         // waiting for a slot or already processed. Non-paged live edits bypass this.
         const path = (payload as { path?: string })?.path;
+        const requestAction = msgAction === WSAction.FileUpload || msgAction === WSAction.FileSyncMtime || msgAction === WSAction.FileUploadAck
+          ? "FileUploadCheck" : msgAction === WSAction.NoteSyncMtime ? "NoteModify" : msgAction.replace(/Ack$/, "");
+        const requestPath = path || (msgAction === WSAction.NoteRenameAck ? [...this.plugin.pendingNoteRenames.keys()][0]
+          : msgAction === WSAction.FileRenameAck ? this.plugin.pendingFileRenames[0]?.newPath : undefined);
+        if (requestPath) this.sentRequests?.delete(`${requestAction}:${requestPath}`);
         const detailKey = context && pageIndex !== undefined && typeof path === 'string'
           && [WSAction.FileSyncUpdate, WSAction.FileUpload, WSAction.FileSyncMtime,
               WSAction.FileSyncDelete, WSAction.FileSyncRename].includes(msgAction)
           ? JSON.stringify([context, pageIndex, msgAction, path]) : null;
         if (detailKey && this.receivedFileDetails.has(detailKey)) return;
         if (detailKey) this.receivedFileDetails.add(detailKey);
-        void Promise.resolve(handler(payload, this.plugin)).catch(error => {
+        const processing = Promise.resolve(handler(payload, this.plugin, outsideRound)).catch(error => {
           if (detailKey) this.receivedFileDetails.delete(detailKey);
           dump('Sync handler failed', msgAction, error);
         });
         this.client.notifyActivity();
+        return processing;
   }
 
   // ─── 延后队列（见类顶部字段注释 / see class-top field comment）──────────────
@@ -633,13 +705,21 @@ export class WebSocketManager {
   private scheduleDeferredReplay(): void {
     if ((this.deferredMessages.length === 0 && !this.deferredOverflowed) || this.replayScheduled) return;
     this.replayScheduled = true;
+    const generation = this.replayGeneration ??= 0;
     window.setTimeout(() => {
-      this.replayScheduled = false;
-      this.drainDeferredMessages();
+      if (generation !== this.replayGeneration) return;
+      void this.drainDeferredMessages(generation).catch(error => {
+        dump('Deferred replay failed', error);
+      }).finally(() => {
+        if (generation === this.replayGeneration) {
+          this.replayScheduled = false;
+          if (!this.plugin.syncState.activeSyncContext) this.scheduleDeferredReplay();
+        }
+      });
     }, 0);
   }
 
-  private drainDeferredMessages(): void {
+  private async drainDeferredMessages(generation: number): Promise<void> {
     // 队列溢出丢过消息：回放其余消息时不能再推进同步时间，否则会越过被丢弃的那条。
     // 退回"本连接尚未完成同步"的状态，等下一轮同步按已结算的时间重新拉取
     // Messages were dropped on overflow: replaying the rest must not advance the sync cursor past
@@ -651,10 +731,10 @@ export class WebSocketManager {
     }
     // 回放期间新一轮同步已开始：剩余消息留队，等该轮结束的下次触发
     // A new round started mid-replay: leave the rest queued for that round's next trigger
-    while (this.deferredMessages.length > 0 && !this.plugin.syncState.activeSyncContext) {
+    while (generation === this.replayGeneration && this.deferredMessages.length > 0 && !this.plugin.syncState.activeSyncContext) {
       const { action, data } = this.deferredMessages.shift()!;
       this.deferredBytes -= WebSocketManager.stringifySize(data);
-      this.handleStructuredMessage(action, data);
+      await this.handleStructuredMessage(action, data, true);
     }
   }
 
@@ -667,6 +747,7 @@ export class WebSocketManager {
     if (this.deferredMessages.length > 0) {
       dump(`[SyncContext] Connection closed; dropping ${this.deferredMessages.length} deferred messages`);
     }
+    this.replayGeneration = (this.replayGeneration ?? 0) + 1;
     this.deferredMessages = [];
     this.deferredBytes = 0;
     this.replayScheduled = false;
@@ -752,11 +833,15 @@ export class WebSocketManager {
       }
     }
 
+    // A failed or cancelled drain must not prevent the regular catch-up scan.
+    await this.plugin.retryQueue?.onAuthenticated().catch(error => {
+      dump("[RetryQueue] Replay interrupted; continuing regular sync safely", error);
+    });
+    if (handleId !== this.currentStartHandleId || !this.client.isAuth || !this.client.isOpen) return;
     this.plugin.isFirstSync = true;
 
     // 检查是否有用户手动触发的待执行同步 / Check if user manually triggered a pending sync
     const pendingType = this.plugin.syncState.pendingSyncType;
-    this.plugin.syncState.pendingSyncType = null;
 
     if (this.plugin.settings.manualSyncEnabled) {
       // 如果用户手动触发了同步，即使 manualSyncEnabled 也执行一次

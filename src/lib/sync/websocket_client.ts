@@ -22,6 +22,7 @@ export interface AppStoragePlugin {
     loadLocalStorage: (key: string) => unknown;
     saveLocalStorage: (key: string, value: string | null) => void;
   };
+  concurrencyLimiter?: { protectSending: (key: string) => () => void };
   settings?: {
     protobufEnabled?: boolean;
   };
@@ -372,22 +373,31 @@ export class WebSocketClient {
       return;
     }
 
-    while (this.ws.bufferedAmount > maxBufferSize) {
+    const socket = this.ws;
+    while (this.ws === socket && socket.readyState === WebSocket.OPEN && socket.bufferedAmount > maxBufferSize) {
       await new Promise(resolve => window.setTimeout(resolve, 50));
     }
   }
 
-  public async SendMessage(action: string, data: unknown, before?: () => boolean, after?: () => void) {
+  public async SendMessage(action: string, data: unknown, before?: () => boolean, after?: () => void, finalCheck?: () => Promise<boolean>) {
     if (before && before()) {
       return true; // Cancelled
     }
 
-    await this.waitForBufferDrain();
-
-    this.Send(action, data, () => {
-      after?.();
-      this.notifyActivity();
-    });
+    const key = (data as { path?: string })?.path;
+    const finishSending = key ? this.plugin.concurrencyLimiter?.protectSending(key) : undefined;
+    try {
+      await this.waitForBufferDrain();
+      if (before && before()) return true;
+      if (finalCheck && !await finalCheck()) return true;
+      if (before && before()) return true;
+      this.Send(action, data, () => {
+        after?.();
+        this.notifyActivity();
+      });
+    } finally {
+      finishSending?.();
+    }
   }
 
   public Send(action: string, data: unknown, after?: () => void) {

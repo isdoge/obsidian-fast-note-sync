@@ -87,7 +87,7 @@ function fixture(kind, { content = "written offline", readonly = false } = {}) {
       saveLocalStorage: noop,
     },
     lockManager: { withLock: async (_, fn) => fn() },
-    websocket: { ws: {}, SendMessage: async action => sent.push(action) },
+    websocket: { ws: {}, SendMessage: async (action, _data, _before, after) => { sent.push(action); after?.(); } },
     fileHashManager: hashManager(),
     pendingNoteModifies: new Map(), pendingUploadHashes: new Map(),
     pendingDeleteNotePaths: new Set(), pendingDeleteFilePaths: new Set(),

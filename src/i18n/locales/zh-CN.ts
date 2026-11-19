@@ -615,6 +615,7 @@ export default {
   "ui.notice.connection_retrying": "同步连接持续失败，将继续在后台重试",
   "ui.notice.protobuf_fallback": "Protobuf 消息解码失败，本次会话已切换为 JSON；保存的 Protobuf 设置未更改。",
   "ui.notice.hash_limit_exceeded": "已达到单次哈希计算上限 (${limit})，本次跳过 ${skipped} 个文件，将在下次同步时继续处理；也可以调高上限或关闭限制。",
+  "ui.notice.hash_timeout": "本轮有 ${count} 个文件因哈希计算超时被跳过，受影响类型的同步时间已保留，将在下次同步时重试。",
   "ui.conflict.list_count": "${count} 个文件冲突",
   "ui.conflict.list_empty": "当前无发生冲突的笔记",
   "ui.conflict.diff_skipped": "文件较大，已跳过逐行差异对比。可点击上方按钮选用本地/远端版本，或在右侧编辑器直接编辑。",

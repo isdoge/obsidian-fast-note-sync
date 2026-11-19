@@ -499,6 +499,28 @@ export class HttpApiService {
         return res.data;
     }
 
+    /** Existing read-only endpoints; never use sync/check requests, which can mutate state. */
+    async getRetryQueueState(kind: "note" | "file", path: string): Promise<{ path: string; contentHash: string } | null> {
+        const controller = new AbortController();
+        const timer = window.setTimeout(() => controller.abort(), 10000);
+        try {
+            const params = new URLSearchParams({ vault: this.plugin.settings.vault, path,
+                pathHash: hashContent(path), isRecycle: "false" });
+            const endpoint = kind === "note" ? "/api/note" : "/api/file/info";
+            const { status, json } = await this.request(`${endpoint}?${params}`, { method: "GET", signal: controller.signal });
+            const res = json as ApiResponse<{ path?: string; contentHash?: string; isRecycle?: boolean }> & { details?: unknown };
+            if (status === 200 && (res?.code === 430 || res?.code === 455
+                || (kind === "file" && res?.code === 0 && typeof res.details === "string" && /record not found/i.test(res.details)))) return null;
+            if (status !== 200 || !this.isSuccess(json) || res.data?.path !== path
+                || typeof res.data.contentHash !== "string" || res.data.isRecycle === true) {
+                throw new Error("Retry queue: remote state unavailable");
+            }
+            return { path: res.data.path, contentHash: res.data.contentHash };
+        } finally {
+            window.clearTimeout(timer);
+        }
+    }
+
     /**
      * 获取笔记列表（支持回收站模式）
      */

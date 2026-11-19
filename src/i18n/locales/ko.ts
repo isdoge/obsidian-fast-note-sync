@@ -615,6 +615,7 @@ export default {
   "ui.notice.connection_retrying": "동기화 연결이 계속 실패합니다. 백그라운드에서 계속 재시도합니다",
   "ui.notice.protobuf_fallback": "Protobuf 메시지 디코딩에 실패하여 이 세션에서는 JSON으로 전환했습니다. 저장된 Protobuf 설정은 변경되지 않았습니다.",
   "ui.notice.hash_limit_exceeded": "단일 해시 계산 상한(${limit})에 도달하여 이번에 ${skipped}개 파일을 건너뛰었습니다. 다음 동기화에서 계속 처리됩니다. 상한을 높이거나 제한을 비활성화할 수도 있습니다.",
+  "ui.notice.hash_timeout": "해시 계산 시간 초과로 파일 ${count}개를 건너뛰었습니다. 해당 유형의 동기화 시간을 유지하여 다음 동기화에서 다시 시도합니다.",
   "ui.conflict.list_count": "${count}개 파일 충돌",
   "ui.conflict.list_empty": "현재 충돌하는 노트가 없습니다",
   "ui.conflict.diff_skipped": "파일이 커서 줄 단위 차이 비교를 건너뛰었습니다. 위 버튼으로 로컬/원격 버전을 선택하거나 오른쪽 편집기에서 직접 편집하세요.",

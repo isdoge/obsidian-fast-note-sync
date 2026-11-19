@@ -1,11 +1,11 @@
 import { TFolder, TFile, normalizePath } from "obsidian";
 
-import { receiveFileUpload, receiveFileSyncUpdate, receiveFileSyncDelete, receiveFileSyncMtime, receiveFileSyncChunkDownload, receiveFileSyncEnd, checkAndUploadAttachments, receiveFileSyncRename, receiveFileRenameAck, receiveFileUploadAck, receiveFileDeleteAck, isPluginUnloading, sweepStalledDownloadSessions, invalidateFileDownloads } from "./operator_file";
+import { receiveFileUpload, receiveFileSyncUpdate, receiveFileSyncDelete, receiveFileSyncMtime, receiveFileSyncChunkDownload, receiveFileSyncEnd, checkAndUploadAttachments, receiveFileSyncRename, receiveFileRenameAck, receiveFileUploadAck, receiveFileDeleteAck, isPluginUnloading, sweepStalledDownloadSessions, invalidateFileDownloads, isAttachmentUploadActive } from "./operator_file";
 import { hashContent, hashContentAsync, dump, isPathExcluded, isFolderSyncPathExcluded, configIsPathExcluded, getConfigSyncCustomDirs, generateUUID, showSyncNotice, isLargeBinarySyncRisk, describeBinarySyncLimit, hashFileAsync, formatFileSize, yieldToMain, getPluginDir } from "../utils/helpers";
 import { receiveConfigSyncModify, receiveConfigUpload, receiveConfigSyncMtime, receiveConfigSyncDelete, receiveConfigSyncEnd, configAllPaths, receiveConfigSyncClear, receiveConfigModifyAck, receiveConfigDeleteAck } from "./operator_config";
 import { receiveNoteSyncModify, receiveNoteUpload, receiveNoteSyncMtime, receiveNoteSyncDelete, receiveNoteSyncEnd, receiveNoteSyncRename, receiveNoteModifyAck, receiveNoteRenameAck, receiveNoteDeleteAck } from "./operator_note";
 import { SyncMode, SnapFile, SnapFolder, SyncEndData, PathHashFile, NoteSyncData, FileSyncData, ConfigSyncData, FolderSyncData } from "../utils/types";
-import { receiveFolderSyncModify, receiveFolderSyncDelete, receiveFolderSyncRename, receiveFolderSyncEnd } from "./operator_folder";
+import { receiveFolderSyncModify, receiveFolderSyncDelete, receiveFolderSyncRename, receiveFolderSyncEnd, receiveFolderRetryAck } from "./operator_folder";
 import { FileCloudPreview } from "../storage/file_cloud_preview";
 import { SyncLogManager } from "./sync_log_manager";
 import * as WSAction from "./websocket_action";
@@ -111,6 +111,25 @@ export const SYNC_STALL_RESTART_MS = 300000;
 // Stall restart backoff: wait 5 minutes, doubling (5/10/20 min), at most 3 in a row; a further stall
 // stops automatic restarts and reports in the status bar. The count resets on completion or give-up.
 export const SYNC_STALL_MAX_RESTARTS = 3;
+// 并发名额超过这个时间没有动静，就当作确认丢失、无人归还并清扫。取 3 分钟，比停滞阈值短，
+// 清扫后名额归零，停滞检测才能按原来的 5 分钟逻辑重启一轮。
+// A concurrency slot untouched for this long is treated as an abandoned (lost-ack) slot and
+// swept. Three minutes, shorter than the stall threshold, so emptying the slots lets the
+// existing five-minute stall watchdog restart the round.
+export const SYNC_SLOT_STALE_MS = 180000;
+
+// 清扫名额时的"仍忙碌"判断：正在上传的附件和还有下载会话的键不能收回。
+// 其它等待确认的键（笔记/配置的修改、删除、改名）没有超时，正是要清扫的泄漏来源。
+// Busy predicate for the slot sweep: in-progress attachment uploads and keys still owned by a
+// download session must be kept. The other acks (note/config modify, delete, rename) have no
+// timeout and are exactly the leaks this sweep targets.
+function isConcurrencyKeyBusy(plugin: FastSync, key: string): boolean {
+  if (isAttachmentUploadActive(key)) return true;
+  for (const session of plugin.fileDownloadSessions.values()) {
+    if ((session.initialSlotKey || `download_${session.path}`) === key) return true;
+  }
+  return false;
+}
 const syncStallState: { context?: string; signature: string; lastProgressAt: number; restarts: number; restartTimer?: number } = { signature: "", lastProgressAt: 0, restarts: 0 };
 
 export function isSyncStalled(plugin: FastSync, ownerContext: string | undefined, now = Date.now()): boolean {
@@ -155,7 +174,7 @@ export function settleSyncTimes(plugin: FastSync, abort = false): void {
     if (endTime === undefined) continue;
     const done = plugin.progressTracker.isTypeFullyDone(trackerType)
       && (trackerType !== "file" || plugin.fileDownloadSessions.size === 0);
-    const truncated = truncatedSyncFields?.has(field) ?? false;
+    const truncated = (truncatedSyncFields?.has(field) ?? false) || (plugin.syncState.hashTimeoutCounts?.has(field) ?? false);
     if (!abort && !truncated && done && tasks.failed === 0) {
       plugin.localStorageManager.setMetadata(field, endTime);
     } else if (abort || done) {
@@ -192,6 +211,7 @@ function restartStalledSync(plugin: FastSync, intervalId?: number): void {
   plugin.syncPageStateMap.clear();
   plugin.syncState.pendingNotePushPageIndex.clear();
   plugin.syncState.pendingFilePushPageIndex.clear();
+  plugin.syncState.completedFileUploadSessions?.clear();
   plugin.syncState.pendingConfigPushPageIndex.clear();
   plugin.totalFilesToDownload = 0;
   plugin.downloadedFilesCount = 0;
@@ -236,9 +256,15 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, _sync
 
   void sweepStalledDownloadSessions(plugin);
 
-  if (ownerContext && isSyncStalled(plugin, ownerContext)) {
-    restartStalledSync(plugin, intervalId);
-    return;
+  if (ownerContext) {
+    // 先清扫长期无人归还的名额，再判断停滞：漏掉的名额否则会让 activeKeys 永远非空
+    // Sweep long-abandoned slots before the stall check; a leaked slot would otherwise keep
+    // activeKeys non-empty forever and the watchdog would never fire
+    plugin.concurrencyLimiter.sweepStale?.(SYNC_SLOT_STALE_MS, key => isConcurrencyKeyBusy(plugin, key));
+    if (isSyncStalled(plugin, ownerContext)) {
+      restartStalledSync(plugin, intervalId);
+      return;
+    }
   }
   settleSyncTimes(plugin);
   const ws = plugin.websocket.ws;
@@ -324,11 +350,18 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, _sync
     // before resetSyncTasks (which also clears offlineGuardSkippedThisRound), so we can decide
     // below whether refreshing lastSyncSuccessTime is trustworthy
     const offlineGuardSkippedThisRound = plugin.syncState.offlineGuardSkippedThisRound;
+    const hashTimeoutCount = Array.from(plugin.syncState.hashTimeoutCounts?.values() ?? [])
+      .reduce((sum, count) => sum + count, 0);
+    if (hashTimeoutCount > 0) {
+      showSyncNotice($("ui.notice.hash_timeout", { count: String(hashTimeoutCount) }), 10000);
+      plugin.syncState.hasSyncedThisConnection = false;
+    }
     // 未参与完成判定的类型（如本轮中途关闭了同步）仍有暂存时间时回到基线
     // Types left unsettled (e.g. sync disabled mid-round) fall back to their baseline
     settleSyncTimes(plugin, true);
     syncStallState.restarts = 0;
 
+    if (totalFailed === 0 && hashTimeoutCount === 0) plugin.retryQueue?.completeScan(plugin.progressTracker.getActiveTypes());
     plugin.syncState.activeSyncContext = null; // 同步完成，清空活跃的上下文 / Sync completed, reset the active context
     plugin.isSyncing = false;
     plugin.syncTypeCompleteCount = 0;
@@ -377,7 +410,7 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, _sync
     // was intercepted by the offline guard this round (user clicked "Cancel"), that batch of
     // risky files was never actually handled — refreshing the timestamp would zero out the
     // offline duration and silently defeat the guard on the very next round.
-    if (!offlineGuardSkippedThisRound && totalFailed === 0) {
+    if (!offlineGuardSkippedThisRound && totalFailed === 0 && hashTimeoutCount === 0) {
       plugin.localStorageManager.setMetadata("lastSyncSuccessTime", Date.now());
       // 本连接自此完成过一轮正常同步：实时单条消息此后允许推进游标（service#101，
       // 见 sync_state.hasSyncedThisConnection 注释）。与本轮 lastSyncSuccessTime 同判定：
@@ -389,6 +422,12 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, _sync
       // don't block it (see the field's conservative rule)
       plugin.syncState.hasSyncedThisConnection = true;
     }
+
+    // 本轮同步结束：先强制落盘哈希/快照，再落盘同步时间镜像，保证配对一致
+    (plugin.fileHashManager as { flush?: () => void } | undefined)?.flush?.();
+    (plugin.configHashManager as { flush?: () => void } | undefined)?.flush?.();
+    (plugin.folderSnapshotManager as { flush?: () => void } | undefined)?.flush?.();
+    (plugin.localStorageManager as { flushSyncStateMirror?: () => void } | undefined)?.flushSyncStateMirror?.();
 
     // 如果开启了云预览，在首次同步后检查所有附件在服务端的状态
     if (plugin.settings.cloudPreviewEnabled) {
@@ -418,14 +457,14 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, _sync
  * 消息接收调度
  */
 
-export type OperatorHandler = (data: unknown, plugin: FastSync) => Promise<void> | void;
+export type OperatorHandler = (data: unknown, plugin: FastSync, outsideRound?: boolean) => Promise<void> | void;
 export const receiveOperators: Map<WSAction.WSReceiveAction, OperatorHandler> = new Map([
   [WSAction.NoteSyncModify, receiveNoteSyncModify],
   [WSAction.NoteSyncNeedPush, receiveNoteUpload],
   [WSAction.NoteSyncMtime, receiveNoteSyncMtime],
   [WSAction.NoteSyncDelete, receiveNoteSyncDelete],
   [WSAction.NoteSyncRename, receiveNoteSyncRename],
-  [WSAction.NoteModifyAck, (data, plugin) => receiveNoteModifyAck(data as { lastTime?: number; path?: string }, plugin)],
+  [WSAction.NoteModifyAck, (data, plugin, outsideRound) => receiveNoteModifyAck(data as { lastTime?: number; path?: string }, plugin, outsideRound)],
   [WSAction.NoteRenameAck, (data, plugin) => receiveNoteRenameAck(data as { lastTime?: number; path?: string }, plugin)],
   [WSAction.NoteDeleteAck, (data, plugin) => receiveNoteDeleteAck(data as { lastTime?: number; path?: string }, plugin)],
   [WSAction.NoteSyncEnd, (data, plugin) => receiveSyncEndWrapper(data, plugin, "note")],
@@ -447,6 +486,8 @@ export const receiveOperators: Map<WSAction.WSReceiveAction, OperatorHandler> = 
   [WSAction.SettingSyncClear, receiveConfigSyncClear],
   [WSAction.SettingModifyAck, receiveConfigModifyAck],
   [WSAction.SettingDeleteAck, receiveConfigDeleteAck],
+  [WSAction.FolderDeleteAck, (data, plugin) => receiveFolderRetryAck("FolderDeleteAck", data as { path?: string }, plugin)],
+  [WSAction.FolderRenameAck, (data, plugin) => receiveFolderRetryAck("FolderRenameAck", data as { path?: string }, plugin)],
   [WSAction.FolderSyncModify, receiveFolderSyncModify],
   [WSAction.FolderSyncDelete, receiveFolderSyncDelete],
   [WSAction.FolderSyncRename, receiveFolderSyncRename],
@@ -684,6 +725,10 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     dump("Sync already in progress, skipping");
     return;
   }
+  await plugin.retryQueue?.drainBeforeSync().catch(error => {
+    dump("[RetryQueue] Replay interrupted; continuing regular sync safely", error);
+  });
+  if (plugin.isSyncing) return;
   plugin.isSyncing = true;
 
   // 同步开始前，全局清空上一轮残留的 conflict-notes 物理冲突临时目录中的文件（位于插件目录下，避免 Windows 锁定目录报错）
@@ -763,28 +808,23 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     plugin.downloadedChunksCount = 0;
     plugin.totalChunksToUpload = 0;
     plugin.uploadedChunksCount = 0;
-    // 清空上一次连接的未完成 rename 队列，由 hashManager 旧路径进 delFiles 自然处理
-    // Clear pending renames from previous connection; old paths in hashManager will naturally go into delFiles
-    plugin.pendingFileRenames = []
-    // 清空上一次连接的未完成笔记 rename 队列，由 hashManager 旧路径进 delNotes 自然处理
-    // Clear pending note renames from previous connection; old paths in hashManager will naturally go into delNotes
-    plugin.pendingNoteRenames = new Map()
-    // 清空 pending 删除路径集合，避免旧 of pending 条目干扰本次同步
-    // Clear pending delete path sets to avoid stale entries interfering with this sync
+    // 只保留仍占用空闲槽位的请求，旧轮次/旧连接的条目由扫描重新处理。
+    // Keep pending idle-owned requests until their ACKs; rescan retired/disconnected entries.
+    plugin.pendingFileRenames = plugin.pendingFileRenames.filter(entry => plugin.concurrencyLimiter.getSlotContext?.(entry.newPath) === null)
+    plugin.pendingNoteRenames = new Map(Array.from(plugin.pendingNoteRenames).filter(([path]) => plugin.concurrencyLimiter.getSlotContext?.(path) === null))
     plugin.pendingDeleteNotePaths.clear()
     plugin.pendingDeleteFilePaths.clear()
     plugin.pendingDeleteFolderPaths.clear()
     plugin.pendingDeleteConfigPaths.clear()
-    // 重连时清空 pending Ack 集合；路径保留在 hashManager，将自然进入 delNotes
-    // On reconnect clear pending Ack sets; paths remain in hashManager and flow into delNotes naturally
-    plugin.pendingNoteDeleteAcks.clear()
-    plugin.pendingFileDeleteAcks.clear()
-    plugin.pendingConfigDeleteAcks.clear()
+    plugin.pendingNoteDeleteAcks = new Set(Array.from(plugin.pendingNoteDeleteAcks).filter(path => plugin.concurrencyLimiter.getSlotContext?.(path) === null))
+    plugin.pendingFileDeleteAcks = new Set(Array.from(plugin.pendingFileDeleteAcks).filter(path => plugin.concurrencyLimiter.getSlotContext?.(path) === null))
+    plugin.pendingConfigDeleteAcks = new Set(Array.from(plugin.pendingConfigDeleteAcks).filter(path => plugin.concurrencyLimiter.getSlotContext?.(path) === null))
     // 清空上一轮 NeedPush→Ack 页归属查找表（C3，见 sync_state.ts 注释），避免残留条目误归账到新一轮的页
     // Clear the previous round's NeedPush->Ack page-attribution lookup maps (C3, see sync_state.ts
     // comment), preventing stale entries from misattributing completions in the new round
     plugin.syncState.pendingNotePushPageIndex.clear()
     plugin.syncState.pendingFilePushPageIndex.clear()
+    plugin.syncState.completedFileUploadSessions?.clear()
     plugin.syncState.pendingConfigPushPageIndex.clear()
     // 注意：不清空 pendingConfigModifies，与 pendingNoteModifies 对齐——
     // 该集合记录扫描期间用户本地新改动的配置路径，需保留到扫描阶段用于跳过判断，
@@ -863,6 +903,8 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       let hashComputeCount = 0;
       let truncatedNoteCount = 0;
       let truncatedFileCount = 0;
+      let timedOutNoteCount = 0;
+      let timedOutFileCount = 0;
 
       // --- PERF: bounded concurrency for cache-miss hash computation ---
       // 哈希缓存未命中的文件原先完全串行 read+hash，大库首次/全量扫描时很慢；
@@ -931,6 +973,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
               if (isLoadLastTime
                 && file.stat.mtime < Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime"))
                 && plugin.fileHashManager.getPathHash(file.path) !== null
+                && plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size) === plugin.fileHashManager.getPathHash(file.path)
                 && !plugin.pendingNoteModifies.has(file.path)
                 && !plugin.syncState.conflictedPaths.has(file.path)) continue;
 
@@ -961,7 +1004,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                   try {
                     const contentHash = await Promise.race([
                       plugin.app.vault.read(file).then(content => hashContentAsync(content)),
-                      new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error(`Hash timeout`)), 15000))
+                      new Promise<never>((_, reject) => window.setTimeout(() => reject(Object.assign(new Error(`Hash timeout`), { name: "HashTimeoutError" })), 15000))
                     ]);
                     plugin.scannedNoteHashes.set(notePath, { hash: contentHash, mtime: noteMtime, size: noteSize });
                     const baseHash = plugin.fileHashManager.getPathHash(notePath);
@@ -974,21 +1017,24 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                       size: noteSize,
                       ...(baseHash !== null ? { baseHash } : { baseHashMissing: true }),
                     });
-                  } catch {
-                    // 哈希失败或超时，跳过该文件，不计入本轮同步 / Skip file on hash failure or timeout
+                  } catch (error) {
+                    // 超时单独计数，受影响类型保留游标供下轮重试。 / Count timeouts separately and retry the type next round.
+                    if (error instanceof Error && error.name === "HashTimeoutError") timedOutNoteCount++;
                   }
                 });
               }
             } else {
-              if (isLargeBinarySyncRisk(file.stat.size, plugin)) continue;
-              const attachmentLimit = (plugin.settings.attachmentSyncLimit ?? 50) * 1024 * 1024;
-              if (file.stat.size > attachmentLimit) continue;
+              if (isLargeBinarySyncRisk(file.stat.size, plugin)) {
+                dump(`Skip scanning large attachment (${describeBinarySyncLimit(plugin)} limit): ${file.path}`, file.stat.size);
+                continue;
+              }
               const skipSync = plugin.settings.cloudPreviewEnabled && (!plugin.settings.cloudPreviewTypeRestricted || FileCloudPreview.isRestrictedType("." + file.extension));
               if (skipSync) continue;
 
               if (isLoadLastTime
                 && file.stat.mtime < Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))
                 && plugin.fileHashManager.getPathHash(file.path) !== null
+                && plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size) === plugin.fileHashManager.getPathHash(file.path)
                 && !plugin.pendingUploadHashes.has(file.path)) continue;
 
               const cachedFileHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size);
@@ -1014,7 +1060,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                   try {
                     const contentHash = await Promise.race([
                       hashFileAsync(plugin.app, attPath),
-                      new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error(`Hash timeout`)), 15000))
+                      new Promise<never>((_, reject) => window.setTimeout(() => reject(Object.assign(new Error(`Hash timeout`), { name: "HashTimeoutError" })), 15000))
                     ]);
                     const baseHash = plugin.fileHashManager.getPathHash(attPath);
                     // 内容未变只是 mtime 被刷新：上报同步时的 mtime，服务端有新版本时按下载处理而非要求上传；
@@ -1034,8 +1080,9 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                       size: attSize,
                       ...(baseHash !== null ? { baseHash } : { baseHashMissing: true }),
                     });
-                  } catch {
-                    // 哈希失败或超时，跳过该文件，不计入本轮同步 / Skip file on hash failure or timeout
+                  } catch (error) {
+                    // 超时单独计数，受影响类型保留游标供下轮重试。 / Count timeouts separately and retry the type next round.
+                    if (error instanceof Error && error.name === "HashTimeoutError") timedOutFileCount++;
                   }
                 });
               }
@@ -1051,6 +1098,10 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       if (hashInFlight.size > 0) {
         await Promise.all(Array.from(hashInFlight));
       }
+
+      if (plugin.syncState.activeSyncContext !== context) return;
+      if (timedOutNoteCount > 0) plugin.syncState.hashTimeoutCounts.set("lastNoteSyncTime", timedOutNoteCount);
+      if (timedOutFileCount > 0) plugin.syncState.hashTimeoutCounts.set("lastFileSyncTime", timedOutFileCount);
 
       // Persist any newly computed hashes (breaks the Catch-22)
       commitScannedHashes(plugin.scannedNoteHashes, (m) => plugin.fileHashManager.bulkSetFromScanned(m));
@@ -1076,7 +1127,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         let delCount = 0;
         for (const path of trackedPaths) {
           if (++delCount % 100 === 0) await yieldToMain();
-          if (isPathExcluded(path, plugin)) continue;
+          if (isPathExcluded(path, plugin) || plugin.retryQueue?.shouldSkipScanDelete(path)) continue;
           if (!localPathsSet.has(path)) {
             const item = { path: path, pathHash: hashContent(path) };
             if (path.endsWith(".md")) {
@@ -1094,7 +1145,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
           let folderCount = 0;
           for (const path of trackedFolderPaths) {
             if (++folderCount % 100 === 0) await yieldToMain();
-            if (isFolderSyncPathExcluded(path, plugin)) continue;
+            if (isFolderSyncPathExcluded(path, plugin) || plugin.retryQueue?.shouldSkipScanDelete(path)) continue;
             if (!localFolderPathsSet.has(path)) {
               delFolders.push({ path: path, pathHash: hashContent(path) });
             }
@@ -1403,6 +1454,7 @@ export function cancelSync(plugin: FastSync): void {
   plugin.pendingConfigDeleteAcks.clear();
   plugin.syncState.pendingNotePushPageIndex.clear();
   plugin.syncState.pendingFilePushPageIndex.clear();
+  plugin.syncState.completedFileUploadSessions?.clear();
   plugin.syncState.pendingConfigPushPageIndex.clear();
   plugin.pendingConfigModifies.clear();
   plugin.localStorageManager.clearPending('pendingConfigModifies');
@@ -1720,6 +1772,20 @@ async function sendSyncInBatches<T1, T2, T3>(
  * concurrent createFolder races are absorbed by each handler's lazy folder-creation fallback (design §6.2)
  */
 export const handleRequestSend = async function (plugin: FastSync, syncMode: SyncMode, noteData: NoteSyncData, fileData: FileSyncData, configData: ConfigSyncData, folderData: FolderSyncData) {
+  const queue = plugin.retryQueue;
+  if (queue) {
+    noteData.delNotes = noteData.delNotes.filter(item => !queue.shouldSkipScanDelete(item.path));
+    fileData.delFiles = fileData.delFiles.filter(item => !queue.shouldSkipScanDelete(item.path));
+    folderData.delFolders = folderData.delFolders.filter(item => !queue.shouldSkipScanDelete(item.path));
+    // An unsafe queued delete must become a read-only pull even when offline delete sync is on,
+    // including paths absent from the hash map. Never let the scan reissue the rejected delete.
+    for (const [kind, missing] of [["note", noteData.missingNotes], ["file", fileData.missingFiles], ["folder", folderData.missingFolders]] as const) {
+      for (const path of queue.getRecoveryPaths(kind)) {
+        if (!missing.some(item => item.path === path)) missing.push({ path, pathHash: hashContent(path) });
+      }
+    }
+  }
+
   const shouldSyncNotes = syncMode === "auto" || syncMode === "note";
   const shouldSyncConfigs = syncMode === "auto" || syncMode === "config";
 

@@ -326,6 +326,8 @@ export const configIsPathExcluded = function (relativePath: string, plugin: Fast
     normalizedPath === `${pluginSelfDir}/fileHashMap.json` ||
     normalizedPath === `${pluginSelfDir}/syncHashMap.json` ||
     normalizedPath === `${pluginSelfDir}/folderSnapshot.json` ||
+    normalizedPath === `${pluginSelfDir}/syncState.json` ||
+    normalizedPath === `${pluginSelfDir}/retryQueue.json` ||
     normalizedPath === `${pluginSelfDir}/conflict-notes` ||
     normalizedPath.startsWith(`${pluginSelfDir}/conflict-notes/`)
   ) {
@@ -418,6 +420,20 @@ export const hashContent = function (content: string): string {
     hash &= hash
   }
   return String(hash)
+}
+
+/**
+ * 计算镜像状态配对指纹（长度 + 双哈希），用于跨文件一致性校验与作用域隔离
+ */
+export function computeMirrorDigest(data: string): string {
+  let h1 = 0
+  let h2 = 0x811c9dc5
+  for (let i = 0; i < data.length; i++) {
+    const ch = data.charCodeAt(i)
+    h1 = ((h1 << 5) - h1 + ch) | 0
+    h2 = Math.imul(h2 ^ ch, 0x01000193) | 0
+  }
+  return `${data.length}:${h1 >>> 0}:${h2 >>> 0}`
 }
 
 /**
