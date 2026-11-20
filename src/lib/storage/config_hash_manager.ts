@@ -641,6 +641,9 @@ export class ConfigHashManager {
         this.confirmedPaths.clear();
         this.revisions.clear();
         this.pendingDeleteBaselines.clear();
+        // 基线作用域跟随最新设置后再落盘（切库后旧 scope 的令牌不得留在新库镜像里）
+        // Re-anchor the baseline scope before persisting (old-scope tokens must not survive a switch)
+        this.baselineScope = computeRemoteScope(this.plugin.settings);
         this.saveToStorage();
     }
 

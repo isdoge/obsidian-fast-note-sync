@@ -6,7 +6,7 @@ import { folderModify, folderDelete, folderRename } from "../sync/operator_folde
 import { NoteHistoryModal } from "../../views/note-history/history-modal";
 import { dump, isPathInConfigSyncDirs, isPathExcluded, isFolderSyncPathExcluded } from "./helpers";
 import { ShareModal } from "../../views/share-modal";
-import { FireflyPostModal, CheckFireflyPostModal, triggerFireflyPublish } from "../../views/firefly-post-modal";
+import { FireflyPostModal, CheckFireflyPostModal, CreateFireflyPostModal, triggerFireflyPublish } from "../../views/firefly-post-modal";
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
 
@@ -58,6 +58,7 @@ export class EventManager {
 
     // --- Workspace Events ---
     this.plugin.registerEvent(app.workspace.on("file-menu", this.watchFileMenu))
+    this.plugin.registerEvent(app.workspace.on("editor-menu", this.watchEditorMenu))
 
     // --- Window Events ---
     window.addEventListener("focus", this.onWindowFocus)
@@ -457,7 +458,78 @@ export class EventManager {
     this.rawEventTimers.set(key, timer)
   }
 
+  /** 文件夹右键：新建文章（预填该文件夹）与立即发布 */
+  private watchFolderMenu(menu: Menu, folder: TFolder) {
+    if (this.plugin.settings.fireflyMenuEnabled === false) return
+    menu.addSeparator()
+    menu.addItem((item: MenuItem) => {
+      item
+        .setTitle($("ui.firefly.menu_create_in_folder"))
+        .setIcon("file-plus")
+        .onClick(() => {
+          new CreateFireflyPostModal(this.plugin.app, this.plugin, folder.path).open()
+        })
+    })
+    menu.addItem((item: MenuItem) => {
+      item
+        .setTitle($("ui.firefly.menu_trigger_publish"))
+        .setIcon("send")
+        .onClick(() => {
+          void triggerFireflyPublish(this.plugin)
+        })
+    })
+  }
+
+  /** 当前笔记所在目录（根目录返回空串，交给新建弹窗回退到默认目录） */
+  private parentDirOf(file: TFile): string {
+    const idx = file.path.lastIndexOf("/")
+    return idx === -1 ? "" : file.path.slice(0, idx)
+  }
+
+  /** Markdown 文件右键 / 编辑器右键共用的博客入口 */
+  private addFireflyFileMenuItems(menu: Menu, file: TFile) {
+    if (this.plugin.settings.fireflyMenuEnabled === false) return
+    menu.addSeparator()
+    menu.addItem((item: MenuItem) => {
+      item
+        .setTitle($("ui.firefly.menu_create_in_dir"))
+        .setIcon("file-plus")
+        .onClick(() => {
+          new CreateFireflyPostModal(this.plugin.app, this.plugin, this.parentDirOf(file)).open()
+        })
+    })
+    menu.addItem((item: MenuItem) => {
+      item
+        .setTitle($("ui.firefly.menu_edit_meta"))
+        .setIcon("feather")
+        .onClick(() => {
+          new FireflyPostModal(this.plugin.app, this.plugin, file).open()
+        })
+    })
+    menu.addItem((item: MenuItem) => {
+      item
+        .setTitle($("ui.firefly.menu_check_post"))
+        .setIcon("shield-check")
+        .onClick(() => {
+          new CheckFireflyPostModal(this.plugin.app, this.plugin, file).open()
+        })
+    })
+    menu.addItem((item: MenuItem) => {
+      item
+        .setTitle($("ui.firefly.menu_trigger_publish"))
+        .setIcon("send")
+        .onClick(() => {
+          void triggerFireflyPublish(this.plugin)
+        })
+    })
+  }
+
   private watchFileMenu = (menu: Menu, file: TAbstractFile) => {
+    // 文件树里的「文件夹」右键：新建博客文章 / 立即发布
+    if (file instanceof TFolder) {
+      this.watchFolderMenu(menu, file)
+      return
+    }
     if (!(file instanceof TFile) || !file.path.endsWith(".md")) return
 
     menu.addItem((item: MenuItem) => {
@@ -479,33 +551,13 @@ export class EventManager {
     })
 
     // Firefly 博客快捷项（可在设置里关闭，默认开启）/ Firefly blog shortcuts (toggleable, on by default)
-    if (file instanceof TFile && this.plugin.settings.fireflyMenuEnabled !== false) {
-      const mdFile = file
-      menu.addSeparator()
-      menu.addItem((item: MenuItem) => {
-        item
-          .setTitle($("ui.firefly.menu_edit_meta"))
-          .setIcon("feather")
-          .onClick(() => {
-            new FireflyPostModal(this.plugin.app, this.plugin, mdFile).open()
-          })
-      })
-      menu.addItem((item: MenuItem) => {
-        item
-          .setTitle($("ui.firefly.menu_check_post"))
-          .setIcon("shield-check")
-          .onClick(() => {
-            new CheckFireflyPostModal(this.plugin.app, this.plugin, mdFile).open()
-          })
-      })
-      menu.addItem((item: MenuItem) => {
-        item
-          .setTitle($("ui.firefly.menu_trigger_publish"))
-          .setIcon("send")
-          .onClick(() => {
-            void triggerFireflyPublish(this.plugin)
-          })
-      })
-    }
+    this.addFireflyFileMenuItems(menu, file)
+  }
+
+  /** 编辑器右键菜单：与文件列表的 Markdown 右键保持一致的博客入口 */
+  private watchEditorMenu = (menu: Menu, _editor: unknown, view: { file?: TFile | null }) => {
+    const file = view?.file
+    if (!(file instanceof TFile) || !file.path.endsWith(".md")) return
+    this.addFireflyFileMenuItems(menu, file)
   }
 }

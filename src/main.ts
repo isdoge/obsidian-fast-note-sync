@@ -140,6 +140,25 @@ export default class FastSync extends Plugin {
     return (this.concurrencyLimiter?.activeSlotCount ?? 0) > 0
   }
 
+  /**
+   * 切换远端笔记库名时删除旧库遗留的冲突/待对齐备份。
+   * 这些文件位于插件目录 `conflict-notes/`，已被同步排除；清掉可避免旧库的
+   * 远端正文/基线残留在新库中造成困惑。删除失败只记录日志，不阻断切库。
+   *
+   * Remove conflict/pending-alignment backups left by the previous remote vault when the
+   * vault name changes. They live in the plugin's excluded `conflict-notes/` folder; a
+   * failure is logged and never blocks the switch.
+   */
+  async clearVaultConflictBackups(): Promise<void> {
+    const dir = `${getPluginDir(this)}/conflict-notes`
+    try {
+      const adapter = this.app.vault.adapter
+      if (await adapter.exists(dir)) await adapter.rmdir(dir, true)
+    } catch (error) {
+      dumpError("Failed to clear old vault conflict backups", error)
+    }
+  }
+
   sendSyncPageAck(type: "note" | "file" | "setting" | "folder", pageIndex: number) {
     let action = "";
     if (type === "note") action = "NoteSyncPageAck";

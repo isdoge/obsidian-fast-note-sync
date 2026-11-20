@@ -402,6 +402,27 @@ export class FolderSnapshotManager {
     }
 
     /**
+     * 清空快照表与目录基线（切换远端笔记库名时调用）。
+     * 旧库的目录 mtime 与 revision 都属于旧作用域，必须连同快照一起丢弃，
+     * 否则新库会把这些目录当成“曾经同步、服务端已删除”。
+     *
+     * Clear the snapshot and folder baselines (called when switching the remote vault name).
+     * The old vault's mtimes and revisions belong to the previous remote scope and must be
+     * dropped with the snapshot, or the new vault treats these folders as server-deleted.
+     */
+    clearAll(): void {
+        this.snapshotMap.clear()
+        this.revisions.clear()
+        this.pendingDeleteBaselines.clear()
+        this.digest = computeMirrorDigest("{}")
+        this.isDirty = false
+        // 作用域跟随最新设置后再落盘，避免把旧 scope 写回镜像
+        this.baselineScope = computeRemoteScope(this.plugin.settings)
+        this.saveToStorage()
+        this.flush()
+    }
+
+    /**
      * 保存快照到 localStorage，同时镜像写入文件 (兜底移动端 localStorage 被清除)
      */
     private saveToStorage(): void {

@@ -1,4 +1,4 @@
-import { App, PluginSettingTab, Setting, Platform, SearchComponent, MarkdownRenderer, Component, requestUrl, Modal, setIcon } from "obsidian";
+import { App, PluginSettingTab, Setting, Platform, SearchComponent, MarkdownRenderer, Component, requestUrl, Modal, setIcon, TextComponent } from "obsidian";
 import { createRoot, Root } from "react-dom/client";
 import { unzipSync } from "fflate";
 
@@ -16,6 +16,17 @@ import { $ } from "./i18n/lang";
 import FastSync from "./main";
 import { DEFAULT_IDLE_SYNC_INTERVAL_MINUTES, IDLE_SYNC_INTERVAL_OPTIONS } from "./lib/sync/idle_auto_sync";
 import { updateVaultName } from "./lib/settings/vault_name";
+import type { GitSyncPublicStatus } from "./lib/api/http_api_service";
+import { getSafeHttpUrl, normalizeBlogSiteUrl } from "./lib/blog/firefly-frontmatter";
+import { formatGitSyncReceipt } from "./lib/blog/firefly-receipt";
+import {
+  activeMarkdownFile,
+  CheckFireflyPostModal,
+  CreateFireflyPostModal,
+  showBlogPublishSuccessNotice,
+  triggerFireflyPublish,
+  warnIfActivePostIsDraft,
+} from "./views/firefly-post-modal";
 
 
 export interface PluginSettings {
@@ -123,6 +134,8 @@ export interface PluginSettings {
   fireflyMenuEnabled: boolean
   /** 新建 Firefly 经验分享文章的默认根目录 */
   fireflyDefaultBlogDir: string
+  /** 博客访问地址（可选，仅用于发布成功后快捷打开页面） */
+  fireflySiteUrl: string
 }
 
 /**
@@ -189,9 +202,12 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   largeFileNoticeShown: [],
   fireflyMenuEnabled: true,
   fireflyDefaultBlogDir: "Blog",
+  fireflySiteUrl: "",
 }
 
-export type TabId = "GENERAL" | "DISPLAY" | "SHORTCUT" | "REMOTE" | "SYNC" | "CLOUD" | "DEBUG"
+export type TabId = "GENERAL" | "DISPLAY" | "SHORTCUT" | "REMOTE" | "SYNC" | "CLOUD" | "BLOG" | "DEBUG"
+
+const SETTING_TAB_ORDER: TabId[] = ["GENERAL", "DISPLAY", "REMOTE", "SYNC", "SHORTCUT", "CLOUD", "BLOG", "DEBUG"]
 
 // 预览 toast 位置，文案固定为 "Toast" / Preview toast position with fixed text "Toast"
 function showTestToast(top: number) {
@@ -226,6 +242,18 @@ export class SettingTab extends PluginSettingTab {
 
   private component: Component = new Component()
 
+  private blogStatusState: {
+    loading: boolean
+    loaded: boolean
+    ok: boolean
+    status: number
+    message: string
+    configs: GitSyncPublicStatus[]
+  } = { loading: false, loaded: false, ok: false, status: 0, message: "", configs: [] }
+  private blogPublishing: boolean = false
+  private blogStatusReqSeq: number = 0
+  private blogFollowupTimer: number | null = null
+
   constructor(app: App, plugin: FastSync) {
     super(app, plugin)
     this.plugin = plugin
@@ -236,6 +264,11 @@ export class SettingTab extends PluginSettingTab {
   }
 
   hide(): void {
+    this.blogStatusReqSeq++
+    if (this.blogFollowupTimer !== null) {
+      window.clearTimeout(this.blogFollowupTimer)
+      this.blogFollowupTimer = null
+    }
     this.roots.forEach((root) => root.unmount())
     this.roots = []
     this.component.unload()
@@ -323,6 +356,9 @@ export class SettingTab extends PluginSettingTab {
         case "CLOUD":
           this.renderCloudSettings(contentEl)
           break
+        case "BLOG":
+          this.renderBlogSettings(contentEl, false)
+          break
         case "DISPLAY":
           this.renderDisplaySettings(contentEl)
           break
@@ -351,10 +387,14 @@ export class SettingTab extends PluginSettingTab {
       const el = tabEl as HTMLElement
       if (el.dataset.tabId === this.activeTab && !this.searchQuery) {
         el.addClass("is-active")
+        el.setAttribute("aria-selected", "true")
+        el.tabIndex = 0
         // 确保选中的 Tab 可见
         el.scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" })
       } else {
         el.removeClass("is-active")
+        el.setAttribute("aria-selected", "false")
+        el.tabIndex = -1
       }
     })
   }
@@ -376,19 +416,18 @@ export class SettingTab extends PluginSettingTab {
     const threshold = 50
 
     if (Math.abs(deltaX) > threshold && Math.abs(deltaX) > Math.abs(deltaY) * 1.5) {
-      const tabs: TabId[] = ["GENERAL", "DISPLAY", "REMOTE", "SYNC", "SHORTCUT", "CLOUD", "DEBUG"]
-      const currentIndex = tabs.indexOf(this.activeTab)
+      const currentIndex = SETTING_TAB_ORDER.indexOf(this.activeTab)
 
       if (deltaX > 0) {
         // Swipe right -> Previous tab
         if (currentIndex > 0) {
-          this.activeTab = tabs[currentIndex - 1]
+          this.activeTab = SETTING_TAB_ORDER[currentIndex - 1]
           this.refresh()
         }
       } else {
         // Swipe left -> Next tab
-        if (currentIndex < tabs.length - 1) {
-          this.activeTab = tabs[currentIndex + 1]
+        if (currentIndex < SETTING_TAB_ORDER.length - 1) {
+          this.activeTab = SETTING_TAB_ORDER[currentIndex + 1]
           this.refresh()
         }
       }
@@ -419,6 +458,7 @@ export class SettingTab extends PluginSettingTab {
     this.renderSyncSettings(contentEl)
     this.renderShortcutSettings(contentEl)
     this.renderCloudSettings(contentEl)
+    this.renderBlogSettings(contentEl, true)
     this.renderDebugSettings(contentEl)
   }
 
@@ -477,33 +517,63 @@ export class SettingTab extends PluginSettingTab {
 
   private renderHeader(containerEl: HTMLElement) {
     const headerEl = containerEl.createDiv("fns-setting-tab-header")
+    headerEl.setAttribute("role", "tablist")
 
-    const tabs: { id: TabId; label: string }[] = [
-      { id: "GENERAL", label: $("setting.tab.general") },
-      { id: "DISPLAY", label: $("setting.tab.display") },
-      { id: "REMOTE", label: $("setting.tab.remote") },
-      { id: "SYNC", label: $("setting.tab.sync") },
-      { id: "SHORTCUT", label: $("setting.tab.shortcut") },
-      { id: "CLOUD", label: $("setting.tab.cloud") },
-      { id: "DEBUG", label: $("setting.tab.debug") },
-    ]
+    const tabLabels: Record<TabId, string> = {
+      GENERAL: $("setting.tab.general"),
+      DISPLAY: $("setting.tab.display"),
+      REMOTE: $("setting.tab.remote"),
+      SYNC: $("setting.tab.sync"),
+      SHORTCUT: $("setting.tab.shortcut"),
+      CLOUD: $("setting.tab.cloud"),
+      BLOG: $("setting.tab.blog"),
+      DEBUG: $("setting.tab.debug"),
+    }
+    const tabs = SETTING_TAB_ORDER.map((id) => ({ id, label: tabLabels[id] }))
 
     let activeTabEl: HTMLElement | null = null
+    const tabEls: HTMLElement[] = []
 
-    tabs.forEach((tab) => {
+    const activateTab = (id: TabId) => {
+      this.searchQuery = "" // 切换标签时清空搜索
+      if (this.searchComponent) this.searchComponent.setValue("")
+      this.activeTab = id
+      this.refresh()
+    }
+
+    tabs.forEach((tab, idx) => {
       const tabEl = headerEl.createDiv("fns-setting-tab-item")
       tabEl.setText(tab.label)
       tabEl.dataset.tabId = tab.id // 设置标识用于后续更新状态
-      if (this.activeTab === tab.id) {
+      tabEl.setAttribute("role", "tab")
+      const isActive = this.activeTab === tab.id
+      tabEl.setAttribute("aria-selected", isActive ? "true" : "false")
+      tabEl.tabIndex = isActive ? 0 : -1
+      if (isActive) {
         tabEl.addClass("is-active")
         activeTabEl = tabEl
       }
       tabEl.onclick = () => {
-        this.searchQuery = "" // 切换标签时清空搜索
-        if (this.searchComponent) this.searchComponent.setValue("")
-        this.activeTab = tab.id
-        this.refresh()
+        activateTab(tab.id)
       }
+      tabEl.addEventListener("keydown", (e: KeyboardEvent) => {
+        let nextIdx = -1
+        if (e.key === "ArrowRight") nextIdx = (idx + 1) % tabs.length
+        else if (e.key === "ArrowLeft") nextIdx = (idx - 1 + tabs.length) % tabs.length
+        else if (e.key === "Home") nextIdx = 0
+        else if (e.key === "End") nextIdx = tabs.length - 1
+        else if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault()
+          activateTab(tab.id)
+          return
+        }
+        if (nextIdx !== -1) {
+          e.preventDefault()
+          activateTab(tabs[nextIdx].id)
+          tabEls[nextIdx]?.focus()
+        }
+      })
+      tabEls.push(tabEl)
     })
 
     headerEl.scrollLeft = this.headerScrollLeft
@@ -544,28 +614,6 @@ export class SettingTab extends PluginSettingTab {
         }),
     )
     this.setDescWithBreaks(set.lastElementChild as HTMLElement, $("setting.debug.update_source_desc"))
-
-    // ── 博客 / Firefly ──────────────────────────────────────────────
-    new Setting(set).setName($("setting.general.firefly_section")).setHeading().setClass("fast-note-sync-settings-tag")
-
-    new Setting(set).setName($("setting.general.firefly_menu")).setClass("fns-setting-item-checkbox").addToggle((toggle) =>
-      toggle.setValue(this.plugin.settings.fireflyMenuEnabled !== false).onChange(async (value) => {
-        this.plugin.settings.fireflyMenuEnabled = value
-        await this.plugin.saveSettings()
-      }),
-    )
-    this.setDescWithBreaks(set.lastElementChild as HTMLElement, $("setting.general.firefly_menu_desc"))
-
-    new Setting(set).setName($("setting.general.firefly_blog_dir")).addText((text) =>
-      text
-        .setPlaceholder("Blog")
-        .setValue(this.plugin.settings.fireflyDefaultBlogDir || "Blog")
-        .onChange(async (value) => {
-          this.plugin.settings.fireflyDefaultBlogDir = value.trim() || "Blog"
-          await this.plugin.saveSettings()
-        }),
-    )
-    this.setDescWithBreaks(set.lastElementChild as HTMLElement, $("setting.general.firefly_blog_dir_desc"))
 
     new Setting(set).setName($("setting.support.title")).setHeading().setClass("fast-note-sync-settings-tag")
 
@@ -1334,6 +1382,34 @@ export class SettingTab extends PluginSettingTab {
       warningEl.setText($("setting.remote.http_warning"));
     }
 
+    // 填写顺序刻意保持「服务地址 → 远端笔记库名 → 授权令牌」：
+    // 先确定库名再连上服务端，避免按本地文件夹名自动新建一个多余的库。
+    // Keep the order "server URL → remote vault name → token" so the vault name is chosen
+    // before the plugin connects, instead of auto-creating an extra library from the local folder name.
+    new Setting(set)
+      .setName($("setting.remote.vault_name"))
+      .addText((text) => {
+        text
+          .setPlaceholder($("setting.remote.vault_name"))
+          .setValue(this.plugin.settings.vault);
+
+        text.inputEl.readOnly = true;
+        text.inputEl.addClass("fns-clickable");
+
+        text.inputEl.addEventListener("focus", () => {
+          text.inputEl.blur();
+        });
+
+        text.inputEl.onclick = () => {
+          new VaultNameModal(this.app, this.plugin.settings.vault, async (newValue) => {
+            await updateVaultName(this.plugin, newValue);
+            text.setValue(newValue);
+            showSyncNotice($("setting.debug.clear_cache_success") || "Sync cache cleared successfully");
+          }).open();
+        };
+      });
+    this.setDescWithBreaks(set.lastElementChild as HTMLElement, $("setting.remote.vault_name_desc"))
+
     new Setting(set)
       .setClass("fns-setting-item-vertical")
       .setName($("setting.remote.api_token"))
@@ -1351,30 +1427,6 @@ export class SettingTab extends PluginSettingTab {
           }),
       )
     this.setDescWithBreaks(set.lastElementChild as HTMLElement, $("setting.remote.api_token_desc"))
-
-    new Setting(set)
-      .setName($("setting.remote.vault_name"))
-      .addText((text) => {
-        text
-          .setPlaceholder($("setting.remote.vault_name"))
-          .setValue(this.plugin.settings.vault);
-        
-        text.inputEl.readOnly = true;
-        text.inputEl.addClass("fns-clickable");
-
-        text.inputEl.addEventListener("focus", () => {
-          text.inputEl.blur();
-        });
-
-        text.inputEl.onclick = () => {
-          new VaultNameModal(this.app, this.plugin.settings.vault, async (newValue) => {
-            await updateVaultName(this.plugin, newValue);
-            text.setValue(newValue);
-            showSyncNotice($("setting.debug.clear_cache_success") || "Sync cache cleared successfully");
-          }).open();
-        };
-      });
-    this.setDescWithBreaks(set.lastElementChild as HTMLElement, $("setting.remote.vault_name_desc"))
 
     new Setting(set).setName($("setting.remote.auto_redirect")).setClass("fns-setting-item-checkbox").addToggle((toggle) =>
       toggle.setValue(this.plugin.settings.autoRedirectEnabled).onChange(async (value) => {
@@ -1948,6 +2000,399 @@ export class SettingTab extends PluginSettingTab {
         }),
       )
       this.setDescWithBreaks(set.lastElementChild as HTMLElement, $("setting.cloud.dynamic_attachment_desc"))
+    }
+  }
+
+  private hasRemoteConnection(): boolean {
+    return Boolean(this.plugin.settings.api?.trim() && this.plugin.settings.apiToken?.trim())
+  }
+
+  private formatBlogSyncTime(raw?: string): string {
+    const trimmed = (raw || "").trim()
+    if (!trimmed || trimmed.startsWith("0001-01-01")) {
+      return $("setting.blog.no_sync_yet")
+    }
+    const ts = Date.parse(trimmed)
+    if (Number.isNaN(ts)) return trimmed
+    return new Date(ts).toLocaleString()
+  }
+
+  private getBlogStatusMeta(cfg: GitSyncPublicStatus): { label: string; cls: string } {
+    switch (cfg.lastStatus) {
+      case 1:
+        return { label: $("setting.blog.status_running"), cls: "is-running" }
+      case 2:
+        return { label: $("setting.blog.status_success"), cls: "is-success" }
+      case 3:
+        return { label: $("setting.blog.status_failed"), cls: "is-error" }
+      case 4:
+        return { label: $("setting.blog.status_shutdown"), cls: "is-error" }
+      default:
+        return { label: $("setting.blog.status_idle"), cls: "is-idle" }
+    }
+  }
+
+  private openServerWebGui(): void {
+    const safeUrl = getSafeHttpUrl(this.plugin.runApi || this.plugin.settings.api || "")
+    if (!safeUrl) {
+      showSyncNotice($("setting.blog.webgui_url_invalid"), 6000)
+      return
+    }
+    window.open(safeUrl, "_blank", "noopener,noreferrer")
+  }
+
+  private openBlogSite(): void {
+    const safeUrl = getSafeHttpUrl(this.plugin.settings.fireflySiteUrl || "")
+    if (!safeUrl) {
+      showSyncNotice($("setting.blog.blog_url_invalid"), 6000)
+      return
+    }
+    window.open(safeUrl, "_blank", "noopener,noreferrer")
+  }
+
+  private getPrimaryServerSourceDir(): string {
+    const sorted = this.getSortedBlogConfigs(this.blogStatusState.configs)
+    for (const cfg of sorted) {
+      const dir = (cfg.sourceDir || "").trim()
+      if (dir) return dir
+    }
+    return ""
+  }
+
+  private getSortedBlogConfigs(configs: GitSyncPublicStatus[]): GitSyncPublicStatus[] {
+    return [...configs].sort((a, b) => {
+      const score = (c: GitSyncPublicStatus) => (c.isEnabled ? 2 : 0) + (c.targetSubdir?.trim() ? 1 : 0)
+      return score(b) - score(a)
+    })
+  }
+
+  private async loadBlogSyncStatus(cardEl: HTMLElement, onStatusUpdated?: () => void): Promise<void> {
+    if (!this.hasRemoteConnection()) {
+      this.blogStatusState = { loading: false, loaded: false, ok: false, status: 0, message: "", configs: [] }
+      if (cardEl.isConnected) {
+        this.renderBlogStatusCard(cardEl, onStatusUpdated)
+        onStatusUpdated?.()
+      }
+      return
+    }
+
+    const reqSeq = ++this.blogStatusReqSeq
+    this.blogStatusState = { ...this.blogStatusState, loading: true }
+    if (cardEl.isConnected) {
+      this.renderBlogStatusCard(cardEl, onStatusUpdated)
+    }
+
+    const res = await this.plugin.api.getGitSyncStatus(this.plugin.settings.vault)
+    if (reqSeq !== this.blogStatusReqSeq || !cardEl.isConnected) return
+
+    this.blogStatusState = {
+      loading: false,
+      loaded: true,
+      ok: res.ok,
+      status: res.status,
+      message: res.message,
+      configs: Array.isArray(res.data) ? res.data : [],
+    }
+    this.renderBlogStatusCard(cardEl, onStatusUpdated)
+    onStatusUpdated?.()
+  }
+
+  private async triggerBlogPublishFromTab(cardEl: HTMLElement, onStatusUpdated?: () => void): Promise<void> {
+    if (this.blogPublishing) return
+    await warnIfActivePostIsDraft(this.plugin)
+    this.blogPublishing = true
+    if (cardEl.isConnected) {
+      this.renderBlogStatusCard(cardEl, onStatusUpdated)
+    }
+    try {
+      const res = await this.plugin.api.triggerGitSync(this.plugin.settings.vault)
+      if (!res.ok) {
+        showSyncNotice($("ui.firefly.publish_failed", { msg: res.message || `HTTP ${res.status}` }), 8000)
+        return
+      }
+      showBlogPublishSuccessNotice(this.plugin, $("ui.firefly.publish_triggered"), 8000)
+      await this.loadBlogSyncStatus(cardEl, onStatusUpdated)
+      if (this.blogFollowupTimer !== null) {
+        window.clearTimeout(this.blogFollowupTimer)
+      }
+      this.blogFollowupTimer = window.setTimeout(() => {
+        this.blogFollowupTimer = null
+        if (cardEl.isConnected) {
+          void this.loadBlogSyncStatus(cardEl, onStatusUpdated)
+        }
+      }, 3000)
+    } finally {
+      this.blogPublishing = false
+      if (cardEl.isConnected) {
+        this.renderBlogStatusCard(cardEl, onStatusUpdated)
+      }
+    }
+  }
+
+  private renderBlogStatusCard(cardEl: HTMLElement, onStatusUpdated?: () => void): void {
+    cardEl.empty()
+
+    if (!this.hasRemoteConnection()) {
+      cardEl.createDiv({ cls: "fns-blog-card-title", text: $("setting.blog.not_connected") })
+      cardEl.createDiv({ cls: "fns-blog-card-desc", text: $("setting.blog.not_connected_desc") })
+      const actions = cardEl.createDiv("fns-blog-actions")
+      const remoteBtn = actions.createEl("button", { text: $("setting.blog.goto_remote"), cls: "mod-cta" })
+      remoteBtn.addEventListener("click", () => {
+        this.searchQuery = ""
+        if (this.searchComponent) this.searchComponent.setValue("")
+        this.activeTab = "REMOTE"
+        this.refresh()
+      })
+      return
+    }
+
+    if (this.blogStatusState.loading && !this.blogStatusState.loaded) {
+      cardEl.createDiv({ cls: "fns-blog-card-desc", text: $("setting.blog.loading") })
+      return
+    }
+
+    const configs = this.getSortedBlogConfigs(this.blogStatusState.configs)
+    const hasBlogConfig = this.blogStatusState.ok && configs.length > 0 && configs.some((c) => Boolean(c.targetSubdir?.trim()) || c.isEnabled)
+
+    if (hasBlogConfig) {
+      const listEl = cardEl.createDiv("fns-blog-config-list")
+      for (const cfg of configs) {
+        const itemEl = listEl.createDiv("fns-blog-config-item")
+        const headEl = itemEl.createDiv("fns-blog-config-head")
+
+        // 优先展示服务端配置的 sourceDir；未配置时明确标为「全库」，不拿库名冒充源目录
+        // Prefer the server's sourceDir; when absent show "Whole vault" instead of passing the vault name off as one
+        const sourceLabel = (cfg.sourceDir || "").trim() || $("setting.blog.source_all")
+        const targetLabel = (cfg.targetSubdir || "").trim() || "/"
+        headEl.createSpan({ cls: "fns-blog-mapping", text: `${sourceLabel} → ${targetLabel}` })
+
+        const badgesEl = headEl.createDiv("fns-blog-badges")
+        if (cfg.branch) {
+          badgesEl.createSpan({ cls: "fns-blog-badge is-branch", text: cfg.branch })
+        }
+        const statusMeta = this.getBlogStatusMeta(cfg)
+        badgesEl.createSpan({ cls: `fns-blog-badge ${statusMeta.cls}`, text: statusMeta.label })
+        if (!cfg.isEnabled) {
+          badgesEl.createSpan({ cls: "fns-blog-badge is-disabled", text: $("setting.blog.status_disabled") })
+        }
+
+        const metaEl = itemEl.createDiv("fns-blog-config-meta")
+        if (cfg.requireFrontmatter?.trim()) {
+          // 以小标签展示服务端筛选条件，例如「筛选：type=share」
+          // Show the server-side filter as a small tag, e.g. "Filter: type=share"
+          const filterRow = metaEl.createDiv("fns-blog-meta-row")
+          filterRow.createSpan({
+            cls: "fns-blog-badge is-filter",
+            text: $("setting.blog.filter_label", { filter: cfg.requireFrontmatter.trim() }),
+          })
+        }
+
+        const timeRow = metaEl.createDiv("fns-blog-meta-row")
+        timeRow.createSpan({ cls: "fns-blog-meta-label", text: $("setting.blog.last_sync") })
+        timeRow.createSpan({ cls: "fns-blog-meta-value", text: this.formatBlogSyncTime(cfg.lastSyncTime) })
+
+        if (cfg.lastMessage?.trim()) {
+          const msgRow = metaEl.createDiv("fns-blog-meta-row")
+          msgRow.createSpan({ cls: "fns-blog-meta-label", text: $("setting.blog.last_message") })
+          // 服务端回执是英文，统一按当前插件语言展示，避免中英混杂
+          // Server receipts are English; localize them so the UI never mixes languages
+          const localized = formatGitSyncReceipt(cfg.lastMessage.trim(), (key, params) => $(key as never, params))
+          msgRow.createSpan({ cls: "fns-blog-meta-value fns-blog-meta-message", text: localized || cfg.lastMessage.trim() })
+        }
+      }
+
+      const actions = cardEl.createDiv("fns-blog-actions")
+      const refreshBtn = actions.createEl("button", {
+        text: this.blogStatusState.loading ? $("setting.blog.refreshing") : $("setting.blog.refresh"),
+      })
+      refreshBtn.disabled = this.blogStatusState.loading
+      refreshBtn.addEventListener("click", () => {
+        void this.loadBlogSyncStatus(cardEl, onStatusUpdated)
+      })
+
+      const publishBtn = actions.createEl("button", {
+        text: this.blogPublishing ? $("setting.blog.publishing") : $("setting.blog.publish_now"),
+        cls: "mod-cta",
+      })
+      publishBtn.disabled = this.blogPublishing
+      publishBtn.addEventListener("click", () => {
+        void this.triggerBlogPublishFromTab(cardEl, onStatusUpdated)
+      })
+
+      const webguiBtn = actions.createEl("button", { text: $("setting.blog.open_webgui") })
+      webguiBtn.addEventListener("click", () => {
+        this.openServerWebGui()
+      })
+
+      if (getSafeHttpUrl(this.plugin.settings.fireflySiteUrl || "")) {
+        const blogBtn = actions.createEl("button", { text: $("setting.blog.open_blog") })
+        blogBtn.addEventListener("click", () => {
+          this.openBlogSite()
+        })
+      }
+      return
+    }
+
+    // 未配置 / 旧版服务端不支持 / 状态获取失败：展示 3 步上手引导
+    if (this.blogStatusState.loaded && !this.blogStatusState.ok) {
+      const hintText = this.blogStatusState.status === 404
+        ? $("setting.blog.guide_unsupported")
+        : $("setting.blog.guide_fetch_error", { msg: this.blogStatusState.message || `HTTP ${this.blogStatusState.status}` })
+      cardEl.createDiv({ cls: "fns-blog-guide-hint", text: hintText })
+    }
+
+    cardEl.createDiv({ cls: "fns-blog-card-title", text: $("setting.blog.guide_title") })
+    const stepsEl = cardEl.createEl("ol", { cls: "fns-blog-guide-steps" })
+    stepsEl.createEl("li", { text: $("setting.blog.guide_step_1") })
+    stepsEl.createEl("li", { text: $("setting.blog.guide_step_2") })
+    stepsEl.createEl("li", { text: $("setting.blog.guide_step_3") })
+
+    const actions = cardEl.createDiv("fns-blog-actions")
+    const webguiBtn = actions.createEl("button", { text: $("setting.blog.open_webgui"), cls: "mod-cta" })
+    webguiBtn.addEventListener("click", () => {
+      this.openServerWebGui()
+    })
+
+    const refreshBtn = actions.createEl("button", {
+      text: this.blogStatusState.loading ? $("setting.blog.refreshing") : $("setting.blog.refresh"),
+    })
+    refreshBtn.disabled = this.blogStatusState.loading
+    refreshBtn.addEventListener("click", () => {
+      void this.loadBlogSyncStatus(cardEl, onStatusUpdated)
+    })
+  }
+
+  private renderBlogQuickActions(set: HTMLElement): void {
+    new Setting(set).setName($("setting.blog.quick_actions")).setHeading().setClass("fast-note-sync-settings-tag")
+    const actions = set.createDiv("fns-blog-actions fns-blog-quick-actions")
+
+    const createBtn = actions.createEl("button", { text: $("setting.blog.action_create_post"), cls: "mod-cta" })
+    createBtn.addEventListener("click", () => {
+      new CreateFireflyPostModal(this.app, this.plugin).open()
+    })
+
+    const checkBtn = actions.createEl("button", { text: $("setting.blog.action_check_post") })
+    checkBtn.addEventListener("click", () => {
+      const file = activeMarkdownFile(this.app)
+      if (!file) {
+        showSyncNotice($("ui.firefly.no_file"), 6000)
+        return
+      }
+      new CheckFireflyPostModal(this.app, this.plugin, file).open()
+    })
+
+    const publishBtn = actions.createEl("button", { text: $("setting.blog.action_publish_now") })
+    publishBtn.addEventListener("click", () => {
+      void triggerFireflyPublish(this.plugin)
+    })
+
+    const blogBtn = actions.createEl("button", { text: $("setting.blog.action_open_blog") })
+    blogBtn.addEventListener("click", () => {
+      this.openBlogSite()
+    })
+
+    const webguiBtn = actions.createEl("button", { text: $("setting.blog.action_open_webgui") })
+    webguiBtn.addEventListener("click", () => {
+      this.openServerWebGui()
+    })
+  }
+
+  private renderBlogSettings(set: HTMLElement, isSearchMode: boolean = false) {
+    // ── ⓪ 新手说明：日常写作不需要记命令 ──────────────────────────
+    const intro = set.createDiv("fns-blog-tab-intro")
+    intro.createEl("p", { text: $("setting.blog.tab_intro") })
+    intro.createEl("p", { cls: "fns-blog-tab-note", text: $("setting.blog.tab_intro_webhook") })
+
+    // ── ① 服务端博客同步状态 & 新手引导卡片 ────────────────────────
+    new Setting(set).setName($("setting.blog.status_section")).setHeading().setClass("fast-note-sync-settings-tag")
+    const statusCard = set.createDiv("fns-blog-status-card")
+
+    // ── ①.① 常用操作按钮 ─────────────────────────────────────────
+    this.renderBlogQuickActions(set)
+
+    // ── ② 写作助手与路径设置 ──────────────────────────────────────
+    new Setting(set).setName($("setting.blog.assistant_section")).setHeading().setClass("fast-note-sync-settings-tag")
+
+    new Setting(set).setName($("setting.blog.menu_enabled")).setClass("fns-setting-item-checkbox").addToggle((toggle) =>
+      toggle.setValue(this.plugin.settings.fireflyMenuEnabled !== false).onChange(async (value) => {
+        this.plugin.settings.fireflyMenuEnabled = value
+        await this.plugin.saveSettings()
+      }),
+    )
+    this.setDescWithBreaks(set.lastElementChild as HTMLElement, $("setting.blog.menu_enabled_desc"))
+
+    let defaultDirText: TextComponent | null = null
+    const defaultDirSetting = new Setting(set).setName($("setting.blog.default_dir")).addText((text) => {
+      defaultDirText = text
+      text
+        .setPlaceholder("Blog")
+        .setValue(this.plugin.settings.fireflyDefaultBlogDir || "Blog")
+        .onChange(async (value) => {
+          this.plugin.settings.fireflyDefaultBlogDir = value.trim() || "Blog"
+          await this.plugin.saveSettings()
+          updateSourceDirHint()
+        })
+    })
+    this.setDescWithBreaks(defaultDirSetting.settingEl, $("setting.blog.default_dir_desc"))
+
+    const sourceDirHintEl = set.createDiv("fns-blog-source-dir-hint fns-blog-collapsed")
+    const updateSourceDirHint = () => {
+      if (!sourceDirHintEl.isConnected) return
+      sourceDirHintEl.empty()
+      const serverSourceDir = this.getPrimaryServerSourceDir()
+      const currentDir = (this.plugin.settings.fireflyDefaultBlogDir || "Blog").trim()
+      if (!serverSourceDir || serverSourceDir === currentDir) {
+        sourceDirHintEl.addClass("fns-blog-collapsed")
+        return
+      }
+      sourceDirHintEl.removeClass("fns-blog-collapsed")
+      const applyBtn = sourceDirHintEl.createEl("button", {
+        text: $("setting.blog.use_server_source_dir", { dir: serverSourceDir }),
+      })
+      applyBtn.addEventListener("click", () => {
+        void (async () => {
+          this.plugin.settings.fireflyDefaultBlogDir = serverSourceDir
+          defaultDirText?.setValue(serverSourceDir)
+          await this.plugin.saveSettings()
+          updateSourceDirHint()
+        })()
+      })
+    }
+
+    const siteUrlSetting = new Setting(set).setName($("setting.blog.site_url")).addText((text) =>
+      text
+        .setPlaceholder("https://blog.example.com")
+        .setValue(this.plugin.settings.fireflySiteUrl || "")
+        .onChange(async (value) => {
+          const normalized = normalizeBlogSiteUrl(value)
+          this.plugin.settings.fireflySiteUrl = normalized
+          await this.plugin.saveSettings()
+          updateSiteUrlWarning(normalized)
+          if (statusCard.isConnected) {
+            this.renderBlogStatusCard(statusCard, updateSourceDirHint)
+          }
+        }),
+    )
+    this.setDescWithBreaks(siteUrlSetting.settingEl, $("setting.blog.site_url_desc"))
+
+    const siteUrlWarningEl = set.createDiv("fns-setting-warning fns-blog-url-warning fns-blog-collapsed")
+    const updateSiteUrlWarning = (rawUrl: string) => {
+      const normalized = normalizeBlogSiteUrl(rawUrl)
+      if (normalized && !getSafeHttpUrl(normalized)) {
+        siteUrlWarningEl.setText($("setting.blog.site_url_invalid"))
+        siteUrlWarningEl.removeClass("fns-blog-collapsed")
+      } else {
+        siteUrlWarningEl.setText("")
+        siteUrlWarningEl.addClass("fns-blog-collapsed")
+      }
+    }
+    updateSiteUrlWarning(this.plugin.settings.fireflySiteUrl || "")
+
+    // 首次立即渲染卡片（非阻塞），非搜索模式且已连接远端时异步刷新状态
+    this.renderBlogStatusCard(statusCard, updateSourceDirHint)
+    updateSourceDirHint()
+    if (!isSearchMode && this.hasRemoteConnection()) {
+      void this.loadBlogSyncStatus(statusCard, updateSourceDirHint)
     }
   }
 

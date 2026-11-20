@@ -9,7 +9,7 @@
  * 不触碰同步层文件。
  */
 
-import { App, Modal, Setting, TFile, normalizePath } from "obsidian";
+import { App, Modal, Notice, Setting, TFile, normalizePath } from "obsidian";
 
 import type FastSync from "../main";
 import { $ } from "../i18n/lang";
@@ -23,6 +23,7 @@ import {
     FireflyCheckResult,
     buildFireflyPostTemplate,
     formatLocalDate,
+    getSafeHttpUrl,
     isValidFireflyDate,
     parseFrontmatter,
     stripAuthorReviewBlocks,
@@ -43,6 +44,67 @@ import {
     todayString,
     writeImageIntoNoteAssets,
 } from "../lib/blog/firefly-assets";
+import { formatGitSyncReceipt } from "../lib/blog/firefly-receipt";
+
+/**
+ * 回执本地化：已知的服务端回执按当前插件语言输出；无法识别的自由文本原样套用调用方给的
+ * 兜底模板，避免把构建日志吞掉。
+ *
+ * Localize a receipt: known server messages are rendered in the plugin's language; unrecognized
+ * free text keeps the caller's fallback template so build logs are never swallowed.
+ */
+function localizeReceipt(raw: string, fallbackKey: string): string {
+    const trimmed = String(raw ?? "").trim();
+    const localized = formatGitSyncReceipt(trimmed, (key, params) => $(key as never, params));
+    if (!localized) return $(fallbackKey as never, { msg: "" });
+    if (localized === trimmed) return $(fallbackKey as never, { msg: trimmed });
+    return localized;
+}
+
+/** 分类建议下拉：可一键选常用分类，也可自由输入任意分类 */
+function attachCategorySuggestions(inputEl: HTMLInputElement, parent: HTMLElement, id: string): void {
+    // 面板会重复渲染：已有建议表就复用，避免同名 datalist 越堆越多
+    // The panel re-renders: reuse an existing list so same-id datalists never pile up
+    const existing = parent.querySelector(`datalist#${id}`);
+    if (existing) {
+        inputEl.setAttribute("list", id);
+        return;
+    }
+    const datalist = parent.createEl("datalist", { attr: { id } });
+    for (const category of FIREFLY_CATEGORIES) {
+        datalist.createEl("option", { attr: { value: category } });
+    }
+    inputEl.setAttribute("list", id);
+}
+
+/** Frontmatter 的 draft 字段是否为真（布尔或 "true" 字符串） */
+function isDraftFlag(value: unknown): boolean {
+    if (value === true) return true;
+    return typeof value === "string" && value.trim().toLowerCase() === "true";
+}
+
+/** 活动笔记是否标记为草稿（用于发布前的温和提醒） */
+async function activePostIsDraft(app: App): Promise<boolean> {
+    const file = activeMarkdownFile(app);
+    if (!file) return false;
+    try {
+        const fm = parseFrontmatter(await app.vault.read(file));
+        return isDraftFlag(fm?.draft);
+    } catch {
+        return false;
+    }
+}
+
+/** 发布前若当前文章是草稿，给出一条不阻断的温和提示 */
+export async function warnIfActivePostIsDraft(plugin: FastSync): Promise<void> {
+    try {
+        if (await activePostIsDraft(plugin.app)) {
+            showSyncNotice($("ui.firefly.draft_hint"), 8000);
+        }
+    } catch {
+        // 提示失败不影响发布流程 / A failed hint never blocks publishing
+    }
+}
 
 type ImageMode = "none" | "api" | "local";
 
@@ -123,7 +185,6 @@ export class FireflyPostModal extends Modal {
     private busy = false;
     private lastReceipt = "";
     private pollTimer: number | null = null;
-    private categoryCustom = false;
 
     constructor(app: App, plugin: FastSync, file: TFile) {
         super(app);
@@ -156,7 +217,10 @@ export class FireflyPostModal extends Modal {
             category,
             tags: tags || FIREFLY_DEFAULT_TAGS.join(", "),
             description: stringValue(fm.description),
-            draft: boolValue(fm.draft, true),
+            // 没有 draft 字段的文章按公开处理（与新建模板默认一致），避免保存属性时被悄悄标成草稿
+            // A post without a draft key is public (matching the new-post template), so saving
+            // properties never silently turns it into a draft
+            draft: boolValue(fm.draft, false),
             scope,
             type: type || "share",
             comment: boolValue(fm.comment, false),
@@ -165,7 +229,6 @@ export class FireflyPostModal extends Modal {
             slugLocked: existingSlug.length > 0,
             setUpdatedToday: false,
         };
-        this.categoryCustom = !!category && !FIREFLY_CATEGORIES.includes(category);
         this.render();
     }
 
@@ -298,33 +361,15 @@ export class FireflyPostModal extends Modal {
         const section = parent.createDiv("fns-firefly-section");
         section.createDiv({ cls: "fns-firefly-section-title", text: $("ui.firefly.field_category") });
 
-        const categoryOptions = [...FIREFLY_CATEGORIES];
-        if (state.category && !categoryOptions.includes(state.category)) categoryOptions.push(state.category);
-
         new Setting(section)
             .setName($("ui.firefly.field_category"))
-            .addDropdown((dropdown) => {
-                for (const cat of categoryOptions) dropdown.addOption(cat, cat);
-                dropdown.addOption("__custom__", $("ui.firefly.field_category") + " ✎");
-                dropdown.setValue(this.categoryCustom ? "__custom__" : state.category || categoryOptions[0]);
-                dropdown.onChange((value) => {
-                    if (value === "__custom__") {
-                        this.categoryCustom = true;
-                        this.render();
-                        return;
-                    }
-                    this.categoryCustom = false;
-                    state.category = value;
-                    if (!state.slugLocked) state.slug = generateSlugForNote(value, state.title);
-                    this.scheduleSoftRefresh();
-                });
-            })
+            .setDesc($("ui.firefly.field_category_desc"))
             .addText((text) => {
                 text.inputEl.addClass("fns-firefly-custom-category");
                 text.setPlaceholder($("ui.firefly.field_category"));
-                text.setValue(this.categoryCustom ? state.category : "");
+                text.setValue(state.category);
+                attachCategorySuggestions(text.inputEl, section, "fns-firefly-category-list");
                 text.onChange((value) => {
-                    if (!this.categoryCustom) return;
                     state.category = value.trim();
                     if (!state.slugLocked) state.slug = generateSlugForNote(value, state.title);
                 });
@@ -356,6 +401,7 @@ export class FireflyPostModal extends Modal {
 
         new Setting(section)
             .setName($("ui.firefly.field_draft"))
+            .setDesc($("ui.firefly.create_draft_desc"))
             .addToggle((toggle) =>
                 toggle.setValue(state.draft).onChange((value) => {
                     state.draft = value;
@@ -560,6 +606,14 @@ export class FireflyPostModal extends Modal {
             footer.createDiv({ cls: "fns-firefly-receipt", text: this.lastReceipt });
         }
 
+        const safeSiteUrl = getSafeHttpUrl(this.plugin.settings?.fireflySiteUrl || "");
+        if (this.lastReceipt && safeSiteUrl) {
+            const openBlogBtn = footer.createEl("button", { text: $("ui.firefly.open_blog") });
+            openBlogBtn.addEventListener("click", () => {
+                window.open(safeSiteUrl, "_blank", "noopener,noreferrer");
+            });
+        }
+
         const saveBtn = footer.createEl("button", { text: $("ui.firefly.save") });
         saveBtn.disabled = this.busy;
         saveBtn.addEventListener("click", () => {
@@ -653,6 +707,12 @@ export class FireflyPostModal extends Modal {
     // ─── 发布与轮询 ────────────────────────────────────────────────
 
     private async publish(): Promise<void> {
+        // 以文章实际 frontmatter 为准（未写过 draft 的文章不应被误提示）
+        // Judge by the real frontmatter: a post without a draft key must not trigger the hint
+        if (isDraftFlag(this.frontmatter.draft)) {
+            // 草稿温和提醒，不阻断发布 / Gentle draft hint; never blocks publishing
+            showSyncNotice($("ui.firefly.draft_hint"), 8000);
+        }
         const notice = showSyncNotice($("ui.firefly.publishing"), 120000);
         try {
             const status = await this.plugin.api.getGitSyncStatus(this.plugin.settings.vault);
@@ -730,12 +790,15 @@ export class FireflyPostModal extends Modal {
                 continue;
             }
             if (last.lastStatus === 2) {
-                this.lastReceipt = $("ui.firefly.publish_done", { msg: message || "" });
+                this.lastReceipt = localizeReceipt(message, "ui.firefly.publish_done");
                 notice.setMessage(this.lastReceipt);
+                if (getSafeHttpUrl(this.plugin.settings?.fireflySiteUrl || "")) {
+                    showBlogPublishSuccessNotice(this.plugin, this.lastReceipt, 12000);
+                }
                 break;
             }
             if (last.lastStatus === 3 || last.lastStatus === 4) {
-                this.lastReceipt = $("ui.firefly.publish_deploy_failed", { msg: message || $("ui.firefly.publish_waiting") });
+                this.lastReceipt = localizeReceipt(message, "ui.firefly.publish_deploy_failed");
                 notice.setMessage(this.lastReceipt);
                 break;
             }
@@ -806,6 +869,7 @@ export class CheckFireflyPostModal extends Modal {
     private plugin: FastSync;
     private file: TFile;
     private check: FireflyCheckResult | null = null;
+    private draftHintShown = false;
 
     constructor(app: App, plugin: FastSync, file: TFile) {
         super(app);
@@ -829,6 +893,14 @@ export class CheckFireflyPostModal extends Modal {
             content,
             resolveImageExists: makeImageExistsResolver(this.app, this.file.path),
         });
+        if (!this.draftHintShown) {
+            this.draftHintShown = true;
+            const fm = parseFrontmatter(content);
+            if (isDraftFlag(fm?.draft)) {
+                // 草稿温和提醒，不阻断检查 / Gentle draft hint; never blocks the check
+                showSyncNotice($("ui.firefly.draft_hint"), 8000);
+            }
+        }
         this.render();
     }
 
@@ -892,13 +964,18 @@ export class CheckFireflyPostModal extends Modal {
 export class CreateFireflyPostModal extends Modal {
     private plugin: FastSync;
     private titleValue = "";
-    private category: string = FIREFLY_CATEGORIES[0];
+    private category = "";
     private dir: string;
+    private draft = false;
 
-    constructor(app: App, plugin: FastSync) {
+    /**
+     * @param initialDir 从右键菜单打开时预填的存放目录（文件夹路径或笔记父目录）
+     */
+    constructor(app: App, plugin: FastSync, initialDir?: string) {
         super(app);
         this.plugin = plugin;
-        this.dir = (plugin.settings.fireflyDefaultBlogDir || "Blog").trim() || "Blog";
+        const preset = String(initialDir ?? "").trim();
+        this.dir = preset || (plugin.settings.fireflyDefaultBlogDir || "Blog").trim() || "Blog";
     }
 
     onOpen() {
@@ -918,11 +995,15 @@ export class CreateFireflyPostModal extends Modal {
 
         new Setting(form)
             .setName($("ui.firefly.create_category"))
-            .addDropdown((dropdown) => {
-                for (const cat of FIREFLY_CATEGORIES) dropdown.addOption(cat, cat);
-                dropdown.setValue(this.category).onChange((value) => {
-                    this.category = value;
-                });
+            .setDesc($("ui.firefly.field_category_desc"))
+            .addText((text) => {
+                text
+                    .setPlaceholder($("ui.firefly.create_category_placeholder"))
+                    .setValue(this.category)
+                    .onChange((value) => {
+                        this.category = value.trim();
+                    });
+                attachCategorySuggestions(text.inputEl, form, "fns-firefly-create-category-list");
             });
 
         new Setting(form)
@@ -934,6 +1015,15 @@ export class CreateFireflyPostModal extends Modal {
                     .onChange((value) => {
                         this.dir = value.trim();
                     }),
+            );
+
+        new Setting(form)
+            .setName($("ui.firefly.create_draft"))
+            .setDesc($("ui.firefly.create_draft_desc"))
+            .addToggle((toggle) =>
+                toggle.setValue(this.draft).onChange((value) => {
+                    this.draft = value;
+                }),
             );
 
         const footer = contentEl.createDiv("fns-firefly-footer");
@@ -955,11 +1045,12 @@ export class CreateFireflyPostModal extends Modal {
             showSyncNotice($("ui.firefly.create_no_title"));
             return;
         }
-        const folder = normalizePath(joinVaultPath(this.dir, this.category));
+        const category = this.category.trim();
+        const folder = normalizePath(joinVaultPath(this.dir, category));
         if (!this.app.vault.getAbstractFileByPath(folder)) {
             await this.app.vault.createFolder(folder);
         }
-        const slug = generateSlugForNote(this.category, title);
+        const slug = generateSlugForNote(category, title);
         const path = normalizePath(joinVaultPath(folder, `${title}.md`));
         if (this.app.vault.getAbstractFileByPath(path)) {
             showSyncNotice($("ui.firefly.create_exists", { path }));
@@ -967,10 +1058,11 @@ export class CreateFireflyPostModal extends Modal {
         }
         const content = buildFireflyPostTemplate({
             title,
-            category: this.category,
+            category,
             slug,
             sourceVault: this.plugin.settings.vault || "doge",
             today: formatLocalDate(),
+            draft: this.draft,
         });
         const file = await this.app.vault.create(path, content);
         showSyncNotice($("ui.firefly.create_success", { path }));
@@ -987,10 +1079,42 @@ export function activeMarkdownFile(app: App): TFile | null {
 }
 
 /**
+ * 展示博客发布成功/已受理通知；若配置了合法的博客访问地址，则附上可点击的「打开博客」入口。
+ * Show a blog publish success/accepted notice; appends a clickable "Open blog" link when a valid blog URL is configured.
+ */
+export function showBlogPublishSuccessNotice(plugin: FastSync, message: string, duration = 12000): void {
+    const safeSiteUrl = getSafeHttpUrl(plugin.settings?.fireflySiteUrl || "");
+    if (!safeSiteUrl || typeof Notice !== "function" || typeof createFragment !== "function") {
+        showSyncNotice(message, duration);
+        return;
+    }
+
+    const fragment = createFragment((frag) => {
+        const wrap = frag.createDiv("fns-blog-notice");
+        wrap.createSpan({ text: message });
+        const link = wrap.createEl("a", {
+            cls: "fns-blog-notice-link",
+            text: $("ui.firefly.open_blog"),
+            attr: {
+                href: safeSiteUrl,
+                target: "_blank",
+                rel: "noopener noreferrer",
+            },
+        });
+        link.addEventListener("click", (e) => {
+            e.preventDefault();
+            window.open(safeSiteUrl, "_blank", "noopener,noreferrer");
+        });
+    });
+    new Notice(fragment, duration);
+}
+
+/**
  * 「立即发布到 Firefly」：触发服务端 Git 同步，并轮询几秒展示最新构建回执。
  * Trigger the server-side Git sync and poll briefly for the build receipt.
  */
 export async function triggerFireflyPublish(plugin: FastSync): Promise<void> {
+    await warnIfActivePostIsDraft(plugin);
     const notice = showSyncNotice($("ui.firefly.publishing"), 120000);
     try {
         const status = await plugin.api.getGitSyncStatus(plugin.settings.vault);
@@ -1028,15 +1152,15 @@ export async function triggerFireflyPublish(plugin: FastSync): Promise<void> {
                 || (item.lastSyncTime ?? "") !== previous.lastSyncTime;
             if (item.lastStatus === 1 || !advanced) continue;
             if (item.lastStatus === 2) {
-                showSyncNotice($("ui.firefly.publish_done", { msg: message || "" }), 12000);
+                showBlogPublishSuccessNotice(plugin, localizeReceipt(message, "ui.firefly.publish_done"), 12000);
                 return;
             }
             if (item.lastStatus === 3 || item.lastStatus === 4) {
-                showSyncNotice($("ui.firefly.publish_deploy_failed", { msg: message || $("ui.firefly.publish_waiting") }), 12000);
+                showSyncNotice(localizeReceipt(message, "ui.firefly.publish_deploy_failed"), 12000);
                 return;
             }
         }
-        showSyncNotice($("ui.firefly.publish_waiting"), 8000);
+        showBlogPublishSuccessNotice(plugin, $("ui.firefly.publish_waiting"), 8000);
     } finally {
         notice.hide();
     }

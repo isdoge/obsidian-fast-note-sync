@@ -492,6 +492,35 @@ export class RetryQueue {
         this.settleWaiters();
     }
 
+    /**
+     * 清空队列（切换远端笔记库名时调用）。旧库的删除/改名重试不能带到新库，
+     * 否则会在空库里重放旧路径的删除操作。
+     *
+     * Clear the queue (called when switching the remote vault name). Delete/rename retries
+     * belonging to the old vault must not replay against the new (possibly empty) vault.
+     */
+    clear(): void {
+        this.generation++;
+        if (this.timer !== null) {
+            window.clearTimeout(this.timer);
+            this.timer = null;
+        }
+        if (this.active) this.release(this.active);
+        this.active = null;
+        this.activeTargetStat = "";
+        this.activeSourceStat = "";
+        this.due = 0;
+        this.entries = [];
+        this.liveFolders.clear();
+        this.replayedPaths.clear();
+        this.recoveryPaths.clear();
+        this.retiredAckKeys.clear();
+        this.reconnectRequested = false;
+        this.scope = this.getScope();
+        this.settleWaiters();
+        this.persist();
+    }
+
     stop(): void {
         this.stopped = true;
         this.onDisconnected();

@@ -153,7 +153,9 @@ export interface GitSyncPublicStatus {
     id: number;
     vault: string;
     branch: string;
+    sourceDir?: string;
     targetSubdir: string;
+    requireFrontmatter?: string;
     isEnabled: boolean;
     lastSyncTime?: string;
     lastStatus: number;
