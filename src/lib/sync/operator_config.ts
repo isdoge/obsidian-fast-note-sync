@@ -1,12 +1,13 @@
 import { normalizePath, App } from "obsidian";
 
-import { hashContent, dump, dumpError, configIsPathExcluded, getSafeCtime, isPathInConfigSyncDirs, showSyncNotice, isInWhitelist, hashFileAsync, checkAndNotifyCaseConflict, isLargeBinarySyncRisk, normalizeServerTimestamp } from "../utils/helpers";
+import { hashContent, dump, dumpError, configIsPathExcluded, getSafeCtime, isPathInConfigSyncDirs, showSyncNotice, isInWhitelist, hashFileAsync, hashArrayBuffer, checkAndNotifyCaseConflict, isLargeBinarySyncRisk, normalizeServerTimestamp } from "../utils/helpers";
 import { decodeConfigContent, encodeConfigContent } from "../utils/config_codec";
 import { SyncLogManager } from "./sync_log_manager";
 import { advanceLiveSyncTime } from "./sync_state";
 import { ReceiveMessage, ReceiveMtimeMessage, ReceivePathMessage, SyncEndData } from "../utils/types";
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
+import { buildBaselineFields, buildDeleteBaselineFields } from "../storage/baseline_scope";
 
 
 /**
@@ -167,7 +168,7 @@ const guardPluginDowngrade = async function (data: ReceiveMessage, plugin: FastS
     return false
 }
 
-export const configModify = async function (path: string, plugin: FastSync, eventEnter: boolean = false, content?: string, forceUpload: boolean = false) {
+export const configModify = async function (path: string, plugin: FastSync, eventEnter: boolean = false, content?: string, forceUpload: boolean = false, options?: { isConflictResolved?: boolean; baseRevision?: string }) {
     if (plugin.settings.configSyncEnabled == false || plugin.settings.readonlySyncEnabled) return
     if (!isPathInConfigSyncDirs(path, plugin)) return
     if (eventEnter && plugin.ignoredConfigFiles.has(path)) return
@@ -252,6 +253,9 @@ export const configModify = async function (path: string, plugin: FastSync, even
         contentHash: contentHash,
         mtime: mtime,
         ctime: ctime,
+        ...buildBaselineFields(plugin, "setting", path, contentHash),
+        ...(options?.baseRevision ? { baseRevision: options.baseRevision } : {}),
+        ...(options?.isConflictResolved ? { isConflictResolved: true } : {}),
     }
     // 将 hash 暂存到 pending map，等待服务端 SettingModifyAck 后再写入 configHashManager
     // Temporarily store hash in pending map, update configHashManager only after server SettingModifyAck
@@ -280,10 +284,14 @@ export const configDelete = async function (path: string, plugin: FastSync, even
     }
 
     plugin.addIgnoredConfigFile(path)
+    // 删除前快照最后确认的基线，供实时删除、回放与批量删除携带
+    // Snapshot the last confirmed baseline before deletion for live/replay/batch deletes
+    if (plugin.isSyncBaselineModeEnabled?.() === true) plugin.configHashManager?.recordPendingDeleteBaseline?.(path)
     const data = {
         vault: plugin.settings.vault,
         path: path,
         pathHash: hashContent(path),
+        ...buildDeleteBaselineFields(plugin, "setting", path),
     }
     if (!await plugin.concurrencyLimiter.waitForSlot(path)) {
         plugin.removeIgnoredConfigFile(path)
@@ -323,6 +331,13 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
         // 拦截 LocalStorage 更新
         if (isVirtual) {
             if (await plugin.localStorageManager.handleReceivedUpdate(data.path, data.content)) {
+                // 服务端已落盘虚拟配置：建立/前移可信基线（含 revision）
+                // The server landed the virtual config: establish/advance the trusted baseline
+                const rawRevision = (data as { revision?: string }).revision
+                const revision = typeof rawRevision === "string" ? rawRevision : ""
+                if (revision !== "" && plugin.configHashManager?.setConfirmedBaseline) {
+                    plugin.configHashManager.setConfirmedBaseline(data.path, data.contentHash, revision, normalizeServerTimestamp(data.mtime), data.content?.length || 0)
+                }
                 plugin.removeIgnoredConfigFile(data.path)
                 advanceLiveSyncTime(plugin, "lastConfigSyncTime", data.lastTime)
                 plugin.recordSyncCompleted('setting', data.pageIndex)
@@ -427,7 +442,12 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
         const size = isVirtual ? (data.content?.length || 0) : (stat?.size || 0);
         const mtime = normalizeServerTimestamp(data.mtime) || (stat?.mtime || 0);
 
-        plugin.configHashManager.setFileHash(data.path, data.contentHash, mtime, size)
+        const revision = (data as { revision?: string }).revision
+        if (typeof revision === "string" && revision !== "") {
+            plugin.configHashManager.setFileHash(data.path, data.contentHash, mtime, size, revision)
+        } else {
+            plugin.configHashManager.setFileHash(data.path, data.contentHash, mtime, size)
+        }
         // 记录 mtime
         plugin.lastSyncMtime.set(data.path, mtime)
     }
@@ -510,6 +530,7 @@ export const receiveConfigUpload = async function (data: ReceivePathMessage, plu
         contentHash: contentHash,
         mtime: mtime,
         ctime: ctime,
+        ...buildBaselineFields(plugin, "setting", data.path, contentHash),
     };
     // 将 hash 暂存到 pending map，等待服务端 SettingModifyAck 后再写入 configHashManager
     // Temporarily store hash in pending map, update configHashManager only after server SettingModifyAck
@@ -557,6 +578,16 @@ export const receiveConfigSyncMtime = async function (data: ReceiveMtimeMessage,
     try {
         if (await plugin.app.vault.adapter.exists(filePath)) {
             const content = await plugin.app.vault.adapter.readBinary(filePath)
+            // 内容一致确认：只有本地仍是消息内容时才建立可信基线（设计稿 §5.2 第 3 条）
+            // Content-equality confirmation: only when local content is still the message's content
+            const msgHash = typeof data.contentHash === "string" && data.contentHash !== "" ? data.contentHash : "";
+            const revision = typeof data.revision === "string" && data.revision !== "" ? data.revision : "";
+            if (msgHash !== "" && revision !== "" && plugin.configHashManager?.setConfirmedBaseline) {
+                const localHash = await hashArrayBuffer(content)
+                if (localHash === msgHash) {
+                    plugin.configHashManager.setConfirmedBaseline(data.path, msgHash, revision, mtime || 0, content.byteLength)
+                }
+            }
             await plugin.app.vault.adapter.writeBinary(filePath, content, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
         }
 
@@ -677,12 +708,46 @@ export const receiveConfigSyncClear = async function (data: unknown, plugin: Fas
  * 收到 SettingModifyAck，将 pending hash 转移到正式 configHashManager 并更新 lastConfigSyncTime
  * Receive SettingModifyAck, move pending hash to formal configHashManager and update lastConfigSyncTime
  */
-export const receiveConfigModifyAck = async function (data: { lastTime?: number; path?: string }, plugin: FastSync, outsideRound = false) {
+export const receiveConfigModifyAck = async function (data: { lastTime?: number; path?: string; contentHash?: string; revision?: string }, plugin: FastSync, outsideRound = false) {
     if (data.path) {
-        const contentHash = plugin.pendingConfigModifies.get(data.path)
-        if (contentHash !== undefined) {
+        const pendingHash = plugin.pendingConfigModifies.get(data.path)
+        const ackHash = typeof data.contentHash === "string" && data.contentHash !== "" ? data.contentHash : undefined
+        const isVirtual = data.path.startsWith(plugin.localStorageManager.syncPathPrefix)
+        if (ackHash && plugin.isSyncBaselineModeEnabled?.() === true && plugin.configHashManager?.setConfirmedBaseline) {
+            // 回执只确认发送时的快照；上传途中被继续编辑时绝不能把新内容标为已同步（设计稿 §5.2）
+            // The Ack confirms only the sent snapshot; edits made during the upload are never
+            // marked as synced (design §5.2)
+            let diskHash: string | null = null
+            let mtime = 0, size = 0
+            try {
+                if (isVirtual) {
+                    const value = plugin.localStorageManager.getItemValue(plugin.localStorageManager.pathToKey(data.path) || "")
+                    diskHash = value === null || value === undefined ? null : hashContent(value)
+                    mtime = Date.now()
+                    size = value?.length || 0
+                } else {
+                    const stat = await plugin.app.vault.adapter.stat(normalizePath(data.path))
+                    mtime = stat?.mtime || 0
+                    size = stat?.size || 0
+                    if (stat) diskHash = await hashFileAsync(plugin.app, normalizePath(data.path))
+                }
+            } catch { diskHash = null }
+            plugin.configHashManager.setConfirmedBaseline(data.path, ackHash,
+                typeof data.revision === "string" ? data.revision : "", mtime, size)
+            if (pendingHash === ackHash) {
+                plugin.pendingConfigModifies.delete(data.path)
+                plugin.localStorageManager.savePending('pendingConfigModifies', plugin.pendingConfigModifies)
+            }
+            if (diskHash !== null && diskHash !== ackHash) {
+                // 上传途中的新编辑：保留 pending 并立即安排携带新基线的后续上传
+                // New edit during upload: keep pending and schedule a follow-up upload with the new baseline
+                dump(`[Baseline] Config Ack confirmed ${ackHash}, disk changed to ${diskHash}; scheduling follow-up upload`, data.path)
+                plugin.pendingConfigModifies.set(data.path, diskHash)
+                plugin.localStorageManager.savePending('pendingConfigModifies', plugin.pendingConfigModifies)
+                window.setTimeout(() => { void configModify(data.path as string, plugin, true) }, 0)
+            }
+        } else if (pendingHash !== undefined) {
             if (plugin.configHashManager && plugin.configHashManager.isReady()) {
-                const isVirtual = data.path.startsWith(plugin.localStorageManager.syncPathPrefix)
                 let mtime = 0, size = 0
                 if (isVirtual) {
                     mtime = Date.now() // LocalStorage 虚拟时间
@@ -692,7 +757,7 @@ export const receiveConfigModifyAck = async function (data: { lastTime?: number;
                     mtime = stat?.mtime || 0
                     size = stat?.size || 0
                 }
-                plugin.configHashManager.setFileHash(data.path, contentHash, mtime, size)
+                plugin.configHashManager.setFileHash(data.path, pendingHash, mtime, size)
             }
             plugin.pendingConfigModifies.delete(data.path)
             plugin.localStorageManager.savePending('pendingConfigModifies', plugin.pendingConfigModifies)
@@ -716,6 +781,11 @@ export const receiveConfigModifyAck = async function (data: { lastTime?: number;
  * Receive SettingDeleteAck; only remove from configHashManager if path is still pending and update lastConfigSyncTime
  */
 export const receiveConfigDeleteAck = function (data: { lastTime?: number; path?: string }, plugin: FastSync) {
+    if (data.path) {
+        // 删除已确认：清除待删基线记录
+        // Delete confirmed: drop the pre-delete baseline record
+        plugin.configHashManager?.clearPendingDeleteBaseline?.(data.path)
+    }
     if (data.path && plugin.pendingConfigDeleteAcks.has(data.path)) {
         if (plugin.configHashManager && plugin.configHashManager.isReady()) {
             plugin.configHashManager.removeFileHash(data.path)

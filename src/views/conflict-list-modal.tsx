@@ -7,6 +7,7 @@ import { $ } from "../i18n/lang";
 import { LucideIcon } from "./note-history/lucide-icon";
 import { alignConflictEntries, listUnalignedPaths, ConflictAlignMode, ConflictAlignResult } from "../lib/sync/conflict_align";
 import { ConfirmModal } from "./confirm-modal";
+import { conflictKindLabel, conflictReasonLabel, readUnifiedConflictMeta } from "../lib/sync/conflict_store";
 
 export class ConflictListModal extends Modal {
     private root: Root | null = null;
@@ -61,6 +62,8 @@ const ConflictListView = ({ plugin, modal }: { plugin: FastSync, modal: Conflict
     // 待对齐路径（本地有内容但无可信基线）；普通双端冲突不在其中
     const [unaligned, setUnaligned] = React.useState<string[]>([]);
     const [busy, setBusy] = React.useState<ConflictAlignMode | null>(null);
+    // 四类资源与原因标签（阶段 E）/ Kind and reason labels for all four kinds (stage E)
+    const [metas, setMetas] = React.useState<Record<string, { kind: string; reason: string }>>({});
 
     React.useEffect(() => {
         let disposed = false;
@@ -69,6 +72,12 @@ const ConflictListView = ({ plugin, modal }: { plugin: FastSync, modal: Conflict
             setConflicts(previous => (sameList(current, previous) ? previous : current));
             const pending = await listUnalignedPaths(plugin, current);
             if (!disposed) setUnaligned(previous => (sameList(pending, previous) ? previous : pending));
+            const nextMetas: Record<string, { kind: string; reason: string }> = {};
+            for (const path of current) {
+                const meta = await readUnifiedConflictMeta(plugin, path);
+                nextMetas[path] = { kind: meta?.kind || (path.endsWith(".md") ? "note" : "file"), reason: meta?.reason || "" };
+            }
+            if (!disposed) setMetas(nextMetas);
         };
         void refresh();
         const timer = window.setInterval(() => { void refresh(); }, 500);
@@ -148,6 +157,11 @@ const ConflictListView = ({ plugin, modal }: { plugin: FastSync, modal: Conflict
                             </div>
                             <div className="fns-ws-clients-item-address-line">
                                 {path}
+                            </div>
+                            <div className="fns-conflict-kind-line">
+                                {conflictKindLabel(metas[path]?.kind)}
+                                {" · "}
+                                {conflictReasonLabel(metas[path]?.reason)}
                             </div>
                             {isUnaligned && (
                                 <div className="fns-conflict-unaligned-tag">

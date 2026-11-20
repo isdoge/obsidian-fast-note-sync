@@ -64,6 +64,14 @@ export class SyncState {
    * used to show one aggregated notice when the round completes.
    */
   public newUnalignedPathsThisRound: Set<string> = new Set();
+  /**
+   * 本轮已持久化的基线冲突数（按类型）。SyncConflict 既可能作为分页条目到达，
+   * 也可能由条件写 530 拒绝返回；两者都必须计入本轮冲突提示，不能混入上传成功计数。
+   * Baseline conflicts persisted this round by type. A SyncConflict may arrive as a paged item
+   * or as a 530 rejection of a conditional write; both must count toward the round's conflict
+   * notice and never toward upload success.
+   */
+  public conflictCountsThisRound: Map<"note" | "file" | "setting" | "folder", number> = new Map();
 
   // ─── Chunk size settings from server ─────────────────────────────────────────
   /** 上传分片数量 / Upload chunk size from server */
@@ -438,6 +446,7 @@ export class SyncState {
     this.offlineGuardSkippedThisRound = false;
     this.truncatedSyncFields.clear();
     this.hashTimeoutCounts.clear();
+    this.conflictCountsThisRound.clear();
     // 注意：不再清空 scannedXxxHashes。这些哈希是扫描期实打实算出来的，条目自带 mtime/size 校验，
     // 留到下一轮同步结束时提交依然有效；在这里清空会把上一轮（可能仍在收尾）算出的哈希白白丢掉，
     // 导致同一批文件每次同步都要重算。提交由 operator.ts 的 commitScannedHashes 按键移除。

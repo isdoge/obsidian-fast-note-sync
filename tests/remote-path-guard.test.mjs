@@ -29,7 +29,9 @@ function load(name) {
     module, exports: module.exports, console,
     window: { setTimeout: callback => callback() },
     require(id) {
-      if (id === "obsidian") return { TFile, TFolder, normalizePath, Platform: { isMobile: false } };
+      if (id.includes("baseline_scope")) return { buildBaselineFields: (plugin, kind, path) => { if (kind === "folder" || !plugin) return {}; const m = kind === "setting" ? plugin.configHashManager : plugin.fileHashManager; const b = m && typeof m.getPathHash === "function" ? m.getPathHash(path) : null; return b !== null && b !== undefined ? { baseHash: b } : { baseHashMissing: true }; }, buildDeleteBaselineFields: () => ({}), baselineFieldsFromDeleteRecord: () => ({}), computeRemoteScope: () => "scope", parseScopedState: () => ({ state: { scope: "scope", revisions: {}, pendingDeletes: {} }, scopeChanged: false }), serializeScopedState: (state) => JSON.stringify(state) };
+    if (id.includes("conflict_store")) return { storeSyncConflict: async () => false, normalizeConflict: () => null, conflictKindToSyncType: () => "note", conflictReasonLabel: () => "", conflictKindLabel: () => "" };
+          if (id === "obsidian") return { TFile, TFolder, normalizePath, Platform: { isMobile: false } };
       if (id === "./remote_path_guard") return load("remote_path_guard");
       if (id === "./remote_delete_guard") return load("remote_delete_guard");
       if (id === "./sync_log_manager") return { SyncLogManager: logger };

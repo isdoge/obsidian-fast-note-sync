@@ -789,6 +789,18 @@ export class MenuManager {
       const adapter = this.plugin.app.vault.adapter;
       const { baseBackupPath, remoteBackupPath } = conflictBackupPaths(this.plugin, normalizedPath);
       const meta = await readConflictMeta(this.plugin, normalizedPath);
+      // 四类资源分流：附件/目录用选择框，笔记与文本配置用差异编辑器（设计稿 §5.3）
+      // Route by kind: attachments/folders use a choice modal, notes and text settings use the
+      // diff editor (design §5.3)
+      const { readUnifiedConflictMeta } = await import("../sync/conflict_store");
+      const { conflictSupportsDiffEditor } = await import("../sync/conflict_resolve");
+      const unified = await readUnifiedConflictMeta(this.plugin, normalizedPath);
+      const conflictKind = unified?.kind || (normalizedPath.endsWith(".md") ? "note" : "file");
+      if (!conflictSupportsDiffEditor(conflictKind)) {
+        const { ConflictChoiceModal } = await import("../../views/conflict-choice-modal");
+        new ConflictChoiceModal(this.plugin.app, this.plugin, normalizedPath).open();
+        return;
+      }
       // base 文件存在才算有共同祖先；空文件是“真实空 base”，不存在是“缺基线”，两者文案不同
       // base exists => real ancestor (an empty file is a real empty base); absent => missing base
       const baseExists = await adapter.exists(baseBackupPath);
@@ -804,6 +816,21 @@ export class MenuManager {
       }
 
       const localContent = await this.plugin.app.vault.read(file);
+      if (conflictKind === "setting") {
+        const { ConflictResolveModal } = await import("../../views/conflict-resolve-modal");
+        // TFile 不覆盖 .obsidian：用最小路径对象交给弹窗，写盘分支按 kind 走 adapter
+        // TFile does not cover .obsidian: hand the modal a minimal path object; the write branch
+        // uses the adapter for settings
+        const pseudoFile = { path: normalizedPath, stat: { ctime: 0, mtime: 0 } } as unknown as typeof file;
+        new ConflictResolveModal(this.plugin.app, this.plugin, pseudoFile, localContent, serverContent, baseContent,
+          unified?.serverHash || unified?.remoteHash || "", baseMissing, {
+            kind: "setting",
+            path: normalizedPath,
+            serverRevision: unified?.serverRevision,
+            serverDeleted: unified?.serverDeleted,
+          }).open();
+        return;
+      }
 
       interface SyncLogItem {
         path?: string;
@@ -830,7 +857,12 @@ export class MenuManager {
 
       if (baseMissing && meta?.remoteHash && !serverHash) serverHash = meta.remoteHash;
       const { ConflictResolveModal } = await import("../../views/conflict-resolve-modal");
-      new ConflictResolveModal(this.plugin.app, this.plugin, file, localContent, serverContent, baseContent, serverHash, baseMissing).open();
+      new ConflictResolveModal(this.plugin.app, this.plugin, file, localContent, serverContent, baseContent, serverHash, baseMissing, {
+        kind: conflictKind,
+        path: normalizedPath,
+        serverRevision: unified?.serverRevision,
+        serverDeleted: unified?.serverDeleted,
+      }).open();
     } catch (e) {
       console.error("Failed to open conflict resolver for path:", e);
       new Notice($("ui.conflict.open_failed", { path: normalizedPath }));

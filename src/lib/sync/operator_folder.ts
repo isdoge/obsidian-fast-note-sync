@@ -6,12 +6,13 @@ import { SyncEndData, FolderSyncRenameMessage } from "../utils/types";
 import { hashContent, dump, dumpError, isFolderSyncPathExcluded, waitForFolderEmpty, checkAndNotifyCaseConflict, normalizeServerTimestamp } from "../utils/helpers";
 import { SyncLogManager } from "./sync_log_manager";
 import type FastSync from "../../main";
+import { BaselineDeleteRecord, baselineFieldsFromDeleteRecord, buildBaselineFields, buildDeleteBaselineFields } from "../storage/baseline_scope";
 
 
 /**
  * 文件夹修改/创建事件处理
  */
-export const folderModify = async function (folder: TFolder, plugin: FastSync, eventEnter: boolean = false) {
+export const folderModify = async function (folder: TFolder, plugin: FastSync, eventEnter: boolean = false, options?: { isConflictResolved?: boolean; baseRevision?: string }) {
     if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
     if (eventEnter && plugin.isIgnoredFile(folder.path)) return
     if (isFolderSyncPathExcluded(folder.path, plugin)) return
@@ -24,6 +25,9 @@ export const folderModify = async function (folder: TFolder, plugin: FastSync, e
                 vault: plugin.settings.vault,
                 path: folder.path,
                 pathHash: hashContent(folder.path),
+                ...buildBaselineFields(plugin, "folder", folder.path, null),
+                ...(options?.baseRevision ? { baseRevision: options.baseRevision } : {}),
+                ...(options?.isConflictResolved ? { isConflictResolved: true } : {}),
             }
             void plugin.websocket.SendMessage("FolderModify", data, undefined, () => {
                 plugin.folderSnapshotManager.setFolderMtime(folder.path, now)
@@ -52,10 +56,13 @@ export const folderDelete = async function (folder: TFolder, plugin: FastSync, e
     await plugin.lockManager.withLock(folder.path, async () => {
         plugin.addIgnoredFile(folder.path)
         try {
+            // 删除前快照最后确认的目录 revision / Snapshot the last confirmed folder revision
+            if (plugin.isSyncBaselineModeEnabled?.() === true) plugin.folderSnapshotManager.recordPendingDeleteBaseline?.(folder.path)
             const data = {
                 vault: plugin.settings.vault,
                 path: folder.path,
                 pathHash: hashContent(folder.path),
+                ...buildDeleteBaselineFields(plugin, "folder", folder.path),
             }
             const queued = plugin.retryQueue?.canSend("FolderDelete", data) ?? false
             if (queued && !await plugin.concurrencyLimiter.waitForSlot(folder.path)) return
@@ -73,7 +80,7 @@ export const folderDelete = async function (folder: TFolder, plugin: FastSync, e
  * 按路径字符串发送文件夹删除消息（用于无法获取 TFolder 对象的场景，如 rename 后旧路径已不存在）
  * Send folder delete message by path string (for scenarios where TFolder object is unavailable, e.g., old path after rename)
  */
-export const folderDeleteByPath = async function (folderPath: string, plugin: FastSync, retryGuard?: () => boolean) {
+export const folderDeleteByPath = async function (folderPath: string, plugin: FastSync, retryGuard?: () => boolean, explicitBaseline?: BaselineDeleteRecord) {
     if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
     if (isFolderSyncPathExcluded(folderPath, plugin)) return
     if (plugin.lastSyncPathDeleted.has(folderPath)) return
@@ -82,15 +89,20 @@ export const folderDeleteByPath = async function (folderPath: string, plugin: Fa
         if (retryGuard && !retryGuard()) return
         plugin.addIgnoredFile(folderPath)
         try {
+            if (plugin.isSyncBaselineModeEnabled?.() === true) plugin.folderSnapshotManager.recordPendingDeleteBaseline?.(folderPath)
             const data = {
                 vault: plugin.settings.vault,
                 path: folderPath,
                 pathHash: hashContent(folderPath),
+                ...buildDeleteBaselineFields(plugin, "folder", folderPath),
             }
             const queued = plugin.retryQueue?.canSend("FolderDelete", data) ?? false
             if (queued && !await plugin.concurrencyLimiter.waitForSlot(folderPath)) return
             if (retryGuard && !retryGuard()) { plugin.concurrencyLimiter.releaseSlot(folderPath); return }
-            await plugin.websocket.SendMessage("FolderDelete", data, () => retryGuard ? !retryGuard() : false, () => {
+            await plugin.websocket.SendMessage("FolderDelete", {
+                ...data,
+                ...(explicitBaseline ? baselineFieldsFromDeleteRecord(explicitBaseline) : {}),
+            }, () => retryGuard ? !retryGuard() : false, () => {
                 if (!queued) plugin.folderSnapshotManager.removeFolder(folderPath)
             })
             dump('Folder delete by path send', folderPath)
@@ -103,7 +115,7 @@ export const folderDeleteByPath = async function (folderPath: string, plugin: Fa
 /**
  * 文件夹重命名事件处理
  */
-export const folderRename = async function (folder: TFolder, oldPath: string, plugin: FastSync, eventEnter: boolean = false, retryGuard?: () => boolean) {
+export const folderRename = async function (folder: TFolder, oldPath: string, plugin: FastSync, eventEnter: boolean = false, retryGuard?: () => boolean, retryBaselineRevision?: string) {
     if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
     if (eventEnter && plugin.isIgnoredFile(folder.path)) return
     const newExcluded = isFolderSyncPathExcluded(folder.path, plugin)
@@ -132,6 +144,19 @@ export const folderRename = async function (folder: TFolder, oldPath: string, pl
     // --- 新增：重命名拦截 ---
     if (plugin.lastSyncPathRenamed.has(folder.path)) {
         dump(`Folder rename intercepted: ${folder.path}`)
+        return
+    }
+
+    // 基线模式（设计稿 §2.4）：先创建目标目录，再对源路径带 revision 条件删除；旧模式保持原生 rename
+    // Baseline mode (§2.4): create the target folder, then conditionally delete the source with its
+    // revision; compatibility mode keeps the native rename
+    if (plugin.isSyncBaselineModeEnabled?.()) {
+        if (retryGuard && !retryGuard()) return
+        const sourceHasBaseline = plugin.folderSnapshotManager.getMtime(oldPath) !== null
+            || plugin.folderSnapshotManager.getBaselineRevision?.(oldPath) !== null
+        await folderModify(folder, plugin, true)
+        if (sourceHasBaseline) await folderDeleteByPath(oldPath, plugin)
+        dump(`Folder rename converted to create-then-conditional-delete`, oldPath, folder.path)
         return
     }
 
@@ -198,6 +223,9 @@ export const receiveFolderSyncModify = async function (data: { path: string, mti
                 // snapshot and lastFolderSyncTime are both milliseconds; a seconds value would
                 // compare as older than the cursor and skip folder creation
                 plugin.folderSnapshotManager.setFolderMtime(normalizedPath, normalizeServerTimestamp(data.mtime) || Date.now())
+                if (typeof (data as { revision?: string }).revision === "string" && (data as { revision?: string }).revision) {
+                    plugin.folderSnapshotManager.setConfirmedRevision?.(normalizedPath, (data as { revision?: string }).revision as string)
+                }
             } finally {
                 window.setTimeout(() => {
                     plugin.removeIgnoredFile(normalizedPath)
@@ -274,6 +302,7 @@ export const receiveFolderSyncDelete = async function (data: { path: string, las
                         if (!missing || await plugin.app.vault.adapter.exists(normalizedPath)) throw e
                     }
                     plugin.folderSnapshotManager.removeFolder(normalizedPath)
+                    plugin.folderSnapshotManager.clearPendingDeleteBaseline?.(normalizedPath)
                 } finally {
                     window.setTimeout(() => {
                         plugin.removeIgnoredFile(normalizedPath)
@@ -424,10 +453,37 @@ export const receiveFolderRetryAck = function (action: "FolderDeleteAck" | "Fold
     if (!queue?.matchesAck(action, data.path)) return;
     const entry = queue.entries.find(e => e.objectType === "folder" && e.path === data.path);
     if (!entry) return;
-    if (action === "FolderDeleteAck") plugin.folderSnapshotManager.removeFolder(entry.path);
+    if (action === "FolderDeleteAck") {
+        plugin.folderSnapshotManager.removeFolder(entry.path);
+        plugin.folderSnapshotManager.clearPendingDeleteBaseline?.(entry.path);
+    }
     else {
         plugin.folderSnapshotManager.removeFolder(entry.oldPath!);
         plugin.folderSnapshotManager.setFolderMtime(entry.path, Date.now());
     }
     queue.acknowledge(action, data.path);
+}
+
+/**
+ * FolderModifyAck / FolderDeleteAck / FolderRenameAck 的 revision 处理（基线模式）。
+ * 只有服务端确认的 Ack 才能建立目录 revision；单纯发送或扫描不前移基线。
+ * Revision handling for folder ACKs (baseline mode). Only a server-confirmed ACK establishes a
+ * folder revision; sends and scans never advance it.
+ */
+export const receiveFolderModifyAck = function (data: { path?: string; revision?: string }, plugin: FastSync) {
+    if (data.path && typeof data.revision === "string" && data.revision !== "") {
+        plugin.folderSnapshotManager.setConfirmedRevision?.(data.path, data.revision);
+    }
+}
+
+export const receiveFolderDeleteAckWithRevision = function (data: { path?: string; revision?: string }, plugin: FastSync) {
+    receiveFolderRetryAck("FolderDeleteAck", data, plugin);
+    if (data.path) plugin.folderSnapshotManager.clearPendingDeleteBaseline?.(data.path);
+}
+
+export const receiveFolderRenameAckWithRevision = function (data: { path?: string; revision?: string }, plugin: FastSync) {
+    receiveFolderRetryAck("FolderRenameAck", data, plugin);
+    if (data.path && typeof data.revision === "string" && data.revision !== "") {
+        plugin.folderSnapshotManager.setConfirmedRevision?.(data.path, data.revision);
+    }
 }
