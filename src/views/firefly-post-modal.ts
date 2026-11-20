@@ -9,7 +9,7 @@
  * 不触碰同步层文件。
  */
 
-import { App, Modal, Setting, TFile, normalizePath } from "obsidian";
+import { App, Modal, Notice, Setting, TFile, normalizePath } from "obsidian";
 
 import type FastSync from "../main";
 import { $ } from "../i18n/lang";
@@ -23,6 +23,7 @@ import {
     FireflyCheckResult,
     buildFireflyPostTemplate,
     formatLocalDate,
+    getSafeHttpUrl,
     isValidFireflyDate,
     parseFrontmatter,
     stripAuthorReviewBlocks,
@@ -560,6 +561,14 @@ export class FireflyPostModal extends Modal {
             footer.createDiv({ cls: "fns-firefly-receipt", text: this.lastReceipt });
         }
 
+        const safeSiteUrl = getSafeHttpUrl(this.plugin.settings?.fireflySiteUrl || "");
+        if (this.lastReceipt && safeSiteUrl) {
+            const openBlogBtn = footer.createEl("button", { text: $("ui.firefly.open_blog") });
+            openBlogBtn.addEventListener("click", () => {
+                window.open(safeSiteUrl, "_blank", "noopener,noreferrer");
+            });
+        }
+
         const saveBtn = footer.createEl("button", { text: $("ui.firefly.save") });
         saveBtn.disabled = this.busy;
         saveBtn.addEventListener("click", () => {
@@ -732,6 +741,9 @@ export class FireflyPostModal extends Modal {
             if (last.lastStatus === 2) {
                 this.lastReceipt = $("ui.firefly.publish_done", { msg: message || "" });
                 notice.setMessage(this.lastReceipt);
+                if (getSafeHttpUrl(this.plugin.settings?.fireflySiteUrl || "")) {
+                    showBlogPublishSuccessNotice(this.plugin, this.lastReceipt, 12000);
+                }
                 break;
             }
             if (last.lastStatus === 3 || last.lastStatus === 4) {
@@ -987,6 +999,37 @@ export function activeMarkdownFile(app: App): TFile | null {
 }
 
 /**
+ * 展示博客发布成功/已受理通知；若配置了合法的博客访问地址，则附上可点击的「打开博客」入口。
+ * Show a blog publish success/accepted notice; appends a clickable "Open blog" link when a valid blog URL is configured.
+ */
+export function showBlogPublishSuccessNotice(plugin: FastSync, message: string, duration = 12000): void {
+    const safeSiteUrl = getSafeHttpUrl(plugin.settings?.fireflySiteUrl || "");
+    if (!safeSiteUrl || typeof Notice !== "function" || typeof createFragment !== "function") {
+        showSyncNotice(message, duration);
+        return;
+    }
+
+    const fragment = createFragment((frag) => {
+        const wrap = frag.createDiv("fns-blog-notice");
+        wrap.createSpan({ text: message });
+        const link = wrap.createEl("a", {
+            cls: "fns-blog-notice-link",
+            text: $("ui.firefly.open_blog"),
+            attr: {
+                href: safeSiteUrl,
+                target: "_blank",
+                rel: "noopener noreferrer",
+            },
+        });
+        link.addEventListener("click", (e) => {
+            e.preventDefault();
+            window.open(safeSiteUrl, "_blank", "noopener,noreferrer");
+        });
+    });
+    new Notice(fragment, duration);
+}
+
+/**
  * 「立即发布到 Firefly」：触发服务端 Git 同步，并轮询几秒展示最新构建回执。
  * Trigger the server-side Git sync and poll briefly for the build receipt.
  */
@@ -1028,7 +1071,7 @@ export async function triggerFireflyPublish(plugin: FastSync): Promise<void> {
                 || (item.lastSyncTime ?? "") !== previous.lastSyncTime;
             if (item.lastStatus === 1 || !advanced) continue;
             if (item.lastStatus === 2) {
-                showSyncNotice($("ui.firefly.publish_done", { msg: message || "" }), 12000);
+                showBlogPublishSuccessNotice(plugin, $("ui.firefly.publish_done", { msg: message || "" }), 12000);
                 return;
             }
             if (item.lastStatus === 3 || item.lastStatus === 4) {
@@ -1036,7 +1079,7 @@ export async function triggerFireflyPublish(plugin: FastSync): Promise<void> {
                 return;
             }
         }
-        showSyncNotice($("ui.firefly.publish_waiting"), 8000);
+        showBlogPublishSuccessNotice(plugin, $("ui.firefly.publish_waiting"), 8000);
     } finally {
         notice.hide();
     }

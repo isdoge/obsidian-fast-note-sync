@@ -626,3 +626,41 @@ export function buildFireflyPostTemplate(opts: FireflyTemplateOptions): string {
 
     return `${frontmatter}\n${body}`;
 }
+
+/**
+ * 规整用户填写的博客访问地址：去首尾空格并移除多余末尾斜杠。
+ * Normalize a user-supplied blog site URL: trim whitespace and trailing slashes.
+ */
+export function normalizeBlogSiteUrl(raw: string): string {
+    return String(raw ?? "").trim().replace(/\/+$/, "");
+}
+
+/**
+ * 校验并返回安全的 http(s) URL；非法协议（如 javascript:、file:、data:）或无效地址返回 null。
+ * Validate and return a safe http(s) URL; returns null for invalid URLs or non-HTTP(S) schemes.
+ */
+export function getSafeHttpUrl(raw: string): string | null {
+    const normalized = normalizeBlogSiteUrl(raw);
+    if (!normalized) return null;
+    for (let i = 0; i < normalized.length; i++) {
+        const code = normalized.charCodeAt(i);
+        if (code <= 0x20 || code === 0x7f) return null;
+    }
+    if (!/^https?:\/\//i.test(normalized)) return null;
+
+    if (typeof URL === "function") {
+        try {
+            const parsed = new URL(normalized);
+            if ((parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.hostname.length > 0) {
+                return normalized;
+            }
+            return null;
+        } catch {
+            return null;
+        }
+    }
+
+    const hostMatch = normalized.match(/^https?:\/\/([^/?#]+)/i);
+    return hostMatch && hostMatch[1].length > 0 ? normalized : null;
+}
+
