@@ -18,7 +18,15 @@ import { DEFAULT_IDLE_SYNC_INTERVAL_MINUTES, IDLE_SYNC_INTERVAL_OPTIONS } from "
 import { updateVaultName } from "./lib/settings/vault_name";
 import type { GitSyncPublicStatus } from "./lib/api/http_api_service";
 import { getSafeHttpUrl, normalizeBlogSiteUrl } from "./lib/blog/firefly-frontmatter";
-import { showBlogPublishSuccessNotice } from "./views/firefly-post-modal";
+import { formatGitSyncReceipt } from "./lib/blog/firefly-receipt";
+import {
+  activeMarkdownFile,
+  CheckFireflyPostModal,
+  CreateFireflyPostModal,
+  showBlogPublishSuccessNotice,
+  triggerFireflyPublish,
+  warnIfActivePostIsDraft,
+} from "./views/firefly-post-modal";
 
 
 export interface PluginSettings {
@@ -1374,6 +1382,34 @@ export class SettingTab extends PluginSettingTab {
       warningEl.setText($("setting.remote.http_warning"));
     }
 
+    // 填写顺序刻意保持「服务地址 → 远端笔记库名 → 授权令牌」：
+    // 先确定库名再连上服务端，避免按本地文件夹名自动新建一个多余的库。
+    // Keep the order "server URL → remote vault name → token" so the vault name is chosen
+    // before the plugin connects, instead of auto-creating an extra library from the local folder name.
+    new Setting(set)
+      .setName($("setting.remote.vault_name"))
+      .addText((text) => {
+        text
+          .setPlaceholder($("setting.remote.vault_name"))
+          .setValue(this.plugin.settings.vault);
+
+        text.inputEl.readOnly = true;
+        text.inputEl.addClass("fns-clickable");
+
+        text.inputEl.addEventListener("focus", () => {
+          text.inputEl.blur();
+        });
+
+        text.inputEl.onclick = () => {
+          new VaultNameModal(this.app, this.plugin.settings.vault, async (newValue) => {
+            await updateVaultName(this.plugin, newValue);
+            text.setValue(newValue);
+            showSyncNotice($("setting.debug.clear_cache_success") || "Sync cache cleared successfully");
+          }).open();
+        };
+      });
+    this.setDescWithBreaks(set.lastElementChild as HTMLElement, $("setting.remote.vault_name_desc"))
+
     new Setting(set)
       .setClass("fns-setting-item-vertical")
       .setName($("setting.remote.api_token"))
@@ -1391,30 +1427,6 @@ export class SettingTab extends PluginSettingTab {
           }),
       )
     this.setDescWithBreaks(set.lastElementChild as HTMLElement, $("setting.remote.api_token_desc"))
-
-    new Setting(set)
-      .setName($("setting.remote.vault_name"))
-      .addText((text) => {
-        text
-          .setPlaceholder($("setting.remote.vault_name"))
-          .setValue(this.plugin.settings.vault);
-        
-        text.inputEl.readOnly = true;
-        text.inputEl.addClass("fns-clickable");
-
-        text.inputEl.addEventListener("focus", () => {
-          text.inputEl.blur();
-        });
-
-        text.inputEl.onclick = () => {
-          new VaultNameModal(this.app, this.plugin.settings.vault, async (newValue) => {
-            await updateVaultName(this.plugin, newValue);
-            text.setValue(newValue);
-            showSyncNotice($("setting.debug.clear_cache_success") || "Sync cache cleared successfully");
-          }).open();
-        };
-      });
-    this.setDescWithBreaks(set.lastElementChild as HTMLElement, $("setting.remote.vault_name_desc"))
 
     new Setting(set).setName($("setting.remote.auto_redirect")).setClass("fns-setting-item-checkbox").addToggle((toggle) =>
       toggle.setValue(this.plugin.settings.autoRedirectEnabled).onChange(async (value) => {
@@ -2087,6 +2099,7 @@ export class SettingTab extends PluginSettingTab {
 
   private async triggerBlogPublishFromTab(cardEl: HTMLElement, onStatusUpdated?: () => void): Promise<void> {
     if (this.blogPublishing) return
+    await warnIfActivePostIsDraft(this.plugin)
     this.blogPublishing = true
     if (cardEl.isConnected) {
       this.renderBlogStatusCard(cardEl, onStatusUpdated)
@@ -2147,7 +2160,9 @@ export class SettingTab extends PluginSettingTab {
         const itemEl = listEl.createDiv("fns-blog-config-item")
         const headEl = itemEl.createDiv("fns-blog-config-head")
 
-        const sourceLabel = (cfg.sourceDir || "").trim() || cfg.vault || this.plugin.settings.vault || "/"
+        // 优先展示服务端配置的 sourceDir；未配置时明确标为「全库」，不拿库名冒充源目录
+        // Prefer the server's sourceDir; when absent show "Whole vault" instead of passing the vault name off as one
+        const sourceLabel = (cfg.sourceDir || "").trim() || $("setting.blog.source_all")
         const targetLabel = (cfg.targetSubdir || "").trim() || "/"
         headEl.createSpan({ cls: "fns-blog-mapping", text: `${sourceLabel} → ${targetLabel}` })
 
@@ -2163,9 +2178,13 @@ export class SettingTab extends PluginSettingTab {
 
         const metaEl = itemEl.createDiv("fns-blog-config-meta")
         if (cfg.requireFrontmatter?.trim()) {
+          // 以小标签展示服务端筛选条件，例如「筛选：type=share」
+          // Show the server-side filter as a small tag, e.g. "Filter: type=share"
           const filterRow = metaEl.createDiv("fns-blog-meta-row")
-          filterRow.createSpan({ cls: "fns-blog-meta-label", text: $("setting.blog.filter") })
-          filterRow.createEl("code", { cls: "fns-blog-meta-code", text: cfg.requireFrontmatter.trim() })
+          filterRow.createSpan({
+            cls: "fns-blog-badge is-filter",
+            text: $("setting.blog.filter_label", { filter: cfg.requireFrontmatter.trim() }),
+          })
         }
 
         const timeRow = metaEl.createDiv("fns-blog-meta-row")
@@ -2175,7 +2194,10 @@ export class SettingTab extends PluginSettingTab {
         if (cfg.lastMessage?.trim()) {
           const msgRow = metaEl.createDiv("fns-blog-meta-row")
           msgRow.createSpan({ cls: "fns-blog-meta-label", text: $("setting.blog.last_message") })
-          msgRow.createSpan({ cls: "fns-blog-meta-value fns-blog-meta-message", text: cfg.lastMessage.trim() })
+          // 服务端回执是英文，统一按当前插件语言展示，避免中英混杂
+          // Server receipts are English; localize them so the UI never mixes languages
+          const localized = formatGitSyncReceipt(cfg.lastMessage.trim(), (key, params) => $(key as never, params))
+          msgRow.createSpan({ cls: "fns-blog-meta-value fns-blog-meta-message", text: localized || cfg.lastMessage.trim() })
         }
       }
 
@@ -2240,10 +2262,53 @@ export class SettingTab extends PluginSettingTab {
     })
   }
 
+  private renderBlogQuickActions(set: HTMLElement): void {
+    new Setting(set).setName($("setting.blog.quick_actions")).setHeading().setClass("fast-note-sync-settings-tag")
+    const actions = set.createDiv("fns-blog-actions fns-blog-quick-actions")
+
+    const createBtn = actions.createEl("button", { text: $("setting.blog.action_create_post"), cls: "mod-cta" })
+    createBtn.addEventListener("click", () => {
+      new CreateFireflyPostModal(this.app, this.plugin).open()
+    })
+
+    const checkBtn = actions.createEl("button", { text: $("setting.blog.action_check_post") })
+    checkBtn.addEventListener("click", () => {
+      const file = activeMarkdownFile(this.app)
+      if (!file) {
+        showSyncNotice($("ui.firefly.no_file"), 6000)
+        return
+      }
+      new CheckFireflyPostModal(this.app, this.plugin, file).open()
+    })
+
+    const publishBtn = actions.createEl("button", { text: $("setting.blog.action_publish_now") })
+    publishBtn.addEventListener("click", () => {
+      void triggerFireflyPublish(this.plugin)
+    })
+
+    const blogBtn = actions.createEl("button", { text: $("setting.blog.action_open_blog") })
+    blogBtn.addEventListener("click", () => {
+      this.openBlogSite()
+    })
+
+    const webguiBtn = actions.createEl("button", { text: $("setting.blog.action_open_webgui") })
+    webguiBtn.addEventListener("click", () => {
+      this.openServerWebGui()
+    })
+  }
+
   private renderBlogSettings(set: HTMLElement, isSearchMode: boolean = false) {
+    // ── ⓪ 新手说明：日常写作不需要记命令 ──────────────────────────
+    const intro = set.createDiv("fns-blog-tab-intro")
+    intro.createEl("p", { text: $("setting.blog.tab_intro") })
+    intro.createEl("p", { cls: "fns-blog-tab-note", text: $("setting.blog.tab_intro_webhook") })
+
     // ── ① 服务端博客同步状态 & 新手引导卡片 ────────────────────────
     new Setting(set).setName($("setting.blog.status_section")).setHeading().setClass("fast-note-sync-settings-tag")
     const statusCard = set.createDiv("fns-blog-status-card")
+
+    // ── ①.① 常用操作按钮 ─────────────────────────────────────────
+    this.renderBlogQuickActions(set)
 
     // ── ② 写作助手与路径设置 ──────────────────────────────────────
     new Setting(set).setName($("setting.blog.assistant_section")).setHeading().setClass("fast-note-sync-settings-tag")

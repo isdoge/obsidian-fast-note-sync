@@ -90,6 +90,7 @@ const modalMod = loadTsModule(
     if (id === "../lib/api/http_api_service") return {};
     if (id === "../lib/blog/firefly-frontmatter") return ff;
     if (id === "../lib/blog/firefly-assets") return new Proxy({}, { get: () => () => undefined });
+    if (id === "../lib/blog/firefly-receipt") return { formatGitSyncReceipt: (raw) => raw };
     if (id === "../main") return {};
     throw new Error(`Unexpected require: ${id}`);
   },

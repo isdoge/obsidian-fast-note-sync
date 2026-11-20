@@ -60,6 +60,10 @@ const moduleExports = loadModule("src/views/firefly-post-modal.ts", (id) => {
   if (id === "../lib/api/http_api_service") return {};
   if (id === "../lib/blog/firefly-frontmatter") return frontmatterStub;
   if (id === "../lib/blog/firefly-assets") return assetsStub;
+  if (id === "../lib/blog/firefly-receipt") {
+    // 回执本地化在 firefly-receipt.test.mjs 单独覆盖；这里只回显 key 便于断言分支
+    return { formatGitSyncReceipt: (raw) => raw };
+  }
   if (id === "../main") return {};
   if (id === "obsidian") return { Modal, TFile, TFolder, normalizePath: (p) => p };
   throw new Error(`Unexpected require in firefly-post-modal: ${id}`);

@@ -271,20 +271,34 @@ const plain = (value) => JSON.parse(JSON.stringify(value));
   assert.ok(md.startsWith("---\n"), "template starts with frontmatter");
   assert.ok(md.includes(`published: ${today}`), "published uses the real today date");
   assert.ok(!md.includes("YYYY-MM-DD"), "template never ships the placeholder date");
-  assert.ok(md.includes("draft: true"), "new posts are drafts");
+  assert.ok(md.includes("draft: false"), "new posts are public by default");
   assert.ok(md.includes("scope: 内部"), "new posts default to internal");
   assert.ok(md.includes("type: share"), "new posts are experience shares");
   assert.ok(md.includes("comment: false"), "comments default off");
   assert.ok(md.includes("lang: zh-CN"));
   assert.ok(md.includes("  - experience-sharing"), "default tag present");
   assert.ok(md.includes("sourceVault: \"doge\""));
-  assert.ok(md.includes("<!-- AUTHOR-REVIEW:START -->"), "author review block is present for later editing");
+  assert.ok(!md.includes("AUTHOR-REVIEW"), "the minimal template ships no author review block");
+  assert.ok(!md.includes("作者取材索引"), "no personal template placeholders are injected");
+  assert.ok(md.includes("## 正文"), "the body gives a plain writing starting point");
 
   const fm = ff.parseFrontmatter(md);
   assert.equal(fm.title, "我的第一篇文章");
   assert.equal(fm.published, today, "published parses back as a plain date string");
-  assert.equal(fm.draft, true, "draft parses back as a boolean");
+  assert.equal(fm.draft, false, "draft parses back as a boolean");
   assert.deepEqual(plain(fm.tags), ["experience-sharing"], "tags parse back as an array");
+
+  // 勾选草稿时写入 draft: true / The draft switch writes draft: true
+  const draftPost = ff.buildFireflyPostTemplate({
+    title: "草稿文章",
+    category: "工具推荐",
+    slug: "experience/gong-ju-tui-jian/cao-gao",
+    sourceVault: "doge",
+    today,
+    draft: true,
+  });
+  assert.ok(draftPost.includes("draft: true"), "the draft switch is honoured");
+  assert.equal(ff.parseFrontmatter(draftPost).draft, true, "draft flag parses back");
 
   const selfCheck = ff.validateFireflyPostContent({ titleFromFilename: "我的第一篇文章", content: md });
   assert.equal(selfCheck.ok, true, "generated template passes its own compliance check");
@@ -292,8 +306,9 @@ const plain = (value) => JSON.parse(JSON.stringify(value));
 
   // bad `today` input falls back to a real date instead of leaking the placeholder
   const fallback = ff.buildFireflyPostTemplate({
-    title: "x", category: "工具推荐", slug: "", sourceVault: "", today: "YYYY-MM-DD",
+    title: "x", category: "", slug: "", sourceVault: "", today: "YYYY-MM-DD",
   });
+  assert.equal(ff.parseFrontmatter(fallback).category, "", "an empty category stays empty (free-form category)");
   assert.ok(!fallback.includes("YYYY-MM-DD"), "invalid today never leaks into the template");
   assert.match(ff.parseFrontmatter(fallback).published, /^\d{4}-\d{2}-\d{2}$/);
 }

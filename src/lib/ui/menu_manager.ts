@@ -608,6 +608,27 @@ export class MenuManager {
       }
     });
 
+    // FNS 菜单里的博客入口：日常写作无需记命令 / Blog entries in the FNS menu
+    if (this.plugin.settings.fireflyMenuEnabled !== false) {
+      menu.addSeparator();
+      menu.addItem((item: MenuItem) => {
+        item
+          .setIcon("file-plus")
+          .setTitle($("ui.firefly.menu_create_post"))
+          .onClick(() => {
+            new CreateFireflyPostModal(this.plugin.app, this.plugin).open();
+          });
+      });
+      menu.addItem((item: MenuItem) => {
+        item
+          .setIcon("send")
+          .setTitle($("ui.firefly.menu_trigger_publish"))
+          .onClick(() => {
+            void triggerFireflyPublish(this.plugin);
+          });
+      });
+    }
+
     menu.addSeparator();
     menu.addItem((item) => {
       item.setTitle($("ui.log.title"))

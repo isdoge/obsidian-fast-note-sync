@@ -546,11 +546,20 @@ export interface FireflyTemplateOptions {
     slug: string;
     sourceVault: string;
     today: string;
+    /** 是否作为草稿创建；默认 false（直接公开发表） */
+    draft?: boolean;
 }
 
 /**
- * 生成一篇可直接通过 Firefly 校验的新文章（Frontmatter + 写作骨架）。
- * 默认 `draft: true`、`scope: 内部`、`type: share`、`comment: false`、`lang: zh-CN`。
+ * 生成一篇可直接通过 Firefly 校验的新文章（Frontmatter + 简洁写作骨架）。
+ * 默认 `draft: false`（公开发表）、`scope: 内部`、`type: share`、`comment: false`、
+ * `lang: zh-CN`。正文只保留标题、导语与正文起点，不塞入个人模板占位或审阅块，
+ * 新手打开即可直接写，合规检查直接全绿。
+ *
+ * Build a Firefly-ready new post (frontmatter + a minimal writing skeleton). `draft`
+ * defaults to false (public). The body only carries a title, a short lead-in and a body
+ * starting point — no personal template placeholders or review blocks — so a first-time
+ * user can start writing immediately and pass the compliance check as-is.
  */
 export function buildFireflyPostTemplate(opts: FireflyTemplateOptions): string {
     const today = isValidFireflyDate(opts.today) ? opts.today : formatLocalDate();
@@ -558,6 +567,7 @@ export function buildFireflyPostTemplate(opts: FireflyTemplateOptions): string {
     const category = String(opts.category ?? "").trim();
     const slug = String(opts.slug ?? "").trim() || generateFireflySlug(category, title);
     const sourceVault = String(opts.sourceVault ?? "").trim() || "doge";
+    const draft = opts.draft === true;
 
     const frontmatter = [
         "---",
@@ -568,13 +578,11 @@ export function buildFireflyPostTemplate(opts: FireflyTemplateOptions): string {
         'description: ""',
         `category: ${yamlQuote(category)}`,
         "lang: zh-CN",
-        "draft: true",
+        `draft: ${draft ? "true" : "false"}`,
         "comment: false",
         `sourceVault: ${yamlQuote(sourceVault)}`,
         "type: share",
         "scope: 内部",
-        'source: ""',
-        'area: ""',
         `createTime: ${today}`,
         `updateTime: ${today}`,
         "tags:",
@@ -584,43 +592,13 @@ export function buildFireflyPostTemplate(opts: FireflyTemplateOptions): string {
 
     const body = [
         "",
-        "> 一句话结论：（读者只记一句话的话，记哪句）",
+        `# ${title}`,
         "",
-        "（紧接结论写两三段自然前言，像向朋友介绍：先说它是干嘛的，再按题材聊自己的使用场景、体会、坑和以后还会用到的地方。）",
+        "（用一两句话写下导语：这篇讲什么、适合谁看。）",
         "",
-        "## （围绕本篇问题起标题：读者先要弄清什么）",
+        "## 正文",
         "",
-        "（只解释本篇特有的术语；通用术语链到术语表。）",
-        "",
-        "## （有真实取舍时：我为什么这么选）",
-        "",
-        "（讲选择依据、实际限制，以及读者是否适合照做。）",
-        "",
-        "## （用具体动作命名：接下来怎样做）",
-        "",
-        "（步骤较多时，在这里用一句话写整体路线；补清设备、软件和输入资料的准备条件。）",
-        "",
-        "### 第一步：一个具体目标",
-        "",
-        "（说明读者从哪里操作、填什么、为什么需要这一步。使用示例值并指出替换项。）",
-        "",
-        "完成后应看到：（可观察的结果）。",
-        "",
-        "## （说出实际结果：做完以后看什么）",
-        "",
-        "（解释检查方法和预期现象，注明它们能证明什么。）",
-        "",
-        "## 来源与延伸阅读",
-        "",
-        "（注明已有记录或公开资料的日期、环境和未覆盖范围。）",
-        "",
-        "## 作者审阅意见",
-        "",
-        "<!-- AUTHOR-REVIEW:START -->",
-        "",
-        "（待填写：哪里不顺口、哪些经历需要补充，或希望怎样删改，都可以直接写在这里。）",
-        "",
-        "<!-- AUTHOR-REVIEW:END -->",
+        "（从这里开始写。需要小标题时继续使用 ##。）",
         "",
     ].join("\n");
 

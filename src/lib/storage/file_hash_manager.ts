@@ -750,6 +750,10 @@ export class FileHashManager {
     this.confirmedPaths.clear();
     this.revisions.clear();
     this.pendingDeleteBaselines.clear();
+    // 基线作用域跟随最新设置后再落盘：切库后若沿用旧 scope，镜像里的旧令牌会被当成新库的
+    // Re-anchor the baseline scope to the current settings before persisting: after a vault
+    // switch a stale scope would make mirrored old tokens look like the new vault's
+    this.baselineScope = computeRemoteScope(this.plugin.settings);
     this.saveToStorage();
   }
 
