@@ -71,6 +71,78 @@ export class SyncState {
   /** 本次连接是否已完成 pv2 协商（auth 响应携带协商块）/ Whether this connection completed pv2 negotiation (auth response carried a negotiation block) */
   negotiated = false;
 
+  // ─── 同步基线能力协商（设计稿 §2.1，阶段 C 只建闸门）─────────────────────────
+  /**
+   * 服务端在鉴权应答里广告的最高基线版本（缺省 0）。它只是能力广告，不能据此启用新模式。
+   * Highest baseline version advertised in the auth reply (0 when absent). This is only an
+   * advertisement and must never switch this connection to the new mode by itself.
+   */
+  serverAdvertisedBaselineVersion = 0;
+  /**
+   * 本连接经 ClientInfo 应答确认的基线版本：0 = 兼容模式，>=1 = 基线模式。
+   * 每次新建连接/断线都重置为 0；后台版本广播不得修改它。
+   * Baseline version confirmed for this connection via the ClientInfo reply: 0 = compatibility
+   * mode, >=1 = baseline mode. Reset to 0 on every new connection / disconnect; background
+   * version broadcasts must never change it.
+   */
+  negotiatedSyncBaselineVersion = 0;
+  /**
+   * 本连接是否已完成一次 ClientInfo 应答确认。未确认前闸门阻塞（服务端广告 >=1 时）。
+   * Whether this connection completed one ClientInfo reply confirmation. The gate blocks until
+   * then when the server advertises >= 1.
+   */
+  clientInfoConfirmed = false;
+  /** 客户端请求的基线版本（阶段 C 固定为 1）/ Baseline version requested by the client (fixed at 1 in stage C) */
+  requestedSyncBaselineVersion = 1;
+
+  /**
+   * 重置连接级基线协商状态。新建连接与断线都必须调用，避免上一条连接的结论泄漏。
+   * Resets connection-level baseline negotiation state. Must be called on every new connection
+   * and disconnect so the previous connection's verdict cannot leak.
+   */
+  resetSyncBaselineNegotiation(): void {
+    this.serverAdvertisedBaselineVersion = 0;
+    this.negotiatedSyncBaselineVersion = 0;
+    this.clientInfoConfirmed = false;
+  }
+
+  /**
+   * 记录鉴权应答广告（仅能力广告）/ Records the auth-reply advertisement (advertisement only).
+   */
+  applyServerBaselineAdvertisement(advertised: unknown): void {
+    this.serverAdvertisedBaselineVersion = typeof advertised === "number" && advertised > 0
+      ? Math.floor(advertised) : 0;
+  }
+
+  /**
+   * 记录 ClientInfo 应答确认结果并关闭闸门。缺省（老服务端）视为 0，立即进入兼容模式。
+   * Records the ClientInfo reply verdict and opens the gate. An absent value (old server) means
+   * 0 and enters compatibility mode immediately.
+   */
+  confirmSyncBaseline(accepted: unknown): void {
+    const value = typeof accepted === "number" && accepted > 0 ? Math.floor(accepted) : 0;
+    this.negotiatedSyncBaselineVersion = value;
+    this.clientInfoConfirmed = true;
+  }
+
+  /**
+   * 基线模式是否启用（协商成功且版本 >= 1）。
+   * Whether baseline mode is active (negotiation succeeded and version >= 1).
+   */
+  isSyncBaselineModeEnabled(): boolean {
+    return this.clientInfoConfirmed && this.negotiatedSyncBaselineVersion >= 1;
+  }
+
+  /**
+   * 闸门：服务端广告 >= 1 但本连接尚未确认时，不得开始同步或实时写。
+   * 老服务端广告 0 时立即放行，不阻塞兼容模式。
+   * Gate: when the server advertises >= 1 but this connection is not yet confirmed, sync and
+   * live writes must not start. A server advertising 0 lets the client through immediately.
+   */
+  isSyncBaselineGateOpen(): boolean {
+    return this.serverAdvertisedBaselineVersion < 1 || this.clientInfoConfirmed;
+  }
+
   // ─── C3 多页在途归属：completed 计数的 pageIndex 透传通道 ─────────────────────
   /**
    * 瞬时字段：FastSync.recordSyncCompleted() 在自增 xxxSyncTasks.completed 前写入，

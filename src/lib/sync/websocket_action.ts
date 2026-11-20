@@ -126,6 +126,15 @@ export const NoteDeleteAck: WSReceiveAction = "NoteDeleteAck";
  */
 export const NoteSyncBatchAck: WSReceiveAction = "NoteSyncBatchAck";
 
+/**
+ * SyncConflict unified baseline conflict notification.
+ * Only sent to connections that negotiated syncBaselineVersion >= 1; the payload carries
+ * kind/path/reason plus the server hash, revision and (when proven) base content.
+ * SyncConflict 统一基线冲突通知。仅发送给已协商 syncBaselineVersion >= 1 的连接；
+ * 载荷携带 kind/path/reason 以及服务端哈希、版本令牌和（能证实时）base 内容。
+ */
+export const SyncConflict: WSReceiveAction = "SyncConflict";
+
 // ---------------- File ----------------
 /**
  * FileSyncUpdate file synchronization update / 文件同步更新

@@ -199,6 +199,17 @@ export default class FastSync extends Plugin {
   }
   get isSyncRequesting() { return this.syncState.isSyncRequesting }
   set isSyncRequesting(v: boolean) { this.syncState.isSyncRequesting = v }
+
+  /**
+   * 本连接是否已启用同步基线模式（协商成功且版本 >= 1）。
+   * 阶段 C 只暴露开关，不改变兼容模式下的业务 operator 逻辑（阶段 E 再启用完整新模式）。
+   * Whether this connection runs in sync baseline mode (negotiated and version >= 1).
+   * Stage C only exposes the switch; compatibility-mode operator logic is unchanged until
+   * stage E.
+   */
+  isSyncBaselineModeEnabled(): boolean {
+    return this.syncState.isSyncBaselineModeEnabled()
+  }
   get isFirstSync() { return this.syncState.isFirstSync }
   set isFirstSync(v: boolean) { this.syncState.isFirstSync = v }
   get isWaitClearSync() { return this.syncState.isWaitClearSync }

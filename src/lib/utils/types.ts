@@ -22,6 +22,8 @@ export interface SnapFile {
 export interface SnapFolder {
     path: string;
     pathHash: string;
+    /** 目录基线版本令牌（基线模式）/ Folder baseline revision token (baseline mode) */
+    baseRevision?: string;
 }
 
 export interface PathHashFile {
@@ -141,6 +143,8 @@ export interface SyncEndData {
     needModifyCount?: number;
     needSyncMtimeCount?: number;
     needDeleteCount?: number;
+    /** 本轮已持久化的基线冲突数量（基线模式；旧服务端缺省）/ Persisted baseline conflicts this round (baseline mode; absent on old servers) */
+    needConflictCount?: number;
     context?: string;
 }
 
@@ -252,3 +256,63 @@ export interface WorkspaceWithInternal {
 }
 
 
+
+/**
+ * 同步基线相关字段（阶段 C 仅做协议准备，阶段 E 才启用完整新决策）。
+ * Sync baseline fields: stage C only prepares the protocol; stage E activates the full rules.
+ *
+ * 语义（设计稿 §2.2）：baseHashMissing=true 或 baseHash="" 表示没有可信内容基线；
+ * 空文本的内容哈希是字符串 "0"（helpers.ts hashContent("") === "0"），它是有效哈希，
+ * 不能按空字符串处理。两者矛盾时以 baseHashMissing 为准。
+ * Semantics (design §2.2): baseHashMissing=true or baseHash="" means "no trusted content
+ * baseline"; the empty-text hash is the string "0" and is a real hash. When the two disagree,
+ * baseHashMissing wins.
+ */
+export interface SyncBaselineFields {
+    baseHash?: string;
+    baseHashMissing?: boolean;
+    baseRevision?: string;
+    isConflictResolved?: boolean;
+}
+
+/** 空文本内容哈希：有效哈希，不得当作空基线 / Empty-text content hash: real, never "no baseline" */
+export const EMPTY_CONTENT_HASH = "0";
+
+/**
+ * 归一 baseline 字段，供 JSON 与 PB 解码结果共用。
+ * Normalizes baseline fields for both JSON and PB decoding results.
+ */
+export function normalizeSyncBaseline<T extends SyncBaselineFields>(input: T): T {
+    const baseHash = typeof input.baseHash === "string" ? input.baseHash : "";
+    const missing = input.baseHashMissing === true || baseHash === "";
+    return {
+        ...input,
+        baseHash: missing ? "" : baseHash,
+        baseHashMissing: missing,
+    };
+}
+
+/** 是否存在可信基线 / Whether a trusted baseline exists */
+export function hasTrustedBaseline(input: SyncBaselineFields): boolean {
+    return normalizeSyncBaseline(input).baseHashMissing === false;
+}
+
+/** 四类资源共用的统一冲突载荷 / Unified conflict payload shared by all four kinds */
+export interface SyncConflictPayload {
+    /** note | file | setting | folder（未来可能扩展，故保持 string） / note | file | setting | folder (kept as string for forward compatibility) */
+    kind: string;
+    path: string;
+    pathHash: string;
+    /**
+     * both_modified | remote_deleted | local_deleted | no_baseline | baseline_unverified |
+     * server_missing | revision_changed（未来可能扩展，故保持 string）
+     */
+    reason: string;
+    serverHash: string;
+    serverRevision: string;
+    serverDeleted: boolean;
+    baseHash: string;
+    baseContent: string;
+    baseMissing: boolean;
+    serverContent: string;
+}
