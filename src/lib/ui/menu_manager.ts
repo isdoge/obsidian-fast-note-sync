@@ -11,6 +11,7 @@ import { $ } from "../../i18n/lang";
 import FastSync from "../../main";
 import { StatusBarManager } from './status_bar_manager';
 import { SyncLogManager } from '../sync/sync_log_manager';
+import { FireflyPostModal, CreateFireflyPostModal, CheckFireflyPostModal, activeMarkdownFile, triggerFireflyPublish } from '../../views/firefly-post-modal';
 
 
 
@@ -207,6 +208,52 @@ export class MenuManager {
         }
       },
     })
+
+    this.registerFireflyCommands()
+  }
+
+  /**
+   * 注册 Firefly 博客相关命令（属性面板 / 新建 / 合规检查 / 立即发布）。
+   * Register the Firefly blog commands.
+   */
+  private registerFireflyCommands() {
+    this.plugin.addCommand({
+      id: "firefly-edit-post-meta",
+      name: $("ui.firefly.cmd_edit_meta"),
+      checkCallback: (checking: boolean) => {
+        const file = activeMarkdownFile(this.plugin.app);
+        if (!file) return false;
+        if (!checking) new FireflyPostModal(this.plugin.app, this.plugin, file).open();
+        return true;
+      },
+    });
+
+    this.plugin.addCommand({
+      id: "firefly-create-post",
+      name: $("ui.firefly.cmd_create_post"),
+      callback: () => {
+        new CreateFireflyPostModal(this.plugin.app, this.plugin).open();
+      },
+    });
+
+    this.plugin.addCommand({
+      id: "firefly-check-post",
+      name: $("ui.firefly.cmd_check_post"),
+      checkCallback: (checking: boolean) => {
+        const file = activeMarkdownFile(this.plugin.app);
+        if (!file) return false;
+        if (!checking) new CheckFireflyPostModal(this.plugin.app, this.plugin, file).open();
+        return true;
+      },
+    });
+
+    this.plugin.addCommand({
+      id: "firefly-trigger-publish",
+      name: $("ui.firefly.cmd_trigger_publish"),
+      callback: () => {
+        void triggerFireflyPublish(this.plugin);
+      },
+    });
   }
 
 
