@@ -500,6 +500,17 @@ function deReceiveProtobufToDTO(action: WSAction.WSReceiveAction, data: Uint8Arr
                 return tryJsonDecode();
             }
         }
+        case WSAction.SyncConflict: {
+            try {
+                const pbObj = proto.v1.SyncConflictMessage.toObject(
+                    proto.v1.SyncConflictMessage.decode(data),
+                    { defaults: true, longs: Number }
+                ) as proto.v1.SyncConflictMessage.$Properties;
+                return normalizeConflictPayload(pbObj);
+            } catch {
+                return tryJsonDecode();
+            }
+        }
         case WSAction.FolderRenameAck: {
             try {
                 return proto.v1.FolderRenameAckMessage.toObject(
@@ -601,5 +612,41 @@ export function deReceivePacket(data: Uint8Array): DeserializedWSResponse {
         vault: wsResp.vault || "",
         context: wsResp.context || "",
         pageIndex: wsResp.pageIndex || 0
+    };
+}
+
+/**
+ * Normalizes a SyncConflict payload from either wire encoding.
+ * 归一两种编码下的 SyncConflict 载荷。
+ *
+ * The empty-text content hash "0" is a real baseline (helpers.ts hashContent("") === "0"), so it
+ * is preserved verbatim. "No trusted baseline" is expressed only by baseMissing, never by an
+ * empty string, and a contradictory pair resolves in favor of baseMissing.
+ * 空文本内容哈希 "0" 是有效基线（helpers.ts hashContent("") === "0"），必须原样保留。
+ * "没有可信基线"只由 baseMissing 表达，不能靠空串推断；两者矛盾时以 baseMissing 为准。
+ */
+export function normalizeConflictPayload(payload: unknown): Record<string, unknown> | null {
+    if (payload === null || typeof payload !== "object") {
+        return null;
+    }
+    const src = payload as Record<string, unknown>;
+    const text = (value: unknown): string => (typeof value === "string" ? value : value == null ? "" : String(value));
+    const flag = (value: unknown): boolean => value === true;
+    const baseHash = text(src.baseHash ?? src.BaseHash);
+    const baseMissing = flag(src.baseMissing ?? src.BaseMissing) || baseHash === "";
+    return {
+        kind: text(src.kind ?? src.Kind),
+        path: text(src.path ?? src.Path),
+        pathHash: text(src.pathHash ?? src.PathHash),
+        reason: text(src.reason ?? src.Reason),
+        serverHash: text(src.serverHash ?? src.ServerHash),
+        serverRevision: text(src.serverRevision ?? src.ServerRevision),
+        serverDeleted: flag(src.serverDeleted ?? src.ServerDeleted),
+        // A normalized "no baseline" clears the hash; a real hash (including "0") is kept.
+        // 归一后的"无基线"清空哈希；有效哈希（含 "0"）原样保留。
+        baseHash: baseMissing ? "" : baseHash,
+        baseContent: text(src.baseContent ?? src.BaseContent),
+        baseMissing,
+        serverContent: text(src.serverContent ?? src.ServerContent),
     };
 }

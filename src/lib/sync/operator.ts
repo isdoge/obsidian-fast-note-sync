@@ -511,6 +511,7 @@ export const receiveOperators: Map<WSAction.WSReceiveAction, OperatorHandler> = 
   [WSAction.SettingSyncBatchAck, (data, plugin) => { plugin.websocket.emit("SettingSyncBatchAck", data); }],
   [WSAction.FolderSyncBatchAck, (data, plugin) => { plugin.websocket.emit("FolderSyncBatchAck", data); }],
   [WSAction.ShareSyncRefresh, receiveShareSyncRefresh],
+  [WSAction.SyncConflict, receiveSyncConflict],
   [WSAction.FolderSyncPage, (data, plugin) => handleSyncPage(data, plugin, "folder")],
   [WSAction.NoteSyncPage, (data, plugin) => handleSyncPage(data, plugin, "note")],
   [WSAction.FileSyncPage, (data, plugin) => handleSyncPage(data, plugin, "file")],
@@ -571,6 +572,28 @@ async function handleSyncPage(data: unknown, plugin: FastSync, type: "note" | "f
  * 收到分享状态变更通知，全量刷新分享路径
  * Received share state change notification, full refresh share paths
  */
+/**
+ * SyncConflict：统一基线冲突通知。阶段 C 只做协议接通与记录，不改变兼容模式下的同步决策
+ * （统一冲突处理在阶段 E 接入）。载荷的 baseHash 由 protobuf_mapper 的
+ * normalizeConflictPayload 归一，空文本哈希 "0" 原样保留。
+ * SyncConflict: the unified baseline conflict notification. Stage C only wires the protocol and
+ * logs it; compatibility-mode decisions are unchanged (unified conflict handling lands in
+ * stage E). The payload's baseHash is normalized by protobuf_mapper.normalizeConflictPayload,
+ * keeping the empty-text hash "0" verbatim.
+ */
+function receiveSyncConflict(data: unknown, plugin: FastSync): void {
+  const payload = (data ?? {}) as Record<string, unknown>;
+  dump("Receive SyncConflict (stage C: log only)", payload);
+  SyncLogManager.getInstance().addLog(
+    'error',
+    'SyncConflict',
+    JSON.stringify(payload),
+    'error',
+    typeof payload.path === 'string' ? payload.path : undefined,
+    plugin.settings.vault,
+  );
+}
+
 function receiveShareSyncRefresh(_data: unknown, plugin: FastSync): void {
   dump("Receive ShareSyncRefresh, triggering share indicator sync");
   void plugin.shareIndicatorManager?.syncWithServer();

@@ -341,6 +341,9 @@ export namespace proto {
             /** ClientInfoMessage protobuf. */
             protobuf: boolean;
 
+            /** ClientInfoMessage syncBaselineVersion. */
+            syncBaselineVersion: number;
+
             /**
              * Creates a new ClientInfoMessage instance using the specified properties.
              * @param [properties] Properties to set
@@ -460,6 +463,9 @@ export namespace proto {
 
                 /** ClientInfoMessage protobuf */
                 protobuf?: (boolean|null);
+
+                /** ClientInfoMessage syncBaselineVersion */
+                syncBaselineVersion?: (number|null);
 
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
@@ -660,6 +666,9 @@ export namespace proto {
             /** CheckVersionInfo pipelineWindowDown. */
             pipelineWindowDown: number;
 
+            /** CheckVersionInfo syncBaselineVersion. */
+            syncBaselineVersion: number;
+
             /**
              * Creates a new CheckVersionInfo instance using the specified properties.
              * @param [properties] Properties to set
@@ -795,6 +804,9 @@ export namespace proto {
                 /** CheckVersionInfo pipelineWindowDown */
                 pipelineWindowDown?: (number|null);
 
+                /** CheckVersionInfo syncBaselineVersion */
+                syncBaselineVersion?: (number|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -835,6 +847,15 @@ export namespace proto {
 
             /** NoteSyncCheckRequest ctime. */
             ctime: (number|Long);
+
+            /** NoteSyncCheckRequest baseHash. */
+            baseHash: string;
+
+            /** NoteSyncCheckRequest baseHashMissing. */
+            baseHashMissing: boolean;
+
+            /** NoteSyncCheckRequest baseRevision. */
+            baseRevision: string;
 
             /**
              * Creates a new NoteSyncCheckRequest instance using the specified properties.
@@ -935,6 +956,15 @@ export namespace proto {
                 /** NoteSyncCheckRequest ctime */
                 ctime?: (number|Long|null);
 
+                /** NoteSyncCheckRequest baseHash */
+                baseHash?: (string|null);
+
+                /** NoteSyncCheckRequest baseHashMissing */
+                baseHashMissing?: (boolean|null);
+
+                /** NoteSyncCheckRequest baseRevision */
+                baseRevision?: (string|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -966,6 +996,15 @@ export namespace proto {
 
             /** NoteSyncDelNote pathHash. */
             pathHash: string;
+
+            /** NoteSyncDelNote baseHash. */
+            baseHash: string;
+
+            /** NoteSyncDelNote baseHashMissing. */
+            baseHashMissing: boolean;
+
+            /** NoteSyncDelNote baseRevision. */
+            baseRevision: string;
 
             /**
              * Creates a new NoteSyncDelNote instance using the specified properties.
@@ -1056,6 +1095,15 @@ export namespace proto {
 
                 /** NoteSyncDelNote pathHash */
                 pathHash?: (string|null);
+
+                /** NoteSyncDelNote baseHash */
+                baseHash?: (string|null);
+
+                /** NoteSyncDelNote baseHashMissing */
+                baseHashMissing?: (boolean|null);
+
+                /** NoteSyncDelNote baseRevision */
+                baseRevision?: (string|null);
 
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
@@ -1277,6 +1325,9 @@ export namespace proto {
             /** NoteModifyOrCreateRequest isConflictResolved. */
             isConflictResolved: boolean;
 
+            /** NoteModifyOrCreateRequest baseRevision. */
+            baseRevision: string;
+
             /**
              * Creates a new NoteModifyOrCreateRequest instance using the specified properties.
              * @param [properties] Properties to set
@@ -1397,6 +1448,9 @@ export namespace proto {
                 /** NoteModifyOrCreateRequest isConflictResolved */
                 isConflictResolved?: (boolean|null);
 
+                /** NoteModifyOrCreateRequest baseRevision */
+                baseRevision?: (string|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -1440,6 +1494,15 @@ export namespace proto {
 
             /** NoteUpdateCheckRequest mtime. */
             mtime: (number|Long);
+
+            /** NoteUpdateCheckRequest baseHash. */
+            baseHash: string;
+
+            /** NoteUpdateCheckRequest baseHashMissing. */
+            baseHashMissing: boolean;
+
+            /** NoteUpdateCheckRequest baseRevision. */
+            baseRevision: string;
 
             /**
              * Creates a new NoteUpdateCheckRequest instance using the specified properties.
@@ -1543,6 +1606,15 @@ export namespace proto {
                 /** NoteUpdateCheckRequest mtime */
                 mtime?: (number|Long|null);
 
+                /** NoteUpdateCheckRequest baseHash */
+                baseHash?: (string|null);
+
+                /** NoteUpdateCheckRequest baseHashMissing */
+                baseHashMissing?: (boolean|null);
+
+                /** NoteUpdateCheckRequest baseRevision */
+                baseRevision?: (string|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -1580,6 +1652,15 @@ export namespace proto {
 
             /** NoteDeleteRequest context. */
             context: string;
+
+            /** NoteDeleteRequest baseHash. */
+            baseHash: string;
+
+            /** NoteDeleteRequest baseHashMissing. */
+            baseHashMissing: boolean;
+
+            /** NoteDeleteRequest baseRevision. */
+            baseRevision: string;
 
             /**
              * Creates a new NoteDeleteRequest instance using the specified properties.
@@ -1676,6 +1757,15 @@ export namespace proto {
 
                 /** NoteDeleteRequest context */
                 context?: (string|null);
+
+                /** NoteDeleteRequest baseHash */
+                baseHash?: (string|null);
+
+                /** NoteDeleteRequest baseHashMissing */
+                baseHashMissing?: (boolean|null);
+
+                /** NoteDeleteRequest baseRevision */
+                baseRevision?: (string|null);
 
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
@@ -2004,6 +2094,9 @@ export namespace proto {
             /** NoteSyncModifyMessage lastTime. */
             lastTime: (number|Long);
 
+            /** NoteSyncModifyMessage revision. */
+            revision: string;
+
             /**
              * Creates a new NoteSyncModifyMessage instance using the specified properties.
              * @param [properties] Properties to set
@@ -2109,6 +2202,9 @@ export namespace proto {
                 /** NoteSyncModifyMessage lastTime */
                 lastTime?: (number|Long|null);
 
+                /** NoteSyncModifyMessage revision */
+                revision?: (string|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -2152,6 +2248,12 @@ export namespace proto {
 
             /** NoteSyncDeleteMessage lastTime. */
             lastTime: (number|Long);
+
+            /** NoteSyncDeleteMessage revision. */
+            revision: string;
+
+            /** NoteSyncDeleteMessage contentHash. */
+            contentHash: string;
 
             /**
              * Creates a new NoteSyncDeleteMessage instance using the specified properties.
@@ -2254,6 +2356,12 @@ export namespace proto {
 
                 /** NoteSyncDeleteMessage lastTime */
                 lastTime?: (number|Long|null);
+
+                /** NoteSyncDeleteMessage revision */
+                revision?: (string|null);
+
+                /** NoteSyncDeleteMessage contentHash */
+                contentHash?: (string|null);
 
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
@@ -2457,6 +2565,12 @@ export namespace proto {
             /** NoteSyncMtimeMessage lastTime. */
             lastTime: (number|Long);
 
+            /** NoteSyncMtimeMessage contentHash. */
+            contentHash: string;
+
+            /** NoteSyncMtimeMessage revision. */
+            revision: string;
+
             /**
              * Creates a new NoteSyncMtimeMessage instance using the specified properties.
              * @param [properties] Properties to set
@@ -2553,6 +2667,12 @@ export namespace proto {
                 /** NoteSyncMtimeMessage lastTime */
                 lastTime?: (number|Long|null);
 
+                /** NoteSyncMtimeMessage contentHash */
+                contentHash?: (string|null);
+
+                /** NoteSyncMtimeMessage revision */
+                revision?: (string|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -2593,6 +2713,9 @@ export namespace proto {
 
             /** NoteSyncEndMessage needDeleteCount. */
             needDeleteCount: (number|Long);
+
+            /** NoteSyncEndMessage needConflictCount. */
+            needConflictCount: (number|Long);
 
             /**
              * Creates a new NoteSyncEndMessage instance using the specified properties.
@@ -2693,6 +2816,9 @@ export namespace proto {
                 /** NoteSyncEndMessage needDeleteCount */
                 needDeleteCount?: (number|Long|null);
 
+                /** NoteSyncEndMessage needConflictCount */
+                needConflictCount?: (number|Long|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -2733,6 +2859,9 @@ export namespace proto {
 
             /** NoteSyncNeedPushMessage serverHash. */
             serverHash: string;
+
+            /** NoteSyncNeedPushMessage baseMissing. */
+            baseMissing: boolean;
 
             /**
              * Creates a new NoteSyncNeedPushMessage instance using the specified properties.
@@ -2833,6 +2962,9 @@ export namespace proto {
                 /** NoteSyncNeedPushMessage serverHash */
                 serverHash?: (string|null);
 
+                /** NoteSyncNeedPushMessage baseMissing */
+                baseMissing?: (boolean|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -2867,6 +2999,12 @@ export namespace proto {
 
             /** NoteModifyAckMessage pathHash. */
             pathHash: string;
+
+            /** NoteModifyAckMessage contentHash. */
+            contentHash: string;
+
+            /** NoteModifyAckMessage revision. */
+            revision: string;
 
             /**
              * Creates a new NoteModifyAckMessage instance using the specified properties.
@@ -2960,6 +3098,12 @@ export namespace proto {
 
                 /** NoteModifyAckMessage pathHash */
                 pathHash?: (string|null);
+
+                /** NoteModifyAckMessage contentHash */
+                contentHash?: (string|null);
+
+                /** NoteModifyAckMessage revision */
+                revision?: (string|null);
 
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
@@ -3124,6 +3268,9 @@ export namespace proto {
             /** NoteDeleteAckMessage pathHash. */
             pathHash: string;
 
+            /** NoteDeleteAckMessage revision. */
+            revision: string;
+
             /**
              * Creates a new NoteDeleteAckMessage instance using the specified properties.
              * @param [properties] Properties to set
@@ -3216,6 +3363,9 @@ export namespace proto {
 
                 /** NoteDeleteAckMessage pathHash */
                 pathHash?: (string|null);
+
+                /** NoteDeleteAckMessage revision */
+                revision?: (string|null);
 
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
@@ -3419,6 +3569,15 @@ export namespace proto {
             /** FileSyncCheckRequest ctime. */
             ctime: (number|Long);
 
+            /** FileSyncCheckRequest baseHash. */
+            baseHash: string;
+
+            /** FileSyncCheckRequest baseHashMissing. */
+            baseHashMissing: boolean;
+
+            /** FileSyncCheckRequest baseRevision. */
+            baseRevision: string;
+
             /**
              * Creates a new FileSyncCheckRequest instance using the specified properties.
              * @param [properties] Properties to set
@@ -3521,6 +3680,15 @@ export namespace proto {
                 /** FileSyncCheckRequest ctime */
                 ctime?: (number|Long|null);
 
+                /** FileSyncCheckRequest baseHash */
+                baseHash?: (string|null);
+
+                /** FileSyncCheckRequest baseHashMissing */
+                baseHashMissing?: (boolean|null);
+
+                /** FileSyncCheckRequest baseRevision */
+                baseRevision?: (string|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -3552,6 +3720,15 @@ export namespace proto {
 
             /** FileSyncDelFile pathHash. */
             pathHash: string;
+
+            /** FileSyncDelFile baseHash. */
+            baseHash: string;
+
+            /** FileSyncDelFile baseHashMissing. */
+            baseHashMissing: boolean;
+
+            /** FileSyncDelFile baseRevision. */
+            baseRevision: string;
 
             /**
              * Creates a new FileSyncDelFile instance using the specified properties.
@@ -3643,6 +3820,15 @@ export namespace proto {
                 /** FileSyncDelFile pathHash */
                 pathHash?: (string|null);
 
+                /** FileSyncDelFile baseHash */
+                baseHash?: (string|null);
+
+                /** FileSyncDelFile baseHashMissing */
+                baseHashMissing?: (boolean|null);
+
+                /** FileSyncDelFile baseRevision */
+                baseRevision?: (string|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -3692,6 +3878,18 @@ export namespace proto {
 
             /** FileUploadCheckRequest context. */
             context: string;
+
+            /** FileUploadCheckRequest baseHash. */
+            baseHash: string;
+
+            /** FileUploadCheckRequest baseHashMissing. */
+            baseHashMissing: boolean;
+
+            /** FileUploadCheckRequest baseRevision. */
+            baseRevision: string;
+
+            /** FileUploadCheckRequest isConflictResolved. */
+            isConflictResolved: boolean;
 
             /**
              * Creates a new FileUploadCheckRequest instance using the specified properties.
@@ -3801,6 +3999,18 @@ export namespace proto {
                 /** FileUploadCheckRequest context */
                 context?: (string|null);
 
+                /** FileUploadCheckRequest baseHash */
+                baseHash?: (string|null);
+
+                /** FileUploadCheckRequest baseHashMissing */
+                baseHashMissing?: (boolean|null);
+
+                /** FileUploadCheckRequest baseRevision */
+                baseRevision?: (string|null);
+
+                /** FileUploadCheckRequest isConflictResolved */
+                isConflictResolved?: (boolean|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -3838,6 +4048,15 @@ export namespace proto {
 
             /** FileDeleteRequest context. */
             context: string;
+
+            /** FileDeleteRequest baseHash. */
+            baseHash: string;
+
+            /** FileDeleteRequest baseHashMissing. */
+            baseHashMissing: boolean;
+
+            /** FileDeleteRequest baseRevision. */
+            baseRevision: string;
 
             /**
              * Creates a new FileDeleteRequest instance using the specified properties.
@@ -3934,6 +4153,15 @@ export namespace proto {
 
                 /** FileDeleteRequest context */
                 context?: (string|null);
+
+                /** FileDeleteRequest baseHash */
+                baseHash?: (string|null);
+
+                /** FileDeleteRequest baseHashMissing */
+                baseHashMissing?: (boolean|null);
+
+                /** FileDeleteRequest baseRevision */
+                baseRevision?: (string|null);
 
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
@@ -4414,6 +4642,9 @@ export namespace proto {
             /** FileSyncModifyMessage lastTime. */
             lastTime: (number|Long);
 
+            /** FileSyncModifyMessage revision. */
+            revision: string;
+
             /**
              * Creates a new FileSyncModifyMessage instance using the specified properties.
              * @param [properties] Properties to set
@@ -4519,6 +4750,9 @@ export namespace proto {
                 /** FileSyncModifyMessage lastTime */
                 lastTime?: (number|Long|null);
 
+                /** FileSyncModifyMessage revision */
+                revision?: (string|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -4562,6 +4796,12 @@ export namespace proto {
 
             /** FileSyncDeleteMessage lastTime. */
             lastTime: (number|Long);
+
+            /** FileSyncDeleteMessage revision. */
+            revision: string;
+
+            /** FileSyncDeleteMessage contentHash. */
+            contentHash: string;
 
             /**
              * Creates a new FileSyncDeleteMessage instance using the specified properties.
@@ -4664,6 +4904,12 @@ export namespace proto {
 
                 /** FileSyncDeleteMessage lastTime */
                 lastTime?: (number|Long|null);
+
+                /** FileSyncDeleteMessage revision */
+                revision?: (string|null);
+
+                /** FileSyncDeleteMessage contentHash */
+                contentHash?: (string|null);
 
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
@@ -4867,6 +5113,12 @@ export namespace proto {
             /** FileSyncMtimeMessage lastTime. */
             lastTime: (number|Long);
 
+            /** FileSyncMtimeMessage contentHash. */
+            contentHash: string;
+
+            /** FileSyncMtimeMessage revision. */
+            revision: string;
+
             /**
              * Creates a new FileSyncMtimeMessage instance using the specified properties.
              * @param [properties] Properties to set
@@ -4963,6 +5215,12 @@ export namespace proto {
                 /** FileSyncMtimeMessage lastTime */
                 lastTime?: (number|Long|null);
 
+                /** FileSyncMtimeMessage contentHash */
+                contentHash?: (string|null);
+
+                /** FileSyncMtimeMessage revision */
+                revision?: (string|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -5003,6 +5261,9 @@ export namespace proto {
 
             /** FileSyncEndMessage needDeleteCount. */
             needDeleteCount: (number|Long);
+
+            /** FileSyncEndMessage needConflictCount. */
+            needConflictCount: (number|Long);
 
             /**
              * Creates a new FileSyncEndMessage instance using the specified properties.
@@ -5102,6 +5363,9 @@ export namespace proto {
 
                 /** FileSyncEndMessage needDeleteCount */
                 needDeleteCount?: (number|Long|null);
+
+                /** FileSyncEndMessage needConflictCount */
+                needConflictCount?: (number|Long|null);
 
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
@@ -5558,6 +5822,12 @@ export namespace proto {
             /** FileUploadAckMessage pathHash. */
             pathHash: string;
 
+            /** FileUploadAckMessage contentHash. */
+            contentHash: string;
+
+            /** FileUploadAckMessage revision. */
+            revision: string;
+
             /**
              * Creates a new FileUploadAckMessage instance using the specified properties.
              * @param [properties] Properties to set
@@ -5651,6 +5921,12 @@ export namespace proto {
                 /** FileUploadAckMessage pathHash */
                 pathHash?: (string|null);
 
+                /** FileUploadAckMessage contentHash */
+                contentHash?: (string|null);
+
+                /** FileUploadAckMessage revision */
+                revision?: (string|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -5685,6 +5961,9 @@ export namespace proto {
 
             /** FileDeleteAckMessage pathHash. */
             pathHash: string;
+
+            /** FileDeleteAckMessage revision. */
+            revision: string;
 
             /**
              * Creates a new FileDeleteAckMessage instance using the specified properties.
@@ -5779,6 +6058,9 @@ export namespace proto {
                 /** FileDeleteAckMessage pathHash */
                 pathHash?: (string|null);
 
+                /** FileDeleteAckMessage revision */
+                revision?: (string|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -5828,6 +6110,9 @@ export namespace proto {
 
             /** SettingSyncRequest totalBatches. */
             totalBatches: number;
+
+            /** SettingSyncRequest cover. */
+            cover: boolean;
 
             /**
              * Creates a new SettingSyncRequest instance using the specified properties.
@@ -5937,6 +6222,9 @@ export namespace proto {
                 /** SettingSyncRequest totalBatches */
                 totalBatches?: (number|null);
 
+                /** SettingSyncRequest cover */
+                cover?: (boolean|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -5977,6 +6265,15 @@ export namespace proto {
 
             /** SettingSyncCheckRequest ctime. */
             ctime: (number|Long);
+
+            /** SettingSyncCheckRequest baseHash. */
+            baseHash: string;
+
+            /** SettingSyncCheckRequest baseHashMissing. */
+            baseHashMissing: boolean;
+
+            /** SettingSyncCheckRequest baseRevision. */
+            baseRevision: string;
 
             /**
              * Creates a new SettingSyncCheckRequest instance using the specified properties.
@@ -6077,6 +6374,15 @@ export namespace proto {
                 /** SettingSyncCheckRequest ctime */
                 ctime?: (number|Long|null);
 
+                /** SettingSyncCheckRequest baseHash */
+                baseHash?: (string|null);
+
+                /** SettingSyncCheckRequest baseHashMissing */
+                baseHashMissing?: (boolean|null);
+
+                /** SettingSyncCheckRequest baseRevision */
+                baseRevision?: (string|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -6108,6 +6414,15 @@ export namespace proto {
 
             /** SettingSyncDelSetting pathHash. */
             pathHash: string;
+
+            /** SettingSyncDelSetting baseHash. */
+            baseHash: string;
+
+            /** SettingSyncDelSetting baseHashMissing. */
+            baseHashMissing: boolean;
+
+            /** SettingSyncDelSetting baseRevision. */
+            baseRevision: string;
 
             /**
              * Creates a new SettingSyncDelSetting instance using the specified properties.
@@ -6199,6 +6514,15 @@ export namespace proto {
                 /** SettingSyncDelSetting pathHash */
                 pathHash?: (string|null);
 
+                /** SettingSyncDelSetting baseHash */
+                baseHash?: (string|null);
+
+                /** SettingSyncDelSetting baseHashMissing */
+                baseHashMissing?: (boolean|null);
+
+                /** SettingSyncDelSetting baseRevision */
+                baseRevision?: (string|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -6248,6 +6572,18 @@ export namespace proto {
 
             /** SettingModifyOrCreateRequest context. */
             context: string;
+
+            /** SettingModifyOrCreateRequest baseHash. */
+            baseHash: string;
+
+            /** SettingModifyOrCreateRequest baseHashMissing. */
+            baseHashMissing: boolean;
+
+            /** SettingModifyOrCreateRequest baseRevision. */
+            baseRevision: string;
+
+            /** SettingModifyOrCreateRequest isConflictResolved. */
+            isConflictResolved: boolean;
 
             /**
              * Creates a new SettingModifyOrCreateRequest instance using the specified properties.
@@ -6357,6 +6693,18 @@ export namespace proto {
                 /** SettingModifyOrCreateRequest context */
                 context?: (string|null);
 
+                /** SettingModifyOrCreateRequest baseHash */
+                baseHash?: (string|null);
+
+                /** SettingModifyOrCreateRequest baseHashMissing */
+                baseHashMissing?: (boolean|null);
+
+                /** SettingModifyOrCreateRequest baseRevision */
+                baseRevision?: (string|null);
+
+                /** SettingModifyOrCreateRequest isConflictResolved */
+                isConflictResolved?: (boolean|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -6400,6 +6748,15 @@ export namespace proto {
 
             /** SettingUpdateCheckRequest mtime. */
             mtime: (number|Long);
+
+            /** SettingUpdateCheckRequest baseHash. */
+            baseHash: string;
+
+            /** SettingUpdateCheckRequest baseHashMissing. */
+            baseHashMissing: boolean;
+
+            /** SettingUpdateCheckRequest baseRevision. */
+            baseRevision: string;
 
             /**
              * Creates a new SettingUpdateCheckRequest instance using the specified properties.
@@ -6503,6 +6860,15 @@ export namespace proto {
                 /** SettingUpdateCheckRequest mtime */
                 mtime?: (number|Long|null);
 
+                /** SettingUpdateCheckRequest baseHash */
+                baseHash?: (string|null);
+
+                /** SettingUpdateCheckRequest baseHashMissing */
+                baseHashMissing?: (boolean|null);
+
+                /** SettingUpdateCheckRequest baseRevision */
+                baseRevision?: (string|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -6540,6 +6906,15 @@ export namespace proto {
 
             /** SettingDeleteRequest context. */
             context: string;
+
+            /** SettingDeleteRequest baseHash. */
+            baseHash: string;
+
+            /** SettingDeleteRequest baseHashMissing. */
+            baseHashMissing: boolean;
+
+            /** SettingDeleteRequest baseRevision. */
+            baseRevision: string;
 
             /**
              * Creates a new SettingDeleteRequest instance using the specified properties.
@@ -6636,6 +7011,15 @@ export namespace proto {
 
                 /** SettingDeleteRequest context */
                 context?: (string|null);
+
+                /** SettingDeleteRequest baseHash */
+                baseHash?: (string|null);
+
+                /** SettingDeleteRequest baseHashMissing */
+                baseHashMissing?: (boolean|null);
+
+                /** SettingDeleteRequest baseRevision */
+                baseRevision?: (string|null);
 
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
@@ -6931,6 +7315,9 @@ export namespace proto {
             /** SettingSyncModifyMessage lastTime. */
             lastTime: (number|Long);
 
+            /** SettingSyncModifyMessage revision. */
+            revision: string;
+
             /**
              * Creates a new SettingSyncModifyMessage instance using the specified properties.
              * @param [properties] Properties to set
@@ -7039,6 +7426,9 @@ export namespace proto {
                 /** SettingSyncModifyMessage lastTime */
                 lastTime?: (number|Long|null);
 
+                /** SettingSyncModifyMessage revision */
+                revision?: (string|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -7079,6 +7469,12 @@ export namespace proto {
 
             /** SettingSyncDeleteMessage lastTime. */
             lastTime: (number|Long);
+
+            /** SettingSyncDeleteMessage revision. */
+            revision: string;
+
+            /** SettingSyncDeleteMessage contentHash. */
+            contentHash: string;
 
             /**
              * Creates a new SettingSyncDeleteMessage instance using the specified properties.
@@ -7179,6 +7575,12 @@ export namespace proto {
                 /** SettingSyncDeleteMessage lastTime */
                 lastTime?: (number|Long|null);
 
+                /** SettingSyncDeleteMessage revision */
+                revision?: (string|null);
+
+                /** SettingSyncDeleteMessage contentHash */
+                contentHash?: (string|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -7216,6 +7618,12 @@ export namespace proto {
 
             /** SettingSyncMtimeMessage lastTime. */
             lastTime: (number|Long);
+
+            /** SettingSyncMtimeMessage contentHash. */
+            contentHash: string;
+
+            /** SettingSyncMtimeMessage revision. */
+            revision: string;
 
             /**
              * Creates a new SettingSyncMtimeMessage instance using the specified properties.
@@ -7313,6 +7721,12 @@ export namespace proto {
                 /** SettingSyncMtimeMessage lastTime */
                 lastTime?: (number|Long|null);
 
+                /** SettingSyncMtimeMessage contentHash */
+                contentHash?: (string|null);
+
+                /** SettingSyncMtimeMessage revision */
+                revision?: (string|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -7353,6 +7767,9 @@ export namespace proto {
 
             /** SettingSyncEndMessage needDeleteCount. */
             needDeleteCount: (number|Long);
+
+            /** SettingSyncEndMessage needConflictCount. */
+            needConflictCount: (number|Long);
 
             /**
              * Creates a new SettingSyncEndMessage instance using the specified properties.
@@ -7452,6 +7869,9 @@ export namespace proto {
 
                 /** SettingSyncEndMessage needDeleteCount */
                 needDeleteCount?: (number|Long|null);
+
+                /** SettingSyncEndMessage needConflictCount */
+                needConflictCount?: (number|Long|null);
 
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
@@ -7604,6 +8024,12 @@ export namespace proto {
             /** SettingModifyAckMessage pathHash. */
             pathHash: string;
 
+            /** SettingModifyAckMessage contentHash. */
+            contentHash: string;
+
+            /** SettingModifyAckMessage revision. */
+            revision: string;
+
             /**
              * Creates a new SettingModifyAckMessage instance using the specified properties.
              * @param [properties] Properties to set
@@ -7697,6 +8123,12 @@ export namespace proto {
                 /** SettingModifyAckMessage pathHash */
                 pathHash?: (string|null);
 
+                /** SettingModifyAckMessage contentHash */
+                contentHash?: (string|null);
+
+                /** SettingModifyAckMessage revision */
+                revision?: (string|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -7731,6 +8163,9 @@ export namespace proto {
 
             /** SettingDeleteAckMessage pathHash. */
             pathHash: string;
+
+            /** SettingDeleteAckMessage revision. */
+            revision: string;
 
             /**
              * Creates a new SettingDeleteAckMessage instance using the specified properties.
@@ -7825,6 +8260,9 @@ export namespace proto {
                 /** SettingDeleteAckMessage pathHash */
                 pathHash?: (string|null);
 
+                /** SettingDeleteAckMessage revision */
+                revision?: (string|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -7859,6 +8297,9 @@ export namespace proto {
 
             /** FolderSyncCheckRequest mtime. */
             mtime: (number|Long);
+
+            /** FolderSyncCheckRequest baseRevision. */
+            baseRevision: string;
 
             /**
              * Creates a new FolderSyncCheckRequest instance using the specified properties.
@@ -7953,6 +8394,9 @@ export namespace proto {
                 /** FolderSyncCheckRequest mtime */
                 mtime?: (number|Long|null);
 
+                /** FolderSyncCheckRequest baseRevision */
+                baseRevision?: (string|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -7984,6 +8428,9 @@ export namespace proto {
 
             /** FolderSyncDelFolder pathHash. */
             pathHash: string;
+
+            /** FolderSyncDelFolder baseRevision. */
+            baseRevision: string;
 
             /**
              * Creates a new FolderSyncDelFolder instance using the specified properties.
@@ -8074,6 +8521,9 @@ export namespace proto {
 
                 /** FolderSyncDelFolder pathHash */
                 pathHash?: (string|null);
+
+                /** FolderSyncDelFolder baseRevision */
+                baseRevision?: (string|null);
 
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
@@ -8271,6 +8721,12 @@ export namespace proto {
             /** FolderCreateRequest context. */
             context: string;
 
+            /** FolderCreateRequest baseRevision. */
+            baseRevision: string;
+
+            /** FolderCreateRequest isConflictResolved. */
+            isConflictResolved: boolean;
+
             /**
              * Creates a new FolderCreateRequest instance using the specified properties.
              * @param [properties] Properties to set
@@ -8367,6 +8823,12 @@ export namespace proto {
                 /** FolderCreateRequest context */
                 context?: (string|null);
 
+                /** FolderCreateRequest baseRevision */
+                baseRevision?: (string|null);
+
+                /** FolderCreateRequest isConflictResolved */
+                isConflictResolved?: (boolean|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -8404,6 +8866,9 @@ export namespace proto {
 
             /** FolderDeleteRequest context. */
             context: string;
+
+            /** FolderDeleteRequest baseRevision. */
+            baseRevision: string;
 
             /**
              * Creates a new FolderDeleteRequest instance using the specified properties.
@@ -8500,6 +8965,9 @@ export namespace proto {
 
                 /** FolderDeleteRequest context */
                 context?: (string|null);
+
+                /** FolderDeleteRequest baseRevision */
+                baseRevision?: (string|null);
 
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
@@ -8688,6 +9156,9 @@ export namespace proto {
             /** FolderSyncModifyMessage lastTime. */
             lastTime: (number|Long);
 
+            /** FolderSyncModifyMessage revision. */
+            revision: string;
+
             /**
              * Creates a new FolderSyncModifyMessage instance using the specified properties.
              * @param [properties] Properties to set
@@ -8787,6 +9258,9 @@ export namespace proto {
                 /** FolderSyncModifyMessage lastTime */
                 lastTime?: (number|Long|null);
 
+                /** FolderSyncModifyMessage revision */
+                revision?: (string|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -8827,6 +9301,9 @@ export namespace proto {
 
             /** FolderSyncDeleteMessage lastTime. */
             lastTime: (number|Long);
+
+            /** FolderSyncDeleteMessage revision. */
+            revision: string;
 
             /**
              * Creates a new FolderSyncDeleteMessage instance using the specified properties.
@@ -8926,6 +9403,9 @@ export namespace proto {
 
                 /** FolderSyncDeleteMessage lastTime */
                 lastTime?: (number|Long|null);
+
+                /** FolderSyncDeleteMessage revision */
+                revision?: (string|null);
 
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
@@ -9114,6 +9594,9 @@ export namespace proto {
             /** FolderSyncEndMessage needDeleteCount. */
             needDeleteCount: (number|Long);
 
+            /** FolderSyncEndMessage needConflictCount. */
+            needConflictCount: (number|Long);
+
             /**
              * Creates a new FolderSyncEndMessage instance using the specified properties.
              * @param [properties] Properties to set
@@ -9207,6 +9690,9 @@ export namespace proto {
                 /** FolderSyncEndMessage needDeleteCount */
                 needDeleteCount?: (number|Long|null);
 
+                /** FolderSyncEndMessage needConflictCount */
+                needConflictCount?: (number|Long|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
@@ -9241,6 +9727,9 @@ export namespace proto {
 
             /** FolderModifyAckMessage pathHash. */
             pathHash: string;
+
+            /** FolderModifyAckMessage revision. */
+            revision: string;
 
             /**
              * Creates a new FolderModifyAckMessage instance using the specified properties.
@@ -9334,6 +9823,9 @@ export namespace proto {
 
                 /** FolderModifyAckMessage pathHash */
                 pathHash?: (string|null);
+
+                /** FolderModifyAckMessage revision */
+                revision?: (string|null);
 
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
@@ -9498,6 +9990,9 @@ export namespace proto {
             /** FolderDeleteAckMessage pathHash. */
             pathHash: string;
 
+            /** FolderDeleteAckMessage revision. */
+            revision: string;
+
             /**
              * Creates a new FolderDeleteAckMessage instance using the specified properties.
              * @param [properties] Properties to set
@@ -9591,12 +10086,191 @@ export namespace proto {
                 /** FolderDeleteAckMessage pathHash */
                 pathHash?: (string|null);
 
+                /** FolderDeleteAckMessage revision */
+                revision?: (string|null);
+
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];
             }
 
             /** Shape of a FolderDeleteAckMessage. */
             type $Shape = proto.v1.FolderDeleteAckMessage.$Properties;
+        }
+
+        /**
+         * Properties of a SyncConflictMessage.
+         * @deprecated Use proto.v1.SyncConflictMessage.$Properties instead.
+         */
+        type ISyncConflictMessage = proto.v1.SyncConflictMessage.$Properties;
+
+        /** Represents a SyncConflictMessage. */
+        class SyncConflictMessage {
+
+            /**
+             * Constructs a new SyncConflictMessage.
+             * @param [properties] Properties to set
+             */
+            constructor(properties?: proto.v1.SyncConflictMessage.$Properties);
+
+            /** Unknown fields preserved while decoding when enabled */
+            $unknowns?: Uint8Array[];
+
+            /** SyncConflictMessage kind. */
+            kind: string;
+
+            /** SyncConflictMessage path. */
+            path: string;
+
+            /** SyncConflictMessage pathHash. */
+            pathHash: string;
+
+            /** SyncConflictMessage reason. */
+            reason: string;
+
+            /** SyncConflictMessage serverHash. */
+            serverHash: string;
+
+            /** SyncConflictMessage serverRevision. */
+            serverRevision: string;
+
+            /** SyncConflictMessage serverDeleted. */
+            serverDeleted: boolean;
+
+            /** SyncConflictMessage baseHash. */
+            baseHash: string;
+
+            /** SyncConflictMessage baseContent. */
+            baseContent: string;
+
+            /** SyncConflictMessage baseMissing. */
+            baseMissing: boolean;
+
+            /** SyncConflictMessage serverContent. */
+            serverContent: string;
+
+            /**
+             * Creates a new SyncConflictMessage instance using the specified properties.
+             * @param [properties] Properties to set
+             * @returns SyncConflictMessage instance
+             */
+            static create(properties: proto.v1.SyncConflictMessage.$Shape): proto.v1.SyncConflictMessage & proto.v1.SyncConflictMessage.$Shape;
+            static create(properties?: proto.v1.SyncConflictMessage.$Properties): proto.v1.SyncConflictMessage;
+
+            /**
+             * Encodes the specified SyncConflictMessage message. Does not implicitly {@link proto.v1.SyncConflictMessage.verify|verify} messages.
+             * @param message SyncConflictMessage message or plain object to encode
+             * @param [writer] Writer to encode to
+             * @returns Writer
+             */
+            static encode(message: proto.v1.SyncConflictMessage.$Properties, writer?: $protobuf.Writer): $protobuf.Writer;
+
+            /**
+             * Encodes the specified SyncConflictMessage message, length delimited. Does not implicitly {@link proto.v1.SyncConflictMessage.verify|verify} messages.
+             * @param message SyncConflictMessage message or plain object to encode
+             * @param [writer] Writer to encode to
+             * @returns Writer
+             */
+            static encodeDelimited(message: proto.v1.SyncConflictMessage.$Properties, writer?: $protobuf.Writer): $protobuf.Writer;
+
+            /**
+             * Decodes a SyncConflictMessage message from the specified reader or buffer.
+             * @param reader Reader or buffer to decode from
+             * @param [length] Message length if known beforehand
+             * @returns {proto.v1.SyncConflictMessage & proto.v1.SyncConflictMessage.$Shape} SyncConflictMessage
+             * @throws {Error} If the payload is not a reader or valid buffer
+             * @throws {$protobuf.util.ProtocolError} If required fields are missing
+             */
+            static decode(reader: ($protobuf.Reader|Uint8Array), length?: number): proto.v1.SyncConflictMessage & proto.v1.SyncConflictMessage.$Shape;
+
+            /**
+             * Decodes a SyncConflictMessage message from the specified reader or buffer, length delimited.
+             * @param reader Reader or buffer to decode from
+             * @returns {proto.v1.SyncConflictMessage & proto.v1.SyncConflictMessage.$Shape} SyncConflictMessage
+             * @throws {Error} If the payload is not a reader or valid buffer
+             * @throws {$protobuf.util.ProtocolError} If required fields are missing
+             */
+            static decodeDelimited(reader: ($protobuf.Reader|Uint8Array)): proto.v1.SyncConflictMessage & proto.v1.SyncConflictMessage.$Shape;
+
+            /**
+             * Verifies a SyncConflictMessage message.
+             * @param message Plain object to verify
+             * @returns `null` if valid, otherwise the reason why it is not
+             */
+            static verify(message: { [k: string]: unknown }): (string|null);
+
+            /**
+             * Creates a SyncConflictMessage message from a plain object. Also converts values to their respective internal types.
+             * @param object Plain object
+             * @returns SyncConflictMessage
+             */
+            static fromObject(object: { [k: string]: unknown }): proto.v1.SyncConflictMessage;
+
+            /**
+             * Creates a plain object from a SyncConflictMessage message. Also converts values to other types if specified.
+             * @param message SyncConflictMessage
+             * @param [options] Conversion options
+             * @returns Plain object
+             */
+            static toObject(message: proto.v1.SyncConflictMessage, options?: $protobuf.IConversionOptions): { [k: string]: unknown };
+
+            /**
+             * Converts this SyncConflictMessage to JSON.
+             * @returns JSON object
+             */
+            toJSON(): { [k: string]: unknown };
+
+            /**
+             * Gets the type url for SyncConflictMessage
+             * @param [prefix] Custom type url prefix, defaults to `"type.googleapis.com"`
+             * @returns The type url
+             */
+            static getTypeUrl(prefix?: string): string;
+        }
+
+        namespace SyncConflictMessage {
+
+            /** Properties of a SyncConflictMessage. */
+            interface $Properties {
+
+                /** SyncConflictMessage kind */
+                kind?: (string|null);
+
+                /** SyncConflictMessage path */
+                path?: (string|null);
+
+                /** SyncConflictMessage pathHash */
+                pathHash?: (string|null);
+
+                /** SyncConflictMessage reason */
+                reason?: (string|null);
+
+                /** SyncConflictMessage serverHash */
+                serverHash?: (string|null);
+
+                /** SyncConflictMessage serverRevision */
+                serverRevision?: (string|null);
+
+                /** SyncConflictMessage serverDeleted */
+                serverDeleted?: (boolean|null);
+
+                /** SyncConflictMessage baseHash */
+                baseHash?: (string|null);
+
+                /** SyncConflictMessage baseContent */
+                baseContent?: (string|null);
+
+                /** SyncConflictMessage baseMissing */
+                baseMissing?: (boolean|null);
+
+                /** SyncConflictMessage serverContent */
+                serverContent?: (string|null);
+
+                /** Unknown fields preserved while decoding when enabled */
+                $unknowns?: Uint8Array[];
+            }
+
+            /** Shape of a SyncConflictMessage. */
+            type $Shape = proto.v1.SyncConflictMessage.$Properties;
         }
 
         /**
