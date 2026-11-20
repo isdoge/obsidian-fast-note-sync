@@ -21,6 +21,7 @@ import { ConfigManager } from "./lib/sync/config_manager";
 import { RetryQueue } from "./lib/sync/retry_queue";
 import { EventManager } from "./lib/utils/events_manager";
 import { WebSocketManager } from "./lib/sync/websocket_manager";
+import { IdleAutoSyncScheduler, DEFAULT_IDLE_SYNC_INTERVAL_MINUTES } from "./lib/sync/idle_auto_sync";
 import { MenuManager } from "./lib/ui/menu_manager";
 import { LockManager } from "./lib/sync/lock_manager";
 import { handleSync, cancelSync } from "./lib/sync/operator";
@@ -68,6 +69,7 @@ export default class FastSync extends Plugin {
   fileCloudPreview: FileCloudPreview              // 云端文件预览管理器
   folderSnapshotManager: FolderSnapshotManager    // 文件夹快照管理器
   statusBarManager: StatusBarManager              // 状态栏管理器
+  idleSyncScheduler: IdleAutoSyncScheduler        // 空闲连接定时兜底同步 / Idle-connection fallback sync
   readonly progressTracker = new SyncProgressTracker() // 进度追踪器
   private menuManagerInitialized = false          // 防止 onLayoutReady 重复初始化 / Guard against duplicate onLayoutReady init
 
@@ -126,6 +128,18 @@ export default class FastSync extends Plugin {
     tasks.completed++;
   }
 
+  /**
+   * 是否有同步轮次或待处理上传/下载队列；空闲兜底同步只在完全空闲时触发。
+   * Whether a round is active or upload/download work is pending; idle fallback sync only
+   * fires when everything is quiescent.
+   */
+  hasPendingSyncWork(): boolean {
+    if (this.isSyncing || this.syncState.activeSyncContext !== null) return true
+    if (this.pendingNoteModifies.size > 0 || this.pendingUploadHashes.size > 0 || this.pendingConfigModifies.size > 0) return true
+    if ((this.retryQueue?.entries?.length ?? 0) > 0) return true
+    return (this.concurrencyLimiter?.activeSlotCount ?? 0) > 0
+  }
+
   sendSyncPageAck(type: "note" | "file" | "setting" | "folder", pageIndex: number) {
     let action = "";
     if (type === "note") action = "NoteSyncPageAck";
@@ -175,8 +189,13 @@ export default class FastSync extends Plugin {
   // SyncState — control flags
   get isSyncing() { return this.syncState.isSyncing }
   set isSyncing(v: boolean) {
+    const wasSyncing = this.syncState.isSyncing
     this.syncState.isSyncing = v
-    if (!v) this.retryQueue?.resume()
+    if (v && !wasSyncing) this.idleSyncScheduler?.notifySyncStarted()
+    if (!v) {
+      this.retryQueue?.resume()
+      if (wasSyncing) this.idleSyncScheduler?.notifySyncCompleted()
+    }
   }
   get isSyncRequesting() { return this.syncState.isSyncRequesting }
   set isSyncRequesting(v: boolean) { this.syncState.isSyncRequesting = v }
@@ -396,6 +415,19 @@ export default class FastSync extends Plugin {
 
     await this.loadSettings()
 
+    // 空闲连接定时兜底同步（服务端 #503）：只负责调度，能否触发由连接/队列/可见性共同决定
+    // Idle-connection periodic fallback sync (server #503): scheduling only; the host predicates
+    // decide whether a tick may actually fire
+    this.idleSyncScheduler = new IdleAutoSyncScheduler({
+      getIntervalMinutes: () => this.settings.autoIdleSyncIntervalMinutes ?? DEFAULT_IDLE_SYNC_INTERVAL_MINUTES,
+      isConnected: () => !!this.websocket?.isConnected?.() && !!this.websocket?.isAuth,
+      isBusy: () => this.hasPendingSyncWork(),
+      isVisible: () => typeof activeDocument === "undefined" || activeDocument.visibilityState === "visible",
+      // 轻量增量 + 静默：从本机游标继续，不弹开始/完成提示
+      // Lightweight incremental + silent: resume from the local cursor and show no notices
+      runSync: () => { void handleSync(this, true, "auto", true) },
+    })
+
     // Initialize VersionManager after settings are loaded to avoid reading undefined 'settings.vault'
     // 在加载设置后初始化 VersionManager，避免在 settings 未加载时访问 settings.vault
     this.versionManager = new VersionManager(this)
@@ -523,7 +555,12 @@ export default class FastSync extends Plugin {
       this.menuManager.init()
 
       // 注册 WebSocket 状态监听 (Register WebSocket status listener)
-      this.websocket.addStatusListener((status: boolean) => this.updateRibbonIcon(status))
+      // 断开时同步清理空闲兜底定时器，鉴权成功（status=true）后重新挂载
+      // Clear the idle fallback timer on disconnect and re-arm it after auth (status=true)
+      this.websocket.addStatusListener((status: boolean) => {
+        this.updateRibbonIcon(status)
+        this.idleSyncScheduler?.setConnected(status)
+      })
 
       // 注册 WebSocket 数据传输活动监听 — 任何数据收发时显示同步指示器 / Register data transfer activity listener
       let activityTimer: number | null = null;
@@ -661,6 +698,9 @@ export default class FastSync extends Plugin {
     this.localStorageManager?.flushSyncStateMirror()
     // 取消注册文件事件
     void this.reloadServices(false)
+    // reloadServices 末尾会重新评估空闲定时器，卸载时必须最后再清一次，避免留下定时器
+    // reloadServices re-evaluates the idle timer at its end; clear it last during unload
+    this.idleSyncScheduler?.stop()
     this.updateStatusBar("")
   }
 
@@ -984,6 +1024,10 @@ export default class FastSync extends Plugin {
       this.fileDownloadSessions.clear()
       this.updateStatusBar("")
     }
+
+    // 连接/配置变化后重新评估空闲兜底定时器（关功能、断开或改间隔都在这里收口）
+    // Re-evaluate the idle fallback timer after connection/settings changes
+    this.idleSyncScheduler?.applySettings()
 
     setLogEnabled(this.settings.logEnabled || "off")
   }

@@ -14,6 +14,7 @@ import { AppWithInternal } from "./lib/utils/types";
 import { RuleEditor } from "./views/rule-editor";
 import { $ } from "./i18n/lang";
 import FastSync from "./main";
+import { DEFAULT_IDLE_SYNC_INTERVAL_MINUTES, IDLE_SYNC_INTERVAL_OPTIONS } from "./lib/sync/idle_auto_sync";
 import { updateVaultName } from "./lib/settings/vault_name";
 
 
@@ -32,6 +33,8 @@ export interface PluginSettings {
   vault: string
   /** 启动同步延迟时间（毫秒），避免刚启动时大量 IO 冲突 */
   startupDelay: number
+  /** 空闲连接兜底增量同步间隔（分钟），0 表示关闭 / Idle fallback incremental sync interval (minutes); 0 disables */
+  autoIdleSyncIntervalMinutes: number
   /** 离线同步策略（如 newTimeMerge, ignoreTimeMerge 等） */
   offlineSyncStrategy: string
   /** 笔记/文件同步排除文件夹（每行一个） */
@@ -137,6 +140,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   apiToken: "",
   vault: "",
   startupDelay: 500,
+  autoIdleSyncIntervalMinutes: DEFAULT_IDLE_SYNC_INTERVAL_MINUTES,
   offlineSyncStrategy: "",
   syncExcludeFolders: "",
   syncExcludeExtensions: "",
@@ -1582,6 +1586,23 @@ export class SettingTab extends PluginSettingTab {
       }),
     )
     this.setDescWithBreaks(set.lastElementChild as HTMLElement, $("setting.sync.auto_config_desc"))
+
+    new Setting(set).setName($("setting.sync.idle_interval")).addDropdown((dropdown) => {
+      dropdown.addOption("0", $("setting.sync.idle_interval_off"))
+      for (const minutes of IDLE_SYNC_INTERVAL_OPTIONS) {
+        if (minutes > 0) dropdown.addOption(String(minutes), `${minutes} ${$("setting.sync.idle_interval_unit")}`)
+      }
+      dropdown
+        .setValue(String(this.plugin.settings.autoIdleSyncIntervalMinutes ?? DEFAULT_IDLE_SYNC_INTERVAL_MINUTES))
+        .onChange(async (value: string) => {
+          const minutes = parseInt(value)
+          this.plugin.settings.autoIdleSyncIntervalMinutes = Number.isFinite(minutes) && minutes >= 0
+            ? minutes
+            : DEFAULT_IDLE_SYNC_INTERVAL_MINUTES
+          await this.plugin.saveAndReloadServices("autoIdleSyncIntervalMinutes")
+        })
+    })
+    this.setDescWithBreaks(set.lastElementChild as HTMLElement, $("setting.sync.idle_interval_desc"))
 
     new Setting(set).setName($("setting.sync.binary_limit")).setClass("fns-setting-item-checkbox").addToggle((toggle) =>
       toggle.setValue(this.plugin.settings.binarySyncLimitEnabled).onChange(async (value) => {

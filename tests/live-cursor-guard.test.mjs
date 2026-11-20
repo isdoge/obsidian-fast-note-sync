@@ -31,6 +31,10 @@ function load(file, extra = {}, globals = {}) {
     require: id => id === 'obsidian' ? { TFile: MockFile, TFolder: class { constructor(p) { this.path = p; this.children = []; } }, normalizePath: x => x, Platform: { isMobile: false } }
       : id.includes('helpers_obsidian_bypass') ? { ...helpers, vaultDelete: async () => {} }
       : id.includes('helpers') ? { ...helpers, vaultDelete: async () => {} }
+      : id.includes('config_codec') ? {
+          encodeConfigContent: () => '',
+          decodeConfigContent: s => ({ kind: 'text', text: s }),
+        }
       : id.includes('sync_log_manager') ? { SyncLogManager: { getInstance: () => logs } }
       : id.includes('remote_path_guard') ? { blockAliasedRemoteMutation: () => false }
       : id.includes('remote_delete_guard') ? { firstKeepWithoutBaseline: () => false }

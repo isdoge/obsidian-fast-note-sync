@@ -72,6 +72,11 @@ export class ConcurrencyLimiter {
         return this.slotContexts.get(key);
     }
 
+    /** 活跃与排队中的槽位总数，供空闲同步判断是否有待处理上传 / Active plus queued slots, used by idle sync to detect pending uploads */
+    public get activeSlotCount(): number {
+        return this.activeKeys.size + this.queue.length;
+    }
+
     /**
      * 为仍在干活的任务续期，避免刚发过数据的名额被 sweepStale 当成无人归还。
      * Refresh an in-progress key so a slot that just did work is not swept as abandoned.

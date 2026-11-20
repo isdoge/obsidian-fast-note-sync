@@ -14,6 +14,16 @@ const windowStub = {
 
 const cache = new Map();
 let diskHashes = new Map();
+function loadUtil(name) {
+  if (cache.has(name)) return cache.get(name);
+  const module = { exports: {} };
+  const code = ts.transpileModule(fs.readFileSync(`src/lib/utils/${name}.ts`, "utf8"), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
+  }).outputText;
+  vm.runInNewContext(code, { module, exports: module.exports, console, TextDecoder, TextEncoder, require: () => ({}) });
+  cache.set(name, module.exports);
+  return module.exports;
+}
 function load(name) {
   if (cache.has(name)) return cache.get(name);
   const module = { exports: {} };
@@ -34,6 +44,7 @@ function load(name) {
         hashContent: s => `h:${s}`,
         getSafeCtime: s => s.ctime ?? 1,
       }, { get: (t, k) => t[k] ?? noop })
+      : id.includes("config_codec") ? loadUtil("config_codec")
       : id === "./operator_config" ? load("operator_config")
       : id.includes("sync_log_manager") ? { SyncLogManager: { getInstance: () => ({ addLog: noop }) } }
       : id.includes("i18n") ? { $: k => k }

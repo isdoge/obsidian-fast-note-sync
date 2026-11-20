@@ -117,10 +117,12 @@ const plain = v => JSON.parse(JSON.stringify(v));
       }, { get: (t, k) => t[k] ?? noop })
       : id.includes("operator_config") ? {
         CONFIG_PLUGIN_EXTS_TO_WATCH: [".json"], CONFIG_ROOT_FILES_EXCLUDE: [], CONFIG_THEME_EXTS_TO_WATCH: [".css"],
+        CONFIG_SNIPPET_EXTS_TO_WATCH: [".css"],
         configModify: async p => modified.push(p),
         configDelete: async p => deleted.push(p),
         configAllPaths: async () => [...diskFiles.keys()],
         isPluginConfigPathExcluded: () => false,
+        isConfigResourcePathExcluded: () => false,
       }
       : {},
   });
