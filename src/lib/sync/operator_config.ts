@@ -319,25 +319,27 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
         // Fail-safe: before overwriting, check for unsynced local edits so a server push
         // doesn't blindly clobber changes the user just made
         const hasPendingLocalEdit = plugin.pendingConfigModifies.has(data.path)
-        let hasDivergedSinceLastSync = false
-        if (!hasPendingLocalEdit) {
-            const existingStat = await plugin.app.vault.adapter.stat(filePath)
-            if (existingStat) {
-                const knownSyncMtime = plugin.lastSyncMtime.get(data.path)
-                const localMtimeIsNewer = knownSyncMtime !== undefined && existingStat.mtime > knownSyncMtime
-                if (localMtimeIsNewer) {
-                    // mtime 已比上次同步记录的新，进一步用内容哈希确认本地内容是否真的偏离了已知基准
-                    // mtime is newer than what we last synced; confirm with content hash whether
-                    // local content actually diverged from the known baseline
-                    const knownBaseHash = plugin.configHashManager.getPathHash(data.path)
-                    let localContentHash = plugin.configHashManager.getValidHash(data.path, existingStat.mtime, existingStat.size)
-                    if (localContentHash === null) {
-                        localContentHash = await hashFileAsync(plugin.app, filePath)
-                    }
-                    hasDivergedSinceLastSync = localContentHash !== knownBaseHash
-                }
+        const existingStat = await plugin.app.vault.adapter.stat(filePath)
+        let localContentHash: string | null = null
+        if (existingStat) {
+            localContentHash = typeof plugin.configHashManager.getValidHash === "function"
+                ? plugin.configHashManager.getValidHash(data.path, existingStat.mtime, existingStat.size)
+                : null
+            if (localContentHash === null) {
+                localContentHash = await hashFileAsync(plugin.app, filePath)
             }
         }
+        // 旧版持久化基线只有在本地内容仍等于记录值时才可信；否则按“无可信基线”处理
+        // Legacy persisted baselines count only while local content still equals them.
+        const knownBaseHash = plugin.configHashManager.getPathHash(data.path)
+        const trustedBaseHash = typeof plugin.configHashManager.getVerifiedPathHash === "function"
+            ? plugin.configHashManager.getVerifiedPathHash(data.path, localContentHash)
+            : knownBaseHash
+        // 有可信基线时按内容比较（与 mtime 无关）：本地内容不等于基线即已偏离
+        // With a trusted baseline the check is content-based (mtime-independent)
+        const hasDivergedSinceLastSync = !hasPendingLocalEdit
+            && trustedBaseHash !== null
+            && localContentHash !== trustedBaseHash
 
         if (hasPendingLocalEdit || hasDivergedSinceLastSync) {
             dump(`[FastSync] Skip config overwrite, local unsynced edit detected: ${filePath}`)

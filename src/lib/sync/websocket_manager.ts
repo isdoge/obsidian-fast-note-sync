@@ -1,8 +1,8 @@
 import { moment, Platform, normalizePath } from "obsidian";
 
 import { invalidateFileDownloads, handleFileChunkDownload, BINARY_PREFIX_FILE_SYNC, clearUploadQueue, receiveFileUploadSessionNotFound } from "./operator_file";
-import { clearEmptyNoteProbes } from "./operator_note";
-import { dump, addRandomParam, showSyncNotice, safeStringify, getPluginDir, hashContent } from "../utils/helpers";
+import { clearEmptyNoteProbes, conflictBackupPaths, writeConflictMeta } from "./operator_note";
+import { dump, addRandomParam, showSyncNotice, safeStringify } from "../utils/helpers";
 import { enSendDTOToProtobuf, deReceivePacket } from "../../pb/protobuf_mapper";
 import { receiveOperators, startupSync, startupFullSync, settleAllBatchSendSessionsOnClose, settleSyncTimes } from "./operator";
 import { SyncLogManager } from "./sync_log_manager";
@@ -919,21 +919,28 @@ export class WebSocketManager {
         this.plugin.settings.vault
       );
 
-      // 写入 Base 和 Remote 物理冲突文件到 conflict-notes (位于插件目录下，文件名附加路径哈希以防碰撞)
+      // 写入 Remote 物理冲突文件到 conflict-notes（位于插件目录下，文件名附加路径哈希以防碰撞）。
+      // 只有服务端明确给出非空 base 时才写 base 文件：空文本可能是“真实空 base”，但历史快照
+      // 缺失时服务端也会回退成空串，不能拿来冒充共同祖先。
+      // Write the remote conflict copy into conflict-notes. A base file is written only when the
+      // server supplied a non-empty ancestor; an empty string may just be a missing snapshot and
+      // must not be presented as a real common ancestor.
       try {
+        const { dir, baseBackupPath, remoteBackupPath } = conflictBackupPaths(this.plugin, path);
         const adapter = this.plugin.app.vault.adapter;
-        const conflictDir = `${getPluginDir(this.plugin)}/conflict-notes`;
-        if (!(await adapter.exists(conflictDir))) {
-          await adapter.mkdir(conflictDir);
+        if (!(await adapter.exists(dir))) {
+          await adapter.mkdir(dir);
         }
 
-        const safeName = path.replace(/\.md$/, "").replace(/[/\\]/g, "_");
-        const pathHash = hashContent(path);
-        const baseBackupPath = `${conflictDir}/${safeName}_${pathHash}.base.md`;
-        const remoteBackupPath = `${conflictDir}/${safeName}_${pathHash}.remote.md`;
-
-        await adapter.write(baseBackupPath, baseContent);
+        const hasRealBase = baseContent.length > 0;
+        if (hasRealBase) await adapter.write(baseBackupPath, baseContent);
+        else if (await adapter.exists(baseBackupPath)) await adapter.remove(baseBackupPath);
         await adapter.write(remoteBackupPath, serverContent);
+        await writeConflictMeta(this.plugin, path, {
+          reason: hasRealBase ? "manual_merge" : "manual_merge_no_base",
+          baseMissing: !hasRealBase,
+          remoteHash: serverHash,
+        });
       } catch (e) {
         dump("Failed to create conflict-notes backup files:", e);
       }

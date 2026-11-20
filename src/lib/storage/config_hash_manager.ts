@@ -21,8 +21,16 @@ interface HashCache {
  */
 export class ConfigHashManager {
     private plugin: FastSync;
+    /** 本地磁盘哈希缓存；扫描只允许写这里 / Local disk-hash cache; scans may only write here */
     private hashMap: Map<string, HashCache> = new Map();
+    /** 可信同步基线：只由服务端确认（SettingModifyAck / 远端推送落盘 / 相等核验）写入 */
+    /** Trusted baseline: written only at server-confirmed moments (Ack / remote push / equality) */
+    private syncHashMap: Map<string, string> = new Map();
+    private confirmedPaths: Set<string> = new Set();
     private storageKey: string;
+    private syncStorageKey: string;
+    private confirmedStorageKey: string;
+    private syncMirror: LocalStateFileMirror;
     private isInitialized: boolean = false;
     // 脏标记 + 防抖落盘：高频单条写入（下载/Ack 路径）不再逐条同步整表 JSON.stringify，
     // 避免高频写 localStorage 阻塞主线程导致界面白屏
@@ -38,8 +46,11 @@ export class ConfigHashManager {
         // 与 vault 名无关的稳定存储键：iCloud 手机端会把库文件夹改名，绑定 vault 名的旧 key 会失效
         // (与 local_storage_manager.ts getInternalKey 的修复同理)，历史键迁移见 loadFromStorage
         this.storageKey = `fns-configHashMap`;
+        this.syncStorageKey = `fns-configSyncHashMap`;
+        this.confirmedStorageKey = `fns-configSyncHashMapConfirmed`;
         this.debouncedFlush = debounce(() => this.flush(), 500);
         this.mirror = new LocalStateFileMirror(plugin, "configHashMap.json");
+        this.syncMirror = new LocalStateFileMirror(plugin, "configSyncHashMap.json");
     }
 
     /**
@@ -60,6 +71,7 @@ export class ConfigHashManager {
         }
         // 最后冲镜像：既包含 saveToStorage 刚安排的一份，也包含与 isDirty 无关的防抖中镜像写
         this.mirror.flush();
+        this.syncMirror.flush();
     }
 
     /**
@@ -69,6 +81,19 @@ export class ConfigHashManager {
      */
     async initialize(): Promise<void> {
         dump("ConfigHashManager: starting init");
+
+        // 先恢复可信基线与确认来源，再恢复磁盘缓存：后者的 saveToStorage() 也会写基线表，
+        // 顺序反了会用构造时的空表覆盖旧基线（与 FileHashManager 的 iOS 清除事故同理）。
+        // Restore the trusted baseline and its provenance before the disk cache: the latter's
+        // saveToStorage() also writes the baseline, and the wrong order would overwrite it.
+        const hasSync = this.loadSyncFromStorage();
+        if (!hasSync || this.syncHashMap.size === 0) {
+            const mirroredSync = await this.syncMirror.read();
+            if (mirroredSync && this.parseAndLoadSync(mirroredSync) && this.syncHashMap.size > 0) {
+                this.saveSyncToStorage();
+            }
+        }
+        this.loadConfirmedFromStorage();
 
         // 尝试从 localStorage 加载
         const loaded = this.loadFromStorage();
@@ -226,24 +251,41 @@ export class ConfigHashManager {
     }
 
     /**
-     * 获取指定路径的哈希值
+     * 获取指定路径的可信同步基线哈希（不再回退到本地扫描缓存）
+     * Trusted sync baseline for a path (never falls back to the scan cache)
      */
     getPathHash(path: string): string | null {
-        return this.hashMap.get(path)?.hash || null;
+        return this.syncHashMap.get(path) || null;
     }
 
     /**
-     * 获取哈希表中存储的所有配置路径
+     * 判断基线在当前本地内容下是否可信：确认过的直接可信；旧版持久化基线仅当内容相等时可信。
+     * Whether the baseline is trustworthy for the current local content. Confirmed entries are
+     * trusted; legacy persisted entries only while local content still equals the recorded value.
+     */
+    getVerifiedPathHash(path: string, localContentHash: string | null): string | null {
+        const stored = this.syncHashMap.get(path);
+        if (stored === undefined) return null;
+        if (this.confirmedPaths.has(path)) return stored;
+        return localContentHash !== null && localContentHash === stored ? stored : null;
+    }
+
+    /**
+     * 获取已同步（服务端确认过）的所有配置路径
+     * All config paths with a server-confirmed baseline
      */
     getAllPaths(): string[] {
-        return Array.from(this.hashMap.keys());
+        return Array.from(this.syncHashMap.keys());
     }
 
     /**
-     * 添加或更新单个配置的哈希
+     * 添加或更新单个配置的哈希（仅服务端确认/相等核验路径调用）
+     * Add/update one config hash (only server-confirmed or equality-verified paths call this)
      */
     setFileHash(path: string, hash: string, mtime: number = 0, size: number = 0): void {
         this.hashMap.set(path, { hash, mtime, size });
+        this.syncHashMap.set(path, hash);
+        this.confirmedPaths.add(path);
         this.scheduleSave();
     }
 
@@ -279,7 +321,9 @@ export class ConfigHashManager {
      */
     removeFileHash(path: string): void {
         const deleted = this.hashMap.delete(path);
-        if (deleted) {
+        const deletedBase = this.syncHashMap.delete(path);
+        this.confirmedPaths.delete(path);
+        if (deleted || deletedBase) {
             this.scheduleSave();
         }
     }
@@ -288,6 +332,8 @@ export class ConfigHashManager {
         let changed = false;
         for (const path of paths) {
             changed = this.hashMap.delete(path) || changed;
+            changed = this.syncHashMap.delete(path) || changed;
+            this.confirmedPaths.delete(path);
         }
         if (changed) this.scheduleSave();
     }
@@ -326,6 +372,60 @@ export class ConfigHashManager {
             dump("ConfigHashManager: failed to load from localStorage", error);
             return false;
         }
+    }
+
+    private loadSyncFromStorage(): boolean {
+        try {
+            const data = this.plugin.app.loadLocalStorage(this.syncStorageKey) as string | null;
+            if (!data) return false;
+            return this.parseAndLoadSync(data);
+        } catch (error) {
+            dump("ConfigHashManager: failed to load sync baseline from localStorage", error);
+            return false;
+        }
+    }
+
+    private parseAndLoadSync(data: string): boolean {
+        try {
+            const parsed = JSON.parse(data) as Record<string, string>;
+            this.syncHashMap = new Map(Object.entries(parsed));
+            return true;
+        } catch (error) {
+            dump("ConfigHashManager: failed to parse sync baseline data", error);
+            return false;
+        }
+    }
+
+    private loadConfirmedFromStorage(): void {
+        this.confirmedPaths.clear();
+        try {
+            const raw = this.plugin.app.loadLocalStorage(this.confirmedStorageKey) as string | null;
+            if (!raw) return;
+            const parsed = JSON.parse(raw) as unknown;
+            if (!Array.isArray(parsed)) return;
+            for (const path of parsed) {
+                if (typeof path === "string" && this.syncHashMap.has(path)) this.confirmedPaths.add(path);
+            }
+        } catch (error) {
+            dump("ConfigHashManager: failed to load confirmed baseline provenance", error);
+        }
+    }
+
+    private saveSyncToStorage(): void {
+        let data: string;
+        try {
+            data = JSON.stringify(Object.fromEntries(this.syncHashMap));
+        } catch (error) {
+            dump("ConfigHashManager: failed to serialize sync baseline", error);
+            return;
+        }
+        try {
+            this.plugin.app.saveLocalStorage(this.syncStorageKey, data);
+            this.plugin.app.saveLocalStorage(this.confirmedStorageKey, JSON.stringify(Array.from(this.confirmedPaths)));
+        } catch (error) {
+            dump("ConfigHashManager: failed to save sync baseline to localStorage", error);
+        }
+        this.syncMirror.scheduleWrite(data);
     }
 
     /**
@@ -381,6 +481,7 @@ export class ConfigHashManager {
 
         // 即使 localStorage 写入失败 (如配额)，镜像写入也照常进行
         this.mirror.scheduleWrite(data);
+        this.saveSyncToStorage();
     }
 
     /**
@@ -389,8 +490,11 @@ export class ConfigHashManager {
      */
     async rebuildHashMap(): Promise<void> {
         dump("ConfigHashManager: manual config hash map rebuild");
-        this.clearAll();
+        // 只重建磁盘缓存；手动重建不是服务端确认，不能据此生成可信基线
+        // Rebuild only the disk cache; a manual rebuild is not server confirmation.
+        this.hashMap.clear();
         await this.buildConfigHashMap();
+        this.scheduleSave();
     }
 
     /**
@@ -398,6 +502,8 @@ export class ConfigHashManager {
      */
     clearAll(): void {
         this.hashMap.clear();
+        this.syncHashMap.clear();
+        this.confirmedPaths.clear();
         this.saveToStorage();
     }
 
@@ -410,6 +516,8 @@ export class ConfigHashManager {
         for (const path of this.hashMap.keys()) {
             if (configIsPathExcluded(path, this.plugin)) {
                 this.hashMap.delete(path);
+                this.syncHashMap.delete(path);
+                this.confirmedPaths.delete(path);
                 deletedCount++;
             }
         }

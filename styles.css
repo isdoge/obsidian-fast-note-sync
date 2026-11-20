@@ -771,6 +771,17 @@
   font-size: 12px;
   background: var(--background-secondary-alt);
 }
+.conflict-resolve-diff-wrap .conflict-diff-col .conflict-diff-content .conflict-diff-skipped {
+  padding: 16px 12px;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-family: var(--font-interface);
+  line-height: 1.6;
+  text-align: center;
+  border: 1px dashed var(--background-modifier-border);
+  border-radius: 6px;
+  margin: 8px 4px;
+}
 .conflict-resolve-diff-wrap .conflict-diff-col .conflict-diff-content .history-detail-line {
   display: flex;
   align-items: center;
@@ -3578,6 +3589,69 @@ body .suggestion-container {
   background: var(--background-modifier-hover);
 }
 
+/* 阶段 B：待对齐条目的批量操作面板 / Stage B: batch alignment panel for pending entries */
+.fns-conflict-batch-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 8px 0 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary);
+}
+
+.fns-conflict-batch-info {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.85em;
+  color: var(--text-muted);
+}
+
+.fns-conflict-batch-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.fns-conflict-batch-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  font-size: 0.85em;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.fns-conflict-batch-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.fns-conflict-unaligned-tag {
+  display: inline-block;
+  margin-top: 2px;
+  font-size: 0.78em;
+  color: var(--text-warning);
+}
+
+.conflict-resolve-desc-base-missing {
+  border-left: 3px solid var(--text-warning);
+  padding-left: 8px;
+}
+
+.conflict-resolve-base-missing-badge {
+  display: inline-block;
+  margin: 0 0 8px 8px;
+  padding: 2px 8px;
+  font-size: 0.8em;
+  border-radius: 10px;
+  color: var(--text-warning);
+  background: var(--background-modifier-hover);
+}
+
 .fns-ws-clients-item-bottom {
   display: flex;
   align-items: center;
@@ -4926,5 +5000,3 @@ body .suggestion-container {
 .fns-clickable {
   cursor: pointer;
 }
-
-/*# sourceMappingURL=styles.css.map */
