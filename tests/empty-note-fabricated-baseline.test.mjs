@@ -58,12 +58,16 @@ const { FileHashManager } = loadModule("src/lib/storage/file_hash_manager.ts", (
   if (id === "../utils/helpers") return helpers;
   if (id === "../../i18n/lang") return { $: (k) => k };
   if (id === "../../main") return {};
-  throw new Error(`Unexpected require in file_hash_manager: ${id}`);
+  if (id.includes("baseline_scope")) return { buildBaselineFields: (plugin, kind, path) => { if (kind === "folder" || !plugin) return {}; const m = kind === "setting" ? plugin.configHashManager : plugin.fileHashManager; const b = m && typeof m.getPathHash === "function" ? m.getPathHash(path) : null; return b !== null && b !== undefined ? { baseHash: b } : { baseHashMissing: true }; }, buildDeleteBaselineFields: () => ({}), baselineFieldsFromDeleteRecord: () => ({}), computeRemoteScope: () => "scope", parseScopedState: () => ({ state: { scope: "scope", revisions: {}, pendingDeletes: {} }, scopeChanged: false }), serializeScopedState: (state) => JSON.stringify(state) };
+    if (id.includes("conflict_store")) return { storeSyncConflict: async () => false, normalizeConflict: () => null, conflictKindToSyncType: () => "note", conflictReasonLabel: () => "", conflictKindLabel: () => "" };
+    throw new Error(`Unexpected require in file_hash_manager: ${id}`);
 });
 
-// New install: no saved state at all. Local vault already has files (the daily-note case):
-// an empty today.md and a non-empty real.md. initialize() must build the local cache and
-// migrate a baseline ONLY for the non-empty file.
+// Stage B: the startup scan only fills the disk-hash cache. It must never fabricate a trusted
+// sync baseline, not even for a non-empty file: an existing vault attaching to a same-named
+// remote vault would otherwise treat its local bytes as "already synced" and let the first
+// remote modify overwrite it. Empty files still get no baseline either (#205).
+// Stage B：启动扫描只填磁盘缓存，任何文件都不伪造可信基线；空文件同样不伪造（#205）。
 {
   const ls = new Map();
   const files = new Map();
@@ -96,12 +100,13 @@ const { FileHashManager } = loadModule("src/lib/storage/file_hash_manager.ts", (
   const mgr = new FileHashManager(plugin);
   await mgr.initialize();
   mgr.flush();
-  assert.equal(mgr.getPathHash("diary/real.md") !== null, true, "non-empty note gets a fabricated baseline (upgrade/new users unchanged)");
+  assert.equal(mgr.getPathHash("diary/real.md"), null, "startup scan never fabricates a trusted baseline (stage B)");
   assert.equal(mgr.getPathHash("diary/today.md"), null, "empty note gets NO fabricated baseline (#205)");
+  assert.notEqual(mgr.getValidHash("diary/real.md", 1, 9), null, "the disk-hash cache is still populated for performance");
 }
 
-// Upgrade user: hashMap pre-populated (old version data), no syncHashMap. Non-empty entries
-// migrate; an empty entry does not.
+// Upgrade user: hashMap pre-populated (old version data), no syncHashMap. Stage B never
+// promotes the legacy cache into trusted baselines.
 {
   const ls = new Map(), files = new Map();
   ls.set("fns-fileHashMap", JSON.stringify({
@@ -122,7 +127,7 @@ const { FileHashManager } = loadModule("src/lib/storage/file_hash_manager.ts", (
   };
   const mgr = new FileHashManager(plugin);
   await mgr.initialize();
-  assert.equal(mgr.getPathHash("a/old.md"), "h1", "upgrade: non-empty entry migrated");
+  assert.equal(mgr.getPathHash("a/old.md"), null, "upgrade: legacy cache is not promoted to a trusted baseline");
   assert.equal(mgr.getPathHash("a/blank.md"), null, "upgrade: empty entry not migrated");
 }
 
@@ -132,6 +137,8 @@ const { FileHashManager } = loadModule("src/lib/storage/file_hash_manager.ts", (
 {
   class TFile { constructor(p) { this.path = p; this.stat = { size: 0, mtime: 5, ctime: 1 }; } }
   const ops = loadModule("src/lib/sync/operator_note.ts", (id) => {
+    if (id.includes("baseline_scope")) return { buildBaselineFields: (plugin, kind, path) => { if (kind === "folder" || !plugin) return {}; const m = kind === "setting" ? plugin.configHashManager : plugin.fileHashManager; const b = m && typeof m.getPathHash === "function" ? m.getPathHash(path) : null; return b !== null && b !== undefined ? { baseHash: b } : { baseHashMissing: true }; }, buildDeleteBaselineFields: () => ({}), baselineFieldsFromDeleteRecord: () => ({}), computeRemoteScope: () => "scope", parseScopedState: () => ({ state: { scope: "scope", revisions: {}, pendingDeletes: {} }, scopeChanged: false }), serializeScopedState: (state) => JSON.stringify(state) };
+    if (id.includes("conflict_store")) return { storeSyncConflict: async () => false, normalizeConflict: () => null, conflictKindToSyncType: () => "note", conflictReasonLabel: () => "", conflictKindLabel: () => "" };
     if (id === "obsidian") return { TFile, normalizePath: (p) => p, Platform: { isMobile: false } };
     if (id === "../utils/helpers") return new Proxy({ isPathExcluded: () => false, hashContent: (s) => `h${s.length}`, hashContentAsync: async (s) => `h${s.length}`, getPluginDir: () => "" }, { get: (t, n) => t[n] ?? (() => false) });
     if (id === "./remote_path_guard") return { blockAliasedRemoteMutation: () => false };
@@ -184,6 +191,8 @@ const { FileHashManager } = loadModule("src/lib/storage/file_hash_manager.ts", (
 {
   class TFile { constructor(p) { this.path = p; this.stat = { size: 0, mtime: 5, ctime: 1 }; } }
   const ops = loadModule("src/lib/sync/operator_note.ts", (id) => {
+    if (id.includes("baseline_scope")) return { buildBaselineFields: (plugin, kind, path) => { if (kind === "folder" || !plugin) return {}; const m = kind === "setting" ? plugin.configHashManager : plugin.fileHashManager; const b = m && typeof m.getPathHash === "function" ? m.getPathHash(path) : null; return b !== null && b !== undefined ? { baseHash: b } : { baseHashMissing: true }; }, buildDeleteBaselineFields: () => ({}), baselineFieldsFromDeleteRecord: () => ({}), computeRemoteScope: () => "scope", parseScopedState: () => ({ state: { scope: "scope", revisions: {}, pendingDeletes: {} }, scopeChanged: false }), serializeScopedState: (state) => JSON.stringify(state) };
+    if (id.includes("conflict_store")) return { storeSyncConflict: async () => false, normalizeConflict: () => null, conflictKindToSyncType: () => "note", conflictReasonLabel: () => "", conflictKindLabel: () => "" };
     if (id === "obsidian") return { TFile, normalizePath: (p) => p, Platform: { isMobile: false } };
     if (id === "../utils/helpers") return new Proxy({ isPathExcluded: () => false, hashContent: (s) => `h${s.length}`, hashContentAsync: async (s) => `h${s.length}`, getPluginDir: () => "" }, { get: (t, n) => t[n] ?? (() => false) });
     if (id === "./remote_path_guard") return { blockAliasedRemoteMutation: () => false };

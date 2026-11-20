@@ -29,28 +29,33 @@ const helpers = new Proxy({ configIsPathExcluded: p => p.includes('/excluded/'),
   hashFileAsync: async () => 'dictionary-hash', hashContent: text => `hash:${text}`,
   getSafeCtime: stat => stat.mtime,
 }, { get: (t, k) => t[k] ?? noop });
-function load(name) {
-  if (cache.has(name)) return cache.get(name);
+function transpile(relPath, requireImpl) {
   const module = { exports: {} };
-  const code = ts.transpileModule(fs.readFileSync(`src/lib/sync/${name}.ts`, 'utf8'), {
+  const code = ts.transpileModule(fs.readFileSync(relPath, 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }
   }).outputText;
-  vm.runInNewContext(code, { module, exports: module.exports, console, TextDecoder,
-    window: { setTimeout: () => 1, clearTimeout: noop },
-    require: id => id === 'obsidian' ? { normalizePath: p => p }
+  vm.runInNewContext(code, { module, exports: module.exports, console, TextDecoder, TextEncoder,
+    window: { setTimeout: () => 1, clearTimeout: noop }, require: requireImpl });
+  return module.exports;
+}
+const codec = transpile('src/lib/utils/config_codec.ts', () => ({}));
+function load(name) {
+  if (cache.has(name)) return cache.get(name);
+  const exportsObj = transpile(`src/lib/sync/${name}.ts`, id => id === 'obsidian' ? { normalizePath: p => p }
       : id.includes('helpers') ? helpers
+      : id.includes('config_codec') ? codec
       : id === './operator_config' ? load('operator_config')
       : id.includes('sync_log_manager') ? { SyncLogManager: { getInstance: () => ({ addLog: noop }) } }
       : id.includes('sync_state') ? { advanceLiveSyncTime: (plugin, field, lastTime) => { if (lastTime && lastTime > Number(plugin.localStorageManager.getMetadata(field))) plugin.localStorageManager.setMetadata(field, lastTime); } }
-      : id.includes('i18n') ? { $: p => p } : {} });
-  cache.set(name, module.exports);
-  return module.exports;
+      : id.includes('i18n') ? { $: p => p } : id.includes("baseline_scope") ? { buildBaselineFields: (plugin, kind, path) => { if (kind === "folder" || !plugin) return {}; const m = kind === "setting" ? plugin.configHashManager : plugin.fileHashManager; const b = m && typeof m.getPathHash === "function" ? m.getPathHash(path) : null; return b !== null && b !== undefined ? { baseHash: b } : { baseHashMissing: true }; }, buildDeleteBaselineFields: () => ({}), baselineFieldsFromDeleteRecord: () => ({}), computeRemoteScope: () => "scope", parseScopedState: () => ({ state: { scope: "scope", revisions: {}, pendingDeletes: {} }, scopeChanged: false }), serializeScopedState: (state) => JSON.stringify(state) } : id.includes("conflict_store") ? { storeSyncConflict: async () => false, normalizeConflict: () => null, conflictKindToSyncType: () => "note", conflictReasonLabel: () => "", conflictKindLabel: () => "" } : {});
+  cache.set(name, exportsObj);
+  return exportsObj;
 }
 const ops = load('operator_config');
 const plugin = { settings: { configSyncEnabled: true }, app: { vault: { configDir, adapter } } };
-const expected = files.slice(0, 6);
+const expected = files.slice(0, 7);
 const paths = await ops.configAllPaths([configDir], plugin);
-assert.deepEqual([...paths].sort(), [...expected].sort(), 'recursively scan dictionary/text resources, excluding binary and generated directories');
+assert.deepEqual([...paths].sort(), [...expected].sort(), 'recursively scan text/font/image resources, excluding generated directories');
 const manager = Object.create(load('config_manager').ConfigManager.prototype);
 manager.plugin = plugin;
 manager.pluginExtsToWatch = ops.CONFIG_PLUGIN_EXTS_TO_WATCH;

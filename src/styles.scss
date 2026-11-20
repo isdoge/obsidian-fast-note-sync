@@ -3781,6 +3781,69 @@ body .suggestion-container {
   background: var(--background-modifier-hover);
 }
 
+/* 阶段 B：待对齐条目的批量操作面板 / Stage B: batch alignment panel for pending entries */
+.fns-conflict-batch-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 8px 0 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary);
+}
+
+.fns-conflict-batch-info {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.85em;
+  color: var(--text-muted);
+}
+
+.fns-conflict-batch-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.fns-conflict-batch-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  font-size: 0.85em;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.fns-conflict-batch-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.fns-conflict-unaligned-tag {
+  display: inline-block;
+  margin-top: 2px;
+  font-size: 0.78em;
+  color: var(--text-warning);
+}
+
+.conflict-resolve-desc-base-missing {
+  border-left: 3px solid var(--text-warning);
+  padding-left: 8px;
+}
+
+.conflict-resolve-base-missing-badge {
+  display: inline-block;
+  margin: 0 0 8px 8px;
+  padding: 2px 8px;
+  font-size: 0.8em;
+  border-radius: 10px;
+  color: var(--text-warning);
+  background: var(--background-modifier-hover);
+}
+
 .fns-ws-clients-item-bottom {
   display: flex;
   align-items: center;
@@ -5268,4 +5331,216 @@ body .suggestion-container {
 
 .fns-clickable {
   cursor: pointer;
+}
+
+/* ===== Firefly 博客弹窗 / Firefly blog modals ===== */
+.fns-firefly-modal {
+  .modal-content {
+    padding: 10px 20px 20px;
+  }
+}
+
+.fns-firefly-file-badge {
+  display: inline-block;
+  max-width: 100%;
+  margin-bottom: 12px;
+  padding: 4px 10px;
+  border: 1px solid var(--background-modifier-border-faint);
+  border-radius: 14px;
+  background-color: var(--background-secondary);
+  color: var(--text-muted);
+  font-size: 0.8em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fns-firefly-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.fns-firefly-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background-color: var(--background-secondary);
+}
+
+.fns-firefly-section-title {
+  margin-bottom: 2px;
+  color: var(--text-muted);
+  font-size: 0.8em;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.fns-firefly-slug-input {
+  min-width: 260px;
+  font-family: var(--font-monospace);
+  font-size: 0.85em;
+}
+
+.fns-firefly-custom-category {
+  max-width: 140px;
+}
+
+.fns-firefly-cover-select {
+  margin: 4px 0 8px;
+}
+
+.fns-firefly-cover-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.fns-firefly-cover-preview {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-muted);
+  font-size: 0.8em;
+
+  img {
+    width: 120px;
+    height: 68px;
+    border-radius: 6px;
+    border: 1px solid var(--background-modifier-border);
+    object-fit: cover;
+  }
+}
+
+.fns-firefly-check {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+}
+
+.fns-firefly-check-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+
+  &.is-ok {
+    color: var(--text-success);
+  }
+
+  &.is-error {
+    color: var(--text-error);
+  }
+}
+
+.fns-firefly-issue-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+
+  &.is-error .fns-firefly-issue-dot {
+    background-color: var(--text-error);
+  }
+
+  &.is-fixable .fns-firefly-issue-dot {
+    background-color: var(--text-warning);
+  }
+
+  &.is-warning .fns-firefly-issue-dot {
+    background-color: var(--text-muted);
+  }
+}
+
+.fns-firefly-issue-title {
+  color: var(--text-muted);
+  font-size: 0.8em;
+  font-weight: 600;
+}
+
+.fns-firefly-issue {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 0.85em;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.fns-firefly-issue-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  margin-top: 0.5em;
+  border-radius: 50%;
+}
+
+.fns-firefly-check-actions,
+.fns-firefly-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.fns-firefly-receipt {
+  flex: 1 1 100%;
+  margin-bottom: 4px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background-color: var(--background-secondary);
+  color: var(--text-muted);
+  font-size: 0.8em;
+  overflow-wrap: anywhere;
+}
+
+.fns-firefly-image-search {
+  width: 100%;
+  margin-bottom: 10px;
+}
+
+.fns-firefly-image-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 10px;
+  max-height: 55vh;
+  overflow-y: auto;
+}
+
+.fns-firefly-image-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.75em;
+  color: var(--text-muted);
+
+  &:hover {
+    border-color: var(--interactive-accent);
+  }
+
+  img {
+    width: 100%;
+    height: 72px;
+    border-radius: 4px;
+    object-fit: cover;
+  }
+
+  span {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 }

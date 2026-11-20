@@ -6,6 +6,7 @@ import { folderModify, folderDelete, folderRename } from "../sync/operator_folde
 import { NoteHistoryModal } from "../../views/note-history/history-modal";
 import { dump, isPathInConfigSyncDirs, isPathExcluded, isFolderSyncPathExcluded } from "./helpers";
 import { ShareModal } from "../../views/share-modal";
+import { FireflyPostModal, CheckFireflyPostModal, triggerFireflyPublish } from "../../views/firefly-post-modal";
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
 
@@ -477,5 +478,34 @@ export class EventManager {
         })
     })
 
+    // Firefly 博客快捷项（可在设置里关闭，默认开启）/ Firefly blog shortcuts (toggleable, on by default)
+    if (file instanceof TFile && this.plugin.settings.fireflyMenuEnabled !== false) {
+      const mdFile = file
+      menu.addSeparator()
+      menu.addItem((item: MenuItem) => {
+        item
+          .setTitle($("ui.firefly.menu_edit_meta"))
+          .setIcon("feather")
+          .onClick(() => {
+            new FireflyPostModal(this.plugin.app, this.plugin, mdFile).open()
+          })
+      })
+      menu.addItem((item: MenuItem) => {
+        item
+          .setTitle($("ui.firefly.menu_check_post"))
+          .setIcon("shield-check")
+          .onClick(() => {
+            new CheckFireflyPostModal(this.plugin.app, this.plugin, mdFile).open()
+          })
+      })
+      menu.addItem((item: MenuItem) => {
+        item
+          .setTitle($("ui.firefly.menu_trigger_publish"))
+          .setIcon("send")
+          .onClick(() => {
+            void triggerFireflyPublish(this.plugin)
+          })
+      })
+    }
   }
 }

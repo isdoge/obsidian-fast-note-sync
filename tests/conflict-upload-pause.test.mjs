@@ -23,7 +23,9 @@ function load(name, extra = {}) {
   vm.runInNewContext(code, {
     module, exports: module.exports, console, window: { setTimeout: () => 1, clearTimeout() {} },
     require(id) {
-      if (id === "obsidian") return { TFile, TFolder: class {}, normalizePath: p => p, Platform: { isMobile: false } };
+      if (id.includes("baseline_scope")) return { buildBaselineFields: (plugin, kind, path) => { if (kind === "folder" || !plugin) return {}; const m = kind === "setting" ? plugin.configHashManager : plugin.fileHashManager; const b = m && typeof m.getPathHash === "function" ? m.getPathHash(path) : null; return b !== null && b !== undefined ? { baseHash: b } : { baseHashMissing: true }; }, buildDeleteBaselineFields: () => ({}), baselineFieldsFromDeleteRecord: () => ({}), computeRemoteScope: () => "scope", parseScopedState: () => ({ state: { scope: "scope", revisions: {}, pendingDeletes: {} }, scopeChanged: false }), serializeScopedState: (state) => JSON.stringify(state) };
+    if (id.includes("conflict_store")) return { storeSyncConflict: async () => false, normalizeConflict: () => null, conflictKindToSyncType: () => "note", conflictReasonLabel: () => "", conflictKindLabel: () => "" };
+          if (id === "obsidian") return { TFile, TFolder: class {}, normalizePath: p => p, Platform: { isMobile: false } };
       if (id === "../utils/helpers") return helpers;
       if (id.includes("sync_log_manager")) return { SyncLogManager: { getInstance: () => ({ addLog: (...a) => logs.push(a), addOrUpdateLog() {} }) } };
       if (id.includes("i18n")) return { $: k => k };

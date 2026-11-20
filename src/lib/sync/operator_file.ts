@@ -9,6 +9,7 @@ import { SyncLogManager } from "./sync_log_manager";
 import { advanceLiveSyncTime } from "./sync_state";
 import { HttpApiService } from "../api/http_api_service";
 import type FastSync from "../../main";
+import { BaselineDeleteRecord, baselineFieldsFromDeleteRecord, buildBaselineFields, buildDeleteBaselineFields } from "../storage/baseline_scope";
 
 
 // Download commit guard. A download may only overwrite the local path if, at commit time, it is
@@ -397,6 +398,23 @@ export const clearAllTempChunks = async (plugin: FastSync) => {
   }
 }
 
+/**
+ * 冲突（530 / SyncConflict）冻结某条附件时，取消其分片上传并清掉 60s 回执超时定时器：
+ * 否则 recoverUpload 到期会把冲突附件当“回执丢失”自动重传，反复撞 530。
+ * Cancel an attachment's chunk upload and its 60s ack timeout when a conflict (530 / SyncConflict)
+ * freezes the path; otherwise recoverUpload would treat it as a lost ack and retry the conflicting
+ * upload on its own.
+ */
+export const clearUploadTrackingForConflict = (path: string): void => {
+  const active = activeUploadsMap.get(path)
+  if (active) active.cancelled = true
+  clearUploadTracking(path)
+  uploadRetries.delete(path)
+  uploadContexts.delete(path)
+  sentUploadContent.delete(path)
+  ambiguousUploadAcks.delete(path)
+}
+
 export const clearUploadQueue = () => {
   for (const timer of uploadAckTimers.values()) window.clearTimeout(timer)
   for (const state of activeUploadsMap.values()) state.cancelled = true
@@ -434,12 +452,18 @@ export const BINARY_PREFIX_FILE_SYNC = "00"
 /**
  * 文件（非笔记）修改事件处理
  */
-export const fileModify = async function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false, forceCheck = false) {
+export const fileModify = async function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false, forceCheck = false, options?: { isConflictResolved?: boolean; baseRevision?: string }) {
   if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
   if (!(file instanceof TFile)) return
   if (file.path.endsWith(".md")) return
   if (eventEnter && plugin.isIgnoredFile(file.path)) return
   if (isPathExcluded(file.path, plugin)) return
+  // 冲突冻结的附件不响应实时写（已解决的提交除外）
+  // A frozen conflicted attachment ignores live writes (resolved submits excepted)
+  if (plugin.syncState?.conflictedPaths?.has(file.path) && !options?.isConflictResolved) {
+    dump(`File modify paused, unresolved conflict: ${file.path}`)
+    return
+  }
 
   if (isLargeBinarySyncRisk(file.stat.size, plugin)) {
     dump(`Skip file modify for large attachment (${describeBinarySyncLimit(plugin)} limit): ${file.path}`, file.stat.size)
@@ -484,8 +508,9 @@ export const fileModify = async function (file: TAbstractFile, plugin: FastSync,
         mtime: file.stat.mtime,
         ctime: getSafeCtime(file.stat),
         size: file.stat.size,
-        // 始终传递 baseHash 信息，如果不可用则标记 baseHashMissing
-        ...(baseHash !== null ? { baseHash } : { baseHashMissing: true }),
+        ...buildBaselineFields(plugin, "file", file.path, contentHash),
+        ...(options?.baseRevision ? { baseRevision: options.baseRevision } : {}),
+        ...(options?.isConflictResolved ? { isConflictResolved: true } : {}),
       }
       // 将 hash 暂存到 pending map，等待服务端 FileUploadAck 后再写入 hashManager
       // Temporarily store hash in pending map, update hashManager only after server FileUploadAck
@@ -543,6 +568,11 @@ export const fileDelete = async function (file: TAbstractFile, plugin: FastSync,
     dump(`File delete intercepted: ${file.path}`)
     return
   }
+  // 冲突冻结的附件不自动上传删除 / A frozen conflicted attachment never auto-uploads a deletion
+  if (plugin.syncState?.conflictedPaths?.has(file.path)) {
+    dump(`File delete paused, unresolved conflict: ${file.path}`)
+    return
+  }
 
   await plugin.lockManager.withLock(file.path, async () => {
     // 如果该文件正在上传或在队列中，则标记为取消，且不再发送服务端删除消息
@@ -564,10 +594,13 @@ export const fileDelete = async function (file: TAbstractFile, plugin: FastSync,
 
     plugin.addIgnoredFile(file.path)
     try {
+      // 删除前快照最后确认的基线 / Snapshot the last confirmed baseline before deletion
+      if (plugin.isSyncBaselineModeEnabled?.() === true) plugin.fileHashManager.recordPendingDeleteBaseline?.(file.path)
       const data = {
         vault: plugin.settings.vault,
         path: file.path,
         pathHash: hashContent(file.path),
+        ...buildDeleteBaselineFields(plugin, "file", file.path),
       }
       if (!await plugin.concurrencyLimiter.waitForSlot(file.path)) return
       await plugin.websocket.SendMessage("FileDelete", data, undefined, () => {
@@ -586,7 +619,7 @@ export const fileDelete = async function (file: TAbstractFile, plugin: FastSync,
  * 按路径字符串发送文件删除消息（用于无法获取 TFile 对象的场景，如 rename 后旧路径已不存在）
  * Send file delete message by path string (for scenarios where TFile object is unavailable, e.g., old path after rename)
  */
-export const fileDeleteByPath = async function (filePath: string, plugin: FastSync, retryGuard?: () => boolean) {
+export const fileDeleteByPath = async function (filePath: string, plugin: FastSync, retryGuard?: () => boolean, explicitBaseline?: BaselineDeleteRecord) {
   if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
   if (filePath.endsWith(".md")) return
   if (isPathExcluded(filePath, plugin)) return
@@ -613,12 +646,14 @@ export const fileDeleteByPath = async function (filePath: string, plugin: FastSy
 
     plugin.addIgnoredFile(filePath)
     try {
+      if (plugin.isSyncBaselineModeEnabled?.() === true) plugin.fileHashManager.recordPendingDeleteBaseline?.(filePath)
       if (!await plugin.concurrencyLimiter.waitForSlot(filePath)) return
       if (retryGuard && !retryGuard()) { plugin.concurrencyLimiter.releaseSlot(filePath); return }
       await plugin.websocket.SendMessage("FileDelete", {
         vault: plugin.settings.vault,
         path: filePath,
         pathHash: hashContent(filePath),
+        ...(explicitBaseline ? baselineFieldsFromDeleteRecord(explicitBaseline) : buildDeleteBaselineFields(plugin, "file", filePath)),
       }, () => retryGuard ? !retryGuard() : false, () => {
         // 消息真正写入 TCP 缓冲区后加入 pending set，等待 FileDeleteAck 再删 hash
         // Add to pending set only after message is actually buffered; remove hash only on FileDeleteAck
@@ -634,7 +669,7 @@ export const fileDeleteByPath = async function (filePath: string, plugin: FastSy
 /**
  * 文件重命名事件处理
  */
-export const fileRename = async function (file: TAbstractFile, oldfile: string, plugin: FastSync, eventEnter: boolean = false, retryGuard?: () => boolean, retryBaselineHash?: string) {
+export const fileRename = async function (file: TAbstractFile, oldfile: string, plugin: FastSync, eventEnter: boolean = false, retryGuard?: () => boolean, retryBaselineHash?: string, retryBaselineRevision?: string) {
   if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
   if (file.path.endsWith(".md")) return
   if (plugin.isIgnoredFile(file.path) && eventEnter) return
@@ -667,6 +702,21 @@ export const fileRename = async function (file: TAbstractFile, oldfile: string, 
   if (plugin.lastSyncPathRenamed.has(file.path)) {
     dump(`File rename intercepted: ${file.path}`)
     return
+  }
+
+  // 基线模式（设计稿 §2.4）：先确保目标上传成功，再对源路径条件删除；旧模式保持原生 rename
+  // Baseline mode (§2.4): upload the target first, then conditionally delete the source;
+  // compatibility mode keeps the native rename
+  if (plugin.isSyncBaselineModeEnabled?.()) {
+    if (retryGuard && !retryGuard()) return;
+    const sourceHasBaseline = plugin.fileHashManager.getPathHash(oldfile) !== null;
+    await fileModify(file, plugin, true, true);
+    const explicit = retryBaselineHash !== undefined
+      ? { hash: retryBaselineHash, hashMissing: false, revision: retryBaselineRevision || "" } as BaselineDeleteRecord
+      : undefined;
+    if (sourceHasBaseline || explicit) await fileDeleteByPath(oldfile, plugin, undefined, explicit);
+    dump(`File rename converted to create-then-conditional-delete`, oldfile, file.path, sourceHasBaseline);
+    return;
   }
 
   await plugin.lockManager.withLock(file.path, async () => {
@@ -1127,6 +1177,7 @@ export const receiveFileSyncUpdate = async function (data: ReceiveFileSyncUpdate
       commitGuard: captureDownloadGuard(plugin, data.path),
       path: data.path,
       contentHash: data.contentHash,
+      revision: data.revision,
       ctime: normalizeServerTimestamp(data.ctime),
       mtime: normalizeServerTimestamp(data.mtime),
       lastTime: data.lastTime,
@@ -1275,9 +1326,20 @@ export const receiveFileSyncMtime = async function (data: ReceiveMtimeMessage, p
         return
       }
       const content = await plugin.app.vault.readBinary(file)
+      // 内容一致确认：本地仍是消息内容时才建立可信基线（设计稿 §5.2 第 3 条）
+      // Content-equality confirmation: only when the local bytes are still the message content
+      const msgHash = typeof data.contentHash === "string" && data.contentHash !== "" ? data.contentHash : "";
+      const revision = typeof data.revision === "string" && data.revision !== "" ? data.revision : "";
+      const confirmable = msgHash !== "" && revision !== ""
+        && (typeof plugin.fileHashManager.setConfirmedBaseline !== "function"
+          || (await hashArrayBuffer(content)) === msgHash)
+        && typeof plugin.fileHashManager.setConfirmedBaseline === "function"
       plugin.addIgnoredFile(normalizedPath)
       try {
         await plugin.app.vault.modifyBinary(file, content, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
+        if (confirmable) {
+          plugin.fileHashManager.setConfirmedBaseline?.(data.path, msgHash, revision, mtime || 0, file.stat.size)
+        }
         const pendingHash = plugin.pendingUploadHashes.get(data.path)
         if (pendingHash !== undefined) {
           plugin.fileHashManager.setFileHash(data.path, pendingHash, mtime || 0, file.stat.size)
@@ -1346,6 +1408,7 @@ export const receiveFileSyncChunkDownload = async function (data: FileSyncChunkD
     commitGuard: tempSession.commitGuard,
     path: data.path,
     contentHash: data.contentHash,
+    revision: data.revision,
     ctime: normalizeServerTimestamp(data.ctime),
     mtime: normalizeServerTimestamp(data.mtime),
     lastTime: tempSession.lastTime,
@@ -1585,7 +1648,7 @@ export const handleFileChunkDownload = async function (buf: ArrayBuffer | Blob, 
 /**
  * 接收服务端文件重命名通知
  */
-export const receiveFileSyncRename = async function (data: { oldPath: string; path: string; mtime?: number; ctime?: number; contentHash?: string; lastTime?: number; size?: number; pathHash?: string; pageIndex?: number }, plugin: FastSync) {
+export const receiveFileSyncRename = async function (data: { oldPath: string; path: string; mtime?: number; ctime?: number; contentHash?: string; lastTime?: number; size?: number; pathHash?: string; pageIndex?: number; revision?: string }, plugin: FastSync) {
   if (plugin.settings.syncEnabled == false) return
 
     if (isPathExcluded(data.path, plugin) || isPathExcluded(data.oldPath, plugin)) {
@@ -1859,7 +1922,11 @@ const handleFileChunkDownloadComplete = async function (session: FileDownloadSes
       } else {
         dump(`Download complete: using server provided hash: ${session.path}`, contentHash)
       }
-      plugin.fileHashManager.setFileHash(session.path, contentHash, session.mtime, session.size)
+      if (session.revision && plugin.fileHashManager.setConfirmedBaseline) {
+        plugin.fileHashManager.setConfirmedBaseline(session.path, contentHash, session.revision, session.mtime, session.size)
+      } else {
+        plugin.fileHashManager.setFileHash(session.path, contentHash, session.mtime, session.size)
+      }
       // 记录同步后的 mtime
       plugin.lastSyncMtime.set(session.path, session.mtime)
       dump(`Download complete and hash updated for: ${session.path}`, contentHash)
@@ -1930,7 +1997,7 @@ export const receiveFileRenameAck = function (data: { lastTime?: number; path?: 
 
 // 收到 FileUploadAck，将 pending hash 转移到正式 hashManager 并更新 lastFileSyncTime
 // Receive FileUploadAck, move pending hash to formal hashManager and update lastFileSyncTime
-export const receiveFileUploadAck = async function (data: { lastTime?: number; path?: string; pathHash?: string }, plugin: FastSync, outsideRound = false) {
+export const receiveFileUploadAck = async function (data: { lastTime?: number; path?: string; pathHash?: string; contentHash?: string; revision?: string }, plugin: FastSync, outsideRound = false) {
   // 服务端确认上传成功，将 pending hash 转移到正式 hashManager
   // Server confirmed upload success, move pending hash to formal hashManager
   if (data.path) {
@@ -1959,11 +2026,38 @@ export const receiveFileUploadAck = async function (data: { lastTime?: number; p
     uploadRetries.delete(data.path)
     uploadContexts.delete(data.path)
     if (sent && !ambiguousUploadAcks.has(data.path)) {
-      // Cache the stat captured with the sent content, never today's edited file stat.
-      plugin.fileHashManager.setFileHash(data.path, sent.hash, sent.mtime, sent.size)
-      if (plugin.pendingUploadHashes.get(data.path) === sent.hash) {
-        plugin.pendingUploadHashes.delete(data.path)
-        plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes)
+      // 基线模式：只确认发送时的快照哈希 + 服务端 revision；上传途中被继续编辑时，
+      // 当前磁盘内容绝不标为已同步，并立即安排携带新基线的后续上传（设计稿 §5.2）
+      // Baseline mode: confirm only the sent snapshot hash + the server revision. If the file was
+      // edited during the upload, never mark the current bytes as synced; schedule a follow-up
+      // upload carrying the new baseline.
+      const ackHash = typeof data.contentHash === "string" && data.contentHash !== "" ? data.contentHash : sent.hash
+      const revision = typeof data.revision === "string" ? data.revision : ""
+      const baselineMode = plugin.isSyncBaselineModeEnabled?.() === true
+      if (baselineMode && plugin.fileHashManager.setConfirmedBaseline) {
+        let diskHash: string | null = null
+        try { diskHash = await hashFileAsync(plugin.app, normalizePath(data.path)) } catch { diskHash = null }
+        plugin.fileHashManager.setConfirmedBaseline(data.path, ackHash, revision, sent.mtime, sent.size, diskHash === ackHash)
+        if (plugin.pendingUploadHashes.get(data.path) === ackHash) {
+          plugin.pendingUploadHashes.delete(data.path)
+          plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes)
+        }
+        if (diskHash !== null && diskHash !== ackHash) {
+          dump(`[Baseline] File Ack confirmed ${ackHash}, disk changed to ${diskHash}; scheduling follow-up upload`, data.path)
+          plugin.pendingUploadHashes.set(data.path, diskHash)
+          plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes)
+          window.setTimeout(() => {
+            const current = plugin.app.vault.getFileByPath(normalizePath(data.path as string))
+            if (current) void fileModify(current, plugin, false, true)
+          }, 0)
+        }
+      } else {
+        // Cache the stat captured with the sent content, never today's edited file stat.
+        plugin.fileHashManager.setFileHash(data.path, sent.hash, sent.mtime, sent.size)
+        if (plugin.pendingUploadHashes.get(data.path) === sent.hash) {
+          plugin.pendingUploadHashes.delete(data.path)
+          plugin.localStorageManager.savePending('pendingUploadHashes', plugin.pendingUploadHashes)
+        }
       }
     }
     sentUploadContent.delete(data.path)
@@ -1991,6 +2085,11 @@ export const receiveFileUploadAck = async function (data: { lastTime?: number; p
 // Receive FileDeleteAck; only remove from hashManager if path is still pending
 export const receiveFileDeleteAck = function (data: { lastTime?: number; path?: string }, plugin: FastSync) {
   const retryAck = plugin.retryQueue?.matchesAck("FileDeleteAck", data.path) ?? false
+  if (data.path) {
+    // 删除已确认：清除待删基线记录
+    // Delete confirmed: drop the pre-delete baseline record
+    plugin.fileHashManager.clearPendingDeleteBaseline?.(data.path)
+  }
   if (data.path && plugin.pendingFileDeleteAcks.has(data.path)) {
     plugin.fileHashManager.removeFileHash(data.path)
     plugin.pendingFileDeleteAcks.delete(data.path)

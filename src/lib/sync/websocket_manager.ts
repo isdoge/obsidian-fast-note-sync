@@ -1,8 +1,8 @@
 import { moment, Platform, normalizePath } from "obsidian";
 
 import { invalidateFileDownloads, handleFileChunkDownload, BINARY_PREFIX_FILE_SYNC, clearUploadQueue, receiveFileUploadSessionNotFound } from "./operator_file";
-import { clearEmptyNoteProbes } from "./operator_note";
-import { dump, addRandomParam, showSyncNotice, safeStringify, getPluginDir, hashContent } from "../utils/helpers";
+import { clearEmptyNoteProbes, conflictBackupPaths, writeConflictMeta } from "./operator_note";
+import { dump, addRandomParam, showSyncNotice, safeStringify } from "../utils/helpers";
 import { enSendDTOToProtobuf, deReceivePacket } from "../../pb/protobuf_mapper";
 import { receiveOperators, startupSync, startupFullSync, settleAllBatchSendSessionsOnClose, settleSyncTimes } from "./operator";
 import { SyncLogManager } from "./sync_log_manager";
@@ -11,12 +11,22 @@ import { WebSocketClient } from "./websocket_client";
 import { CLIENT_TYPE } from "../utils/types";
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
+import { conflictKindToSyncType, freezeConflictPath, normalizeConflict, storeSyncConflict } from "./conflict_store";
 
 
 // 冲突相关错误码
 const ERROR_SYNC_CONFLICT = 530;
 
 const AUTH_ERROR_REIMPORT_CODES = new Set([307, 308, 309, 310]);
+
+/**
+ * 服务端广告基线版本 >= 1 时，等待 ClientInfo 确认的最长时间。超时后绝不放行新模式，
+ * 而是按设计稿 §2.1 断开重连，避免在"服务端支持但确认未完成"的不确定状态下开始同步。
+ * Max wait for the ClientInfo confirmation when the server advertises baseline >= 1. On
+ * timeout the new mode is never silently enabled; the connection is re-established instead
+ * (design §2.1).
+ */
+const BASELINE_CONFIRM_TIMEOUT_MS = 8000;
 
 const AUTH_ERROR_FALLBACK_MESSAGES: Record<number, string> = {
   307: "Authorization token is missing",
@@ -90,6 +100,9 @@ export class WebSocketManager {
   // 仅在本次插件会话禁用 protobuf，不修改用户保存的设置；插件重启后仍先尝试 protobuf。
   // Disable protobuf only for this plugin session, preserving the saved setting for the next launch.
   private hasProtobufDecodeFailed = false;
+  // ClientInfo 确认等待（基线能力协商闸门）/ ClientInfo confirmation wait (baseline gate)
+  private baselineConfirmTimer: number | null = null;
+  private baselineGateWaiters: { resolve: () => void; reject: (reason: Error) => void }[] = [];
 
   // ─── 活跃同步期间它源消息的延后队列 ───────────────────────────────────────────
   // 一轮同步进行中（activeSyncContext 非空）时，context 不匹配且不属于本机已作废 context 的
@@ -190,6 +203,9 @@ export class WebSocketManager {
         return true;
       },
       onOpen: (client) => {
+        // 每次新建连接都从零开始协商基线能力（设计稿 §2.1 第 1 条）
+        // Every new connection starts baseline negotiation from scratch (design §2.1 rule 1)
+        this.resetBaselineNegotiation();
         client.Send(WSAction.ClientReceiveAuth, this.plugin.settings.apiToken);
         dump("Service authorization");
       },
@@ -232,6 +248,10 @@ export class WebSocketManager {
 
   /** 主动与被动断线共用清理，保留本地待上传改动。 / Shared disconnect cleanup preserves pending edits. */
   private cleanupDisconnectedSync(): void {
+    // 断线即失去本连接的协商结论：清零并让仍在等待的闸门失败，重连后重新协商
+    // A drop voids this connection's negotiation verdict: reset it and fail pending gate
+    // waiters so the next connection re-negotiates
+    this.resetBaselineNegotiation();
     this.sentRequests?.clear();
     this.plugin.retryQueue?.onDisconnected();
     if (this.plugin.isSyncing) {
@@ -464,6 +484,11 @@ export class WebSocketManager {
             negotiated = true;
           }
           this.plugin.syncState.negotiated = negotiated;
+          // 基线能力广告（设计稿 §2.1 第 2 条）：只是能力，不能据此启用新模式
+          // Baseline capability advertisement (design §2.1 rule 2): advertisement only
+          this.plugin.syncState.serverAdvertisedBaselineVersion =
+            typeof nego.syncBaselineVersion === "number" && nego.syncBaselineVersion > 0
+              ? Math.floor(nego.syncBaselineVersion) : 0;
           // protobufAck===true：服务端已在 auth 响应后提前 setUseProtobuf，本连接后续下行帧即为 pb，
           // 客户端同步跟进，无需再等 ClientInfo 响应触发升级（websocket_client.ts:259 该触发仍保留作旧服务端路径）
           if (nego.protobufAck === true && this.isProtobufEnabled()) {
@@ -482,7 +507,7 @@ export class WebSocketManager {
         this.client.notifyStatusChange(true);
 
         this.sendClientInfo();
-        void this.StartHandle();
+        void this.startAfterBaselineGate();
       }
       return;
     }
@@ -493,6 +518,19 @@ export class WebSocketManager {
       } else {
         if (data.data) {
           this.plugin.versionManager.updateFromClientInfo(data.data);
+          // 只有本连接尚未确认时才采纳；后台版本广播只更新提示，不篡改已确认的模式
+          // Only adopt while this connection is unconfirmed; a background broadcast updates the
+          // version notice but never rewrites an established mode (design §2.1 rule 9)
+          if (!this.plugin.syncState.clientInfoConfirmed) {
+            this.confirmBaseline(data.data["syncBaselineVersion"]);
+            dump(`[Baseline] ClientInfo confirmed version ${this.plugin.syncState.negotiatedSyncBaselineVersion}`);
+            this.openBaselineGate();
+          }
+        } else if (!this.plugin.syncState.clientInfoConfirmed) {
+          // 应答没有 data：视为老服务端，按 0 确认，立即进入兼容模式
+          // Reply without data: treat as an old server, confirm 0 and enter compatibility mode
+          this.confirmBaseline(0);
+          this.openBaselineGate();
         }
       }
       return;
@@ -516,16 +554,20 @@ export class WebSocketManager {
       // 处理冲突相关错误码
       if (data.code === ERROR_SYNC_CONFLICT) {
         void this.handleConflictError(data);
-        const payloadData = data.data;
-        let path: unknown = null;
-        if (payloadData && typeof payloadData === "object") {
-          path = payloadData.path ?? payloadData.Path;
-        }
-        if (typeof path === "string") {
+        const conflict = normalizeConflict(data.data);
+        const path = conflict?.path || "";
+        if (path !== "") {
           this.plugin.concurrencyLimiter.releaseSlot(path);
-          const pageIndex = this.plugin.syncState.pendingNotePushPageIndex.get(path);
-          this.plugin.syncState.pendingNotePushPageIndex.delete(path);
-          this.plugin.recordSyncCompleted('note', pageIndex);
+          // 四类资源共用同一拒绝载荷：按 kind 归账，不能一律记到笔记上
+          // All four kinds share the rejection payload: account by kind, never always as a note
+          const type = conflictKindToSyncType(conflict?.kind || "note");
+          const pageIndex = type === "note" ? this.plugin.syncState.pendingNotePushPageIndex.get(path)
+            : type === "setting" ? this.plugin.syncState.pendingConfigPushPageIndex.get(path)
+            : type === "file" ? this.plugin.syncState.pendingFilePushPageIndex.get(path) : undefined;
+          if (type === "note") this.plugin.syncState.pendingNotePushPageIndex.delete(path);
+          else if (type === "setting") this.plugin.syncState.pendingConfigPushPageIndex.delete(path);
+          else if (type === "file") this.plugin.syncState.pendingFilePushPageIndex.delete(path);
+          this.plugin.recordSyncCompleted(type, pageIndex);
         }
       } else if (data.code === 463 && typeof data.data?.sessionID === "string") {
         receiveFileUploadSessionNotFound(data.data.sessionID, this.plugin);
@@ -781,6 +823,110 @@ export class WebSocketManager {
       isLinux: Platform.isLinux,
       offlineSyncStrategy: this.plugin.settings.offlineSyncStrategy,
       protobuf: isProtobufEnabled,
+      // 请求版本固定为 1；PB 降级重发携带同一版本，服务端按"首次 ClientInfo 生效"处理，
+      // 因此不会重置已确认的模式（设计稿 §2.1 第 8 条）
+      // Always request version 1; a PB downgrade re-send carries the same value and the server
+      // applies "first ClientInfo wins", so the confirmed mode is never reset (design §2.1 rule 8)
+      syncBaselineVersion: this.plugin.syncState.requestedSyncBaselineVersion,
+    });
+  }
+
+  // ─── 基线能力协商闸门（设计稿 §2.1）─────────────────────────────────────────────
+  // ─── Baseline capability negotiation gate (design §2.1) ───────────────────────
+
+  /** 记录 ClientInfo 应答的确认结果；缺省视为 0（老服务端） / Record the confirmation; absent means 0 */
+  private confirmBaseline(accepted: unknown): void {
+    this.plugin.syncState.negotiatedSyncBaselineVersion =
+      typeof accepted === "number" && accepted > 0 ? Math.floor(accepted) : 0;
+    this.plugin.syncState.clientInfoConfirmed = true;
+  }
+
+  /** 清零连接级协商状态，并让仍在等待的闸门失败（新连接 / 断线） / Reset state and fail waiters */
+  private resetBaselineNegotiation(): void {
+    if (this.baselineConfirmTimer !== null) {
+      window.clearTimeout(this.baselineConfirmTimer);
+      this.baselineConfirmTimer = null;
+    }
+    // 直接写字段而非调用 SyncState 方法：部分测试/旧路径用最小 stub 注入 syncState，
+    // 保持向后兼容（语义与 SyncState.resetSyncBaselineNegotiation 一致）。
+    // Write the fields directly instead of calling SyncState methods: some tests and legacy
+    // paths inject a minimal syncState stub (semantics identical to
+    // SyncState.resetSyncBaselineNegotiation).
+    this.plugin.syncState.serverAdvertisedBaselineVersion = 0;
+    this.plugin.syncState.negotiatedSyncBaselineVersion = 0;
+    this.plugin.syncState.clientInfoConfirmed = false;
+    const waiters = this.baselineGateWaiters;
+    this.baselineGateWaiters = [];
+    for (const waiter of waiters) {
+      waiter.reject(new Error("sync baseline negotiation reset"));
+    }
+  }
+
+  /** ClientInfo 应答到达后放行所有等待者 / Release all waiters once the ClientInfo reply arrives */
+  private openBaselineGate(): void {
+    if (this.baselineConfirmTimer !== null) {
+      window.clearTimeout(this.baselineConfirmTimer);
+      this.baselineConfirmTimer = null;
+    }
+    const waiters = this.baselineGateWaiters;
+    this.baselineGateWaiters = [];
+    for (const waiter of waiters) {
+      waiter.resolve();
+    }
+  }
+
+  /**
+   * 闸门：服务端广告 >= 1 时，等到 ClientInfo 确认后再开始同步；广告 0 时立即放行。
+   * 超时绝不静默启用新模式，而是断开重连（设计稿 §2.1 末段）。
+   * Gate: with an advertisement >= 1, wait for the ClientInfo confirmation before syncing;
+   * with 0, proceed immediately. On timeout the new mode is never silently enabled — the
+   * connection is re-established instead (design §2.1, last paragraph).
+   */
+  private async startAfterBaselineGate(): Promise<void> {
+    if (!this.isBaselineGateOpen()) {
+      try {
+        await this.waitForBaselineConfirmation();
+      } catch (error) {
+        // 等待失败（超时或断线）：不放行同步，交给重连流程
+        // The wait failed (timeout or disconnect): do not start sync; let reconnect handle it
+        dump("[Baseline] ClientInfo confirmation failed; reconnecting instead of enabling the new mode", error);
+        this.triggerReconnect();
+        return;
+      }
+      if (!this.isBaselineGateOpen()) {
+        dump("[Baseline] Gate still closed after confirmation; skipping this start");
+        return;
+      }
+    }
+    await this.StartHandle();
+  }
+
+  /**
+   * 闸门判定（与 SyncState.isSyncBaselineGateOpen 语义一致）：服务端广告 < 1 时立即放行，
+   * 否则等 ClientInfo 确认。直接读字段以兼容最小 syncState stub。
+   * Gate check (same semantics as SyncState.isSyncBaselineGateOpen): open immediately when the
+   * advertisement is < 1, otherwise wait for the ClientInfo confirmation. Reads fields directly
+   * for minimal syncState stubs.
+   */
+  private isBaselineGateOpen(): boolean {
+    const advertised = Number(this.plugin.syncState.serverAdvertisedBaselineVersion ?? 0);
+    return advertised < 1 || this.plugin.syncState.clientInfoConfirmed === true;
+  }
+
+  /** 等待 ClientInfo 确认，带超时 / Wait for the ClientInfo confirmation with a timeout */
+  private waitForBaselineConfirmation(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.baselineGateWaiters.push({ resolve, reject });
+      if (this.baselineConfirmTimer === null) {
+        this.baselineConfirmTimer = window.setTimeout(() => {
+          this.baselineConfirmTimer = null;
+          const waiters = this.baselineGateWaiters;
+          this.baselineGateWaiters = [];
+          for (const waiter of waiters) {
+            waiter.reject(new Error("sync baseline confirmation timeout"));
+          }
+        }, BASELINE_CONFIRM_TIMEOUT_MS);
+      }
     });
   }
 
@@ -868,6 +1014,13 @@ export class WebSocketManager {
   }
 
   private async handleConflictError(data: StructuredMessageData) {
+    // 基线模式：统一冲突载荷一律持久化，不受 manualMerge 限制，也不要求远端正文非空；
+    // 旧服务端的 530 旧载荷在兼容模式下保持原有行为（设计稿 §2.6）
+    // Baseline mode: always persist the unified payload, never gated on manualMerge or a non-empty
+    // body. Legacy 530 payloads from old servers keep the compatibility behavior (§2.6)
+    if (this.plugin.syncState.isSyncBaselineModeEnabled?.() === true) {
+      if (await storeSyncConflict(this.plugin, data.data)) return;
+    }
     const payloadData = data.data;
     let path = "";
     let serverContent = "";
@@ -900,6 +1053,13 @@ export class WebSocketManager {
          "serverHash:", serverHash, 
          "strategy:", this.plugin.settings.offlineSyncStrategy);
 
+    // 旧协议载荷（未走统一持久化）同样要冻结：清掉在途上传/回执定时器/待确认删除，
+    // 否则 60s 后 recoverUpload 会把冲突附件当作回执丢失自动重传，反复撞 530
+    // Legacy payloads (not persisted through the unified store) freeze the path too: clear the
+    // in-flight upload, ack timers and pending delete acks so recoverUpload cannot retry a
+    // conflicting attachment after 60s and keep hitting 530
+    if (path !== "") freezeConflictPath(this.plugin, path);
+
     if (this.plugin.settings.offlineSyncStrategy === "manualMerge" &&
         path !== "" && serverContent !== "" && serverHash !== "") {
       
@@ -919,21 +1079,28 @@ export class WebSocketManager {
         this.plugin.settings.vault
       );
 
-      // 写入 Base 和 Remote 物理冲突文件到 conflict-notes (位于插件目录下，文件名附加路径哈希以防碰撞)
+      // 写入 Remote 物理冲突文件到 conflict-notes（位于插件目录下，文件名附加路径哈希以防碰撞）。
+      // 只有服务端明确给出非空 base 时才写 base 文件：空文本可能是“真实空 base”，但历史快照
+      // 缺失时服务端也会回退成空串，不能拿来冒充共同祖先。
+      // Write the remote conflict copy into conflict-notes. A base file is written only when the
+      // server supplied a non-empty ancestor; an empty string may just be a missing snapshot and
+      // must not be presented as a real common ancestor.
       try {
+        const { dir, baseBackupPath, remoteBackupPath } = conflictBackupPaths(this.plugin, path);
         const adapter = this.plugin.app.vault.adapter;
-        const conflictDir = `${getPluginDir(this.plugin)}/conflict-notes`;
-        if (!(await adapter.exists(conflictDir))) {
-          await adapter.mkdir(conflictDir);
+        if (!(await adapter.exists(dir))) {
+          await adapter.mkdir(dir);
         }
 
-        const safeName = path.replace(/\.md$/, "").replace(/[/\\]/g, "_");
-        const pathHash = hashContent(path);
-        const baseBackupPath = `${conflictDir}/${safeName}_${pathHash}.base.md`;
-        const remoteBackupPath = `${conflictDir}/${safeName}_${pathHash}.remote.md`;
-
-        await adapter.write(baseBackupPath, baseContent);
+        const hasRealBase = baseContent.length > 0;
+        if (hasRealBase) await adapter.write(baseBackupPath, baseContent);
+        else if (await adapter.exists(baseBackupPath)) await adapter.remove(baseBackupPath);
         await adapter.write(remoteBackupPath, serverContent);
+        await writeConflictMeta(this.plugin, path, {
+          reason: hasRealBase ? "manual_merge" : "manual_merge_no_base",
+          baseMissing: !hasRealBase,
+          remoteHash: serverHash,
+        });
       } catch (e) {
         dump("Failed to create conflict-notes backup files:", e);
       }

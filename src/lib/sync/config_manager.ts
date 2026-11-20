@@ -1,7 +1,7 @@
 import { normalizePath } from "obsidian";
 
 import { dump, dumpError, getFileName, getDirNameOrEmpty, configAddPathExcluded, isPathInConfigSyncDirs, getConfigSyncCustomDirs, isInWhitelist, getPluginDir, configIsPathExcluded } from "../utils/helpers";
-import { CONFIG_PLUGIN_EXTS_TO_WATCH, CONFIG_ROOT_FILES_EXCLUDE, CONFIG_THEME_EXTS_TO_WATCH, configModify, configDelete, configAllPaths, isPluginConfigPathExcluded } from "./operator_config";
+import { CONFIG_PLUGIN_EXTS_TO_WATCH, CONFIG_ROOT_FILES_EXCLUDE, CONFIG_THEME_EXTS_TO_WATCH, CONFIG_SNIPPET_EXTS_TO_WATCH, configModify, configDelete, configAllPaths, isConfigResourcePathExcluded } from "./operator_config";
 import type FastSync from "../../main";
 
 
@@ -138,7 +138,7 @@ export class ConfigManager {
     if (!this.plugin.settings.configSyncEnabled || this.plugin.isSyncing) return
 
     const configDir = this.plugin.app.vault.configDir
-    if (path.includes("/.git") || path.includes("/.DS_Store") || isPluginConfigPathExcluded(path, configDir)) return
+    if (path.includes("/.git") || path.includes("/.DS_Store") || isConfigResourcePathExcluded(path, configDir)) return
 
     // 检查路径是否属于配置同步范畴
     if (!isPathInConfigSyncDirs(path, this.plugin) || configIsPathExcluded(path, this.plugin)) return
@@ -174,12 +174,13 @@ export class ConfigManager {
             // 目录变动
             shouldCheck = true
           } else if (parts.length >= 3 && nameDir != "" && fileName != "") {
-            // 插件文本资源允许位于子目录；主题维持原有的顶层规则。
+            // 插件与主题资源允许位于子目录（主题图片/字体常见于 assets 子目录，#234）。
+            // Plugin and theme resources may live in subfolders (theme images/fonts often do, #234).
             const isPluginFile = topDir === "plugins" && this.pluginExtsToWatch.some(ext => fileName.toLowerCase().endsWith(ext))
-            const isThemeFile = topDir === "themes" && parts.length === 3 && this.themeExtsToWatch.some(ext => fileName.endsWith(ext))
+            const isThemeFile = topDir === "themes" && this.themeExtsToWatch.some(ext => fileName.toLowerCase().endsWith(ext))
             if (isPluginFile || isThemeFile) shouldCheck = true
           }
-        } else if (topDir === "snippets" && parts.length === 2 && fileName.endsWith(".css")) {
+        } else if (topDir === "snippets" && parts.length === 2 && CONFIG_SNIPPET_EXTS_TO_WATCH.some(ext => fileName.toLowerCase().endsWith(ext))) {
           shouldCheck = true
         }
       }

@@ -148,6 +148,27 @@ export interface ApiResponse<T = unknown> {
     data: T;
 }
 
+/** 服务端 Git 同步公开状态（不含仓库地址与凭据） */
+export interface GitSyncPublicStatus {
+    id: number;
+    vault: string;
+    branch: string;
+    targetSubdir: string;
+    isEnabled: boolean;
+    lastSyncTime?: string;
+    lastStatus: number;
+    lastMessage: string;
+    updatedAt?: string;
+}
+
+/** 服务端通用结果包装 */
+export interface ApiResult<T = unknown> {
+    ok: boolean;
+    status: number;
+    message: string;
+    data?: T;
+}
+
 /**
  * 统一的 HTTP API 服务类
  */
@@ -516,6 +537,35 @@ export class HttpApiService {
                 throw new Error("Retry queue: remote state unavailable");
             }
             return { path: res.data.path, contentHash: res.data.contentHash };
+        } finally {
+            window.clearTimeout(timer);
+        }
+    }
+
+    /**
+     * 只读拉取一条远端笔记的正文与内容哈希（冲突解决时远端正文未内联的补取通道）。
+     * 服务端不存在该笔记时返回 null；任何失败抛出，调用方必须据此拒绝清空本地内容。
+     *
+     * Read-only fetch of one remote note's body and content hash (used when a conflict's remote
+     * body was not inlined). Returns null when the server has no such note; failures throw so the
+     * caller refuses to clear the local copy.
+     */
+    async getNoteContent(path: string): Promise<{ content: string; contentHash: string } | null> {
+        const controller = new AbortController();
+        const timer = window.setTimeout(() => controller.abort(), 10000);
+        try {
+            const params = new URLSearchParams({ vault: this.plugin.settings.vault, path,
+                pathHash: hashContent(path), isRecycle: "false" });
+            const { status, json } = await this.request(`/api/note?${params}`, { method: "GET", signal: controller.signal });
+            const res = json as ApiResponse<{ path?: string; content?: string; contentHash?: string; isRecycle?: boolean }> & { details?: unknown };
+            if (status === 200 && (res?.code === 430 || res?.code === 455
+                || (res?.code === 0 && typeof res.details === "string" && /record not found/i.test(res.details)))) return null;
+            if (status !== 200 || !this.isSuccess(json) || !res.data || res.data.path !== path
+                || res.data.isRecycle === true || typeof res.data.content !== "string"
+                || typeof res.data.contentHash !== "string") {
+                throw new Error("Remote note body unavailable");
+            }
+            return { content: res.data.content, contentHash: res.data.contentHash };
         } finally {
             window.clearTimeout(timer);
         }
@@ -994,6 +1044,60 @@ export class HttpApiService {
             throw e;
         } finally {
             window.clearTimeout(timeoutId);
+        }
+    }
+
+    /**
+     * 查询当前 vault 的 Git / Firefly 同步状态（不含仓库地址与凭据）
+     * GET /api/git-sync/status?vault=...
+     */
+    async getGitSyncStatus(vault?: string): Promise<ApiResult<GitSyncPublicStatus[]>> {
+        const params = new URLSearchParams({ vault: vault || this.plugin.settings.vault });
+        const endpoint = `/api/git-sync/status?${params.toString()}`;
+        try {
+            const { status, json } = await this.request(endpoint, { method: "GET" });
+            const res = json as ApiResponse<GitSyncPublicStatus[]> | null;
+            const list = Array.isArray(res?.data)
+                ? res.data
+                : (res?.data && Array.isArray((res.data as { list?: GitSyncPublicStatus[] }).list)
+                    ? (res.data as { list: GitSyncPublicStatus[] }).list
+                    : []);
+            return {
+                ok: status === 200 && this.isSuccess(json),
+                status,
+                message: res?.message || (status === 200 ? "" : `HTTP ${status}`),
+                data: list,
+            };
+        } catch (e) {
+            dumpError("getGitSyncStatus error:", e);
+            return { ok: false, status: 0, message: e instanceof Error ? e.message : String(e), data: [] };
+        }
+    }
+
+    /**
+     * 立即触发当前 vault 的 Git / Firefly 同步与发布
+     * POST /api/git-sync/trigger
+     */
+    async triggerGitSync(vault?: string, configId?: number): Promise<ApiResult<unknown>> {
+        const endpoint = `/api/git-sync/trigger`;
+        try {
+            const { status, json } = await this.request(endpoint, {
+                method: "POST",
+                body: JSON.stringify({
+                    vault: vault || this.plugin.settings.vault,
+                    configId: configId || 0,
+                }),
+            });
+            const res = json as ApiResponse<unknown> | null;
+            return {
+                ok: status === 200 && this.isSuccess(json),
+                status,
+                message: res?.message || (status === 200 ? "" : `HTTP ${status}`),
+                data: res?.data,
+            };
+        } catch (e) {
+            dumpError("triggerGitSync error:", e);
+            return { ok: false, status: 0, message: e instanceof Error ? e.message : String(e) };
         }
     }
 }

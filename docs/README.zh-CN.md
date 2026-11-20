@@ -42,7 +42,7 @@
 - **版本号**：自 v2.5.0 起独立递增，不再跟随上游。
 - **插件 ID 不变**：仍是 `fast-note-sync`。把本仓库发布的文件覆盖到 `.obsidian/plugins/fast-note-sync` 即可，原有设置和同步记录都会沿用，不需要重新配置。
 - **安装与更新**：只在本仓库的 [GitHub Releases](https://github.com/isdoge/obsidian-fast-note-sync/releases) 发布，不上架 Obsidian 社区插件商店。插件内的一键升级从本仓库的 Releases 下载；新版本提示由所连接的服务端下发，搭配本仓库的服务端时指向本仓库。Obsidian 自带的「检查更新」查的是商店里的上游版本，请不要用它来更新本插件。
-- **配套服务端**：请搭配同样独立维护的 [isdoge/fast-note-sync-service](https://github.com/isdoge/fast-note-sync-service)（v3.7.0 及以上）。部分修复需要插件和服务端都升级才生效。
+- **配套服务端**：请搭配同样独立维护的 [isdoge/fast-note-sync-service](https://github.com/isdoge/fast-note-sync-service)。基础同步需服务端 v3.7.0 及以上；完整同步基线协议需 v3.8.4 及以上；Firefly 博客自动发布需 v3.8.5 及以上。部分修复需要插件和服务端都升级才生效。
 - **保持不变**：原作者的版权署名与赞助信息。
 - **反馈**：问题和需求请提到本仓库的 [Issues](https://github.com/isdoge/obsidian-fast-note-sync/issues)，不要提到上游仓库。
 
@@ -103,6 +103,12 @@
     > 配合插件的排除设置，可对某类附件直接使用第三方资源库(例如 WebDav)而不通过服务端上传。
 - 🗒️ **同步日志**：
     - 提供同步日志功能，便于查看每次同步的详细信息。
+- 🌐 **Astro Firefly 博客写作与自动发布助手**：
+    - 校验文章 frontmatter、把图片汇聚并规范到笔记同目录的 `./assets/` 并改写引用、发布前合规检查，并可一键触发服务端 Git/Firefly 构建、实时展示构建回执。
+    > ⚠️ **注意**：自动发布需服务端 v3.8.5+，且服务端已配置 Firefly 的 Git 同步目标。
+- 🧬 **同步基线协议、冲突对齐与批量处理**：
+    - 每次写入都带服务端签发的版本令牌核对；冲突会附带准确的远端版本，在统一面板中列出并支持批量解决（本地 / 远端 / 保留双份），二进制配置与附件逐字节零损传输和恢复。
+    > ⚠️ **注意**：完整基线协议需服务端 v3.8.4+；旧服务端会自动退回兼容模式。
 - **云存储备份**：提供云存储备份功能，保护您的笔记数据不丢失。
 
 ## 🗺️ 路线图 (Roadmap)

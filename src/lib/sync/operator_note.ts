@@ -8,9 +8,123 @@ import { hashContent, hashContentAsync, dump, dumpError, isPathExcluded, getSafe
 import { SyncLogManager } from "./sync_log_manager";
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
+import { BaselineDeleteRecord, baselineFieldsFromDeleteRecord, buildBaselineFields, buildDeleteBaselineFields } from "../storage/baseline_scope";
 
 // 同一插件会话中每条失败路径只通知一次；重试仍逐次保留同步错误日志。
 const notifiedNoteFailures = new WeakMap<FastSync, Set<string>>();
+
+/** 待对齐来源标记：本地已有内容但没有任何可信基线，不能直接覆盖 */
+/** Alignment pending source: local content exists but has no trusted baseline; never overwrite */
+export const CONFLICT_REASON_UNALIGNED = "unaligned_no_baseline";
+
+export interface ConflictBackupMeta {
+  /** 该条目进入冲突/待对齐的原因 / Why the entry entered conflict/pending alignment */
+  reason?: string;
+  /** 是否缺少共同祖先；true 时绝不伪造 base 文件 / Whether the common ancestor is missing */
+  baseMissing?: boolean;
+  /** 远端版本内容哈希 / Remote content hash */
+  remoteHash?: string;
+  /**
+   * 检测当时的本地内容哈希（只存哈希，不存内容），用于批量对齐前的新编辑重检；
+   * 持久化保存，使重检在插件重启后仍然有效。
+   * Local content hash at detection time (a hash only, never content) used to re-check for new
+   * edits before a batch action; persisted so the re-check still works after a restart.
+   */
+  localHashAtDetection?: string;
+  /** 统一冲突资源类型（阶段 E）/ Unified conflict kind (stage E) */
+  kind?: string;
+  /** 服务端当前版本令牌 / Current server revision */
+  serverRevision?: string;
+  serverHash?: string;
+  serverDeleted?: boolean;
+  baseHash?: string;
+  /** 是否存有真实远端正文备份 / Whether a real remote body was stashed */
+  hasServerContent?: boolean;
+}
+
+export interface ConflictBackupPaths {
+  dir: string;
+  safeName: string;
+  pathHash: string;
+  baseBackupPath: string;
+  remoteBackupPath: string;
+  metaPath: string;
+  localBackupPath: string;
+}
+
+/**
+ * 冲突/待对齐条目的内部备份路径（位于插件自身目录，已被同步排除）。
+ * Paths for a conflict/pending-alignment entry (inside the plugin dir, excluded from sync).
+ */
+export function conflictBackupPaths(plugin: FastSync, path: string): ConflictBackupPaths {
+  const dir = `${getPluginDir(plugin)}/conflict-notes`;
+  const safeName = path.replace(/\.md$/, "").replace(/[/\\]/g, "_");
+  const pathHash = hashContent(path);
+  return {
+    dir,
+    safeName,
+    pathHash,
+    baseBackupPath: `${dir}/${safeName}_${pathHash}.base.md`,
+    remoteBackupPath: `${dir}/${safeName}_${pathHash}.remote.md`,
+    metaPath: `${dir}/${safeName}_${pathHash}.meta.json`,
+    localBackupPath: `${dir}/${safeName}_${pathHash}.local-backup.md`,
+  };
+}
+
+export async function readConflictMeta(plugin: FastSync, path: string): Promise<ConflictBackupMeta | null> {
+  try {
+    const { metaPath } = conflictBackupPaths(plugin, path);
+    const adapter = plugin.app.vault.adapter;
+    if (!(await adapter.exists(metaPath))) return null;
+    const raw = await adapter.read(metaPath);
+    if (!raw) return null;
+    return JSON.parse(raw) as ConflictBackupMeta;
+  } catch (error) {
+    dump("Failed to read conflict metadata:", error);
+    return null;
+  }
+}
+
+export async function writeConflictMeta(plugin: FastSync, path: string, meta: ConflictBackupMeta): Promise<void> {
+  const { dir, metaPath } = conflictBackupPaths(plugin, path);
+  const adapter = plugin.app.vault.adapter;
+  if (!(await adapter.exists(dir))) await adapter.mkdir(dir);
+  await adapter.write(metaPath, JSON.stringify(meta));
+}
+
+/**
+ * 清理冲突/待对齐的内部备份文件；keepLocalBackup 用于“以远端为准”后保留本地侧备份。
+ * Remove internal backups; keepLocalBackup retains the local-side safety copy.
+ */
+export async function removeConflictBackups(
+  plugin: FastSync,
+  path: string,
+  options: { keepLocalBackup?: boolean } = {}
+): Promise<void> {
+  try {
+    const adapter = plugin.app.vault.adapter;
+    const { dir, baseBackupPath, remoteBackupPath, metaPath, localBackupPath } = conflictBackupPaths(plugin, path);
+    const targets = [baseBackupPath, remoteBackupPath, metaPath];
+    if (!options.keepLocalBackup) targets.push(localBackupPath);
+    const removals: Promise<void>[] = [];
+    for (const target of targets) {
+      if (await adapter.exists(target)) removals.push(adapter.remove(target));
+    }
+    await Promise.all(removals);
+    if (await adapter.exists(dir)) {
+      const listed = await adapter.list(dir);
+      if (listed && listed.files.length === 0 && listed.folders.length === 0) {
+        try {
+          await adapter.rmdir(dir, true);
+        } catch {
+          // EBUSY/locked folder: keeping an empty folder is harmless / 文件夹繁忙时保留空目录无害
+        }
+      }
+    }
+  } catch (error) {
+    dump("Failed to remove conflict backups:", error);
+  }
+}
 
 // #205：正在通过 NoteRePush 探测服务端是否已有该笔记的路径集合（挂在 plugin 实例上，
 // 每个插件实例独立；断线重连后由 websocket_manager onClose 统一清空，探测随下一轮事件重发）。
@@ -108,9 +222,85 @@ export function clearEmptyNoteProbes(plugin: FastSync): void {
 }
 
 /**
+ * 阶段 B：把“本地有内容、远端也有同名内容、但无任何可信基线”的路径转入待对齐。
+ * 本地笔记原封不动；远端版本只存在内部目录时无法从下行获取，因此仅在调用方拿到远端内容
+ * （NoteSyncModify）时写入 .remote.md；NoteSyncNeedPush 没有远端正文，只登记待对齐，
+ * 远端版本留给用户打开对齐面板时的服务端历史。
+ *
+ * Stage B: move a path with local content, a same-named remote note and no trusted baseline into
+ * pending alignment. The local note is untouched; the remote body is stashed only when the caller
+ * has it (NoteSyncModify). NeedPush carries no body, so the entry is queued without one and the
+ * remote version is taken from server history in the alignment panel.
+ */
+async function stashUnalignedNote(
+  plugin: FastSync,
+  file: TFile,
+  localContent: string,
+  remoteContent?: string,
+  remoteContentHash?: string
+): Promise<boolean> {
+  try {
+    const adapter = plugin.app.vault.adapter;
+    const { dir, remoteBackupPath, baseBackupPath } = conflictBackupPaths(plugin, file.path);
+    if (!(await adapter.exists(dir))) await adapter.mkdir(dir);
+    if (typeof remoteContent === "string") {
+      await adapter.write(remoteBackupPath, remoteContent);
+    }
+    // 缺基线是事实：清掉可能残留的伪造 base，并显式记录 baseMissing
+    // Missing ancestor is a fact: remove any stale fabricated base and record it
+    if (await adapter.exists(baseBackupPath)) await adapter.remove(baseBackupPath);
+    await writeConflictMeta(plugin, file.path, {
+      reason: CONFLICT_REASON_UNALIGNED,
+      baseMissing: true,
+      ...(remoteContentHash ? { remoteHash: remoteContentHash } : {}),
+      localHashAtDetection: await hashContentAsync(localContent),
+    });
+  } catch (err) {
+    dumpError(`[FastSync] Failed to stash remote version for alignment: ${file.path}`, err);
+    return false;
+  }
+
+  plugin.syncState.conflictedPaths.add(file.path);
+  plugin.syncState.newConflictedPathsThisRound.add(file.path);
+  plugin.syncState.newUnalignedPathsThisRound?.add(file.path);
+  plugin.localStorageManager.setConflictedPaths(plugin.syncState.conflictedPaths);
+  plugin.statusBarManager.updateConflictBadge();
+  // 暂停该路径的自动上传，避免反过来立刻把远端覆盖掉
+  // Pause uploads for this path so it cannot overwrite the remote copy
+  plugin.pendingNoteModifies.delete(file.path);
+  plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies);
+
+  SyncLogManager.getInstance().addLog('receive', 'NoteModifyUnaligned',
+    `本地已有内容但无可信同步基线，已保留本地版本并暂存远端版本，等待对齐: ${file.path}`, 'cancelled', file.path)
+  return true;
+}
+
+/**
+ * 只读探测远端同名笔记（旧协议兼容模式的首次接入防覆盖）。
+ * 使用既有只读接口，绝不走会改状态的 check/sync 请求；拿不到结论时返回 null，
+ * 调用方按“远端不可知”处理（不拦截上传，避免把正常新建笔记永久卡住）。
+ * 返回值：null = 查询失败/接口不可用；{ path, contentHash } = 远端存活笔记（已排除回收站）。
+ *
+ * Read-only probe of a same-path remote note (legacy-mode first-attach guard). Uses the existing
+ * read-only endpoint only — never a check/sync request that could mutate state. Returns null when
+ * the verdict is unavailable; the caller then treats the remote as unknown and does not block the
+ * upload (blocking would permanently strand a legitimate new note).
+ */
+async function probeRemoteNoteState(plugin: FastSync, path: string): Promise<{ path: string; contentHash: string } | null> {
+  const api = plugin.api as { getRetryQueueState?: (kind: "note" | "file", path: string) => Promise<{ path: string; contentHash: string } | null> } | null | undefined
+  if (!api || typeof api.getRetryQueueState !== "function") return null
+  try {
+    return await api.getRetryQueueState("note", path)
+  } catch (error) {
+    dump(`[NoteUpload] Remote probe unavailable for ${path}; uploading with baseHashMissing`, error)
+    return null
+  }
+}
+
+/**
  * 笔记修改事件处理
  */
-export const noteModify = async function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false) {
+export const noteModify = async function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false, options?: { isConflictResolved?: boolean; baseRevision?: string }) {
   if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
   if (!(file instanceof TFile)) return
   if (!file.path.endsWith(".md")) return
@@ -119,7 +309,10 @@ export const noteModify = async function (file: TAbstractFile, plugin: FastSync,
   // 冲突未解决的路径暂停上传，否则本端旧稿会覆盖其他端的新内容（#276）；解决冲突时由冲突合并窗口自行推送
   // Uploads of an unresolved conflict are paused, or this device's stale copy overwrites newer content
   // from other devices (#276); the conflict resolve modal pushes the merged result itself
-  if (plugin.syncState.conflictedPaths.has(file.path)) {
+  // 已解决（isConflictResolved）的提交是用户明确拍板的结果，不能因路径仍在冻结集合里被跳过
+  // A resolved submit is the user's explicit decision and must not be skipped just because the
+  // path is still in the frozen set
+  if (plugin.syncState?.conflictedPaths?.has(file.path) && !options?.isConflictResolved) {
     dump(`Note modify paused, unresolved conflict: ${file.path}`)
     return
   }
@@ -161,8 +354,11 @@ export const noteModify = async function (file: TAbstractFile, plugin: FastSync,
         pathHash: hashContent(file.path),
         content: content,
         contentHash: contentHash,
-        // 始终传递 baseHash 信息，如果不可用则标记 baseHashMissing
-        ...(baseHash !== null ? { baseHash } : { baseHashMissing: true }),
+        // 基线模式携带服务端确认的 {baseHash, baseRevision}；兼容模式保持旧字段
+        // Baseline mode carries the server-confirmed {baseHash, baseRevision}; compat mode keeps the old field
+        ...buildBaselineFields(plugin, "note", file.path, contentHash),
+        ...(options?.baseRevision ? { baseRevision: options.baseRevision } : {}),
+        ...(options?.isConflictResolved ? { isConflictResolved: true } : {}),
       }
       // 将 hash 暂存到 pending map，等待服务端 NoteModifyAck 后再写入 hashManager
       // Temporarily store hash in pending map, update hashManager only after server NoteModifyAck
@@ -197,6 +393,12 @@ export const noteDelete = async function (file: TAbstractFile, plugin: FastSync,
     dump(`Note delete intercepted: ${file.path}`)
     return
   }
+  // 冲突冻结的路径不自动上传删除，交给冲突解决窗口决定
+  // A frozen conflicted path never auto-uploads a deletion; the resolver decides
+  if (plugin.syncState?.conflictedPaths?.has(file.path)) {
+    dump(`Note delete paused, unresolved conflict: ${file.path}`)
+    return
+  }
 
   await plugin.lockManager.withLock(file.path, async () => {
     // 清理可能存在的待确认上传记录，避免 pending map 内存泄漏
@@ -205,10 +407,14 @@ export const noteDelete = async function (file: TAbstractFile, plugin: FastSync,
     plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies)
     plugin.addIgnoredFile(file.path)
     try {
+      // 删除前先快照最后确认的基线，供实时删除与断线回放携带
+      // Snapshot the last confirmed baseline before deletion so live deletes and replay can carry it
+      if (plugin.isSyncBaselineModeEnabled?.() === true) plugin.fileHashManager.recordPendingDeleteBaseline?.(file.path)
       const data = {
         vault: plugin.settings.vault,
         path: file.path,
         pathHash: hashContent(file.path),
+        ...buildDeleteBaselineFields(plugin, "note", file.path),
       }
       if (!await plugin.concurrencyLimiter.waitForSlot(file.path)) return
       await plugin.websocket.SendMessage("NoteDelete", data, undefined, () => {
@@ -228,7 +434,7 @@ export const noteDelete = async function (file: TAbstractFile, plugin: FastSync,
  * 按路径字符串发送笔记删除消息（用于无法获取 TFile 对象的场景，如 rename 后旧路径已不存在）
  * Send note delete message by path string (for scenarios where TFile object is unavailable, e.g., old path after rename)
  */
-export const noteDeleteByPath = async function (filePath: string, plugin: FastSync, retryGuard?: () => boolean) {
+export const noteDeleteByPath = async function (filePath: string, plugin: FastSync, retryGuard?: () => boolean, explicitBaseline?: BaselineDeleteRecord) {
   if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
   if (!filePath.endsWith(".md")) return
   if (isPathExcluded(filePath, plugin)) return
@@ -242,12 +448,14 @@ export const noteDeleteByPath = async function (filePath: string, plugin: FastSy
     plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies)
     plugin.addIgnoredFile(filePath)
     try {
+      if (plugin.isSyncBaselineModeEnabled?.() === true) plugin.fileHashManager.recordPendingDeleteBaseline?.(filePath)
       if (!await plugin.concurrencyLimiter.waitForSlot(filePath)) return
       if (retryGuard && !retryGuard()) { plugin.concurrencyLimiter.releaseSlot(filePath); return }
       await plugin.websocket.SendMessage("NoteDelete", {
         vault: plugin.settings.vault,
         path: filePath,
         pathHash: hashContent(filePath),
+        ...(explicitBaseline ? baselineFieldsFromDeleteRecord(explicitBaseline) : buildDeleteBaselineFields(plugin, "note", filePath)),
       }, () => retryGuard ? !retryGuard() : false, () => {
         // 消息真正写入 TCP 缓冲区后加入 pending set，等待 NoteDeleteAck 再删 hash
         // Add to pending set only after message is actually buffered; remove hash only on NoteDeleteAck
@@ -263,7 +471,7 @@ export const noteDeleteByPath = async function (filePath: string, plugin: FastSy
 /**
  * 笔记重命名事件处理
  */
-export const noteRename = async function (file: TAbstractFile, oldfile: string, plugin: FastSync, eventEnter: boolean = false, retryGuard?: () => boolean, retryBaselineHash?: string) {
+export const noteRename = async function (file: TAbstractFile, oldfile: string, plugin: FastSync, eventEnter: boolean = false, retryGuard?: () => boolean, retryBaselineHash?: string, retryBaselineRevision?: string) {
   if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
   if (!(file instanceof TFile)) return
   if (!file.path.endsWith(".md")) return
@@ -295,6 +503,24 @@ export const noteRename = async function (file: TAbstractFile, oldfile: string, 
   if (plugin.lastSyncPathRenamed.has(file.path)) {
     dump(`Note rename intercepted: ${file.path}`)
     return
+  }
+
+  // 基线模式（设计稿 §2.4）：原生 rename 无法携带源路径条件删除，改为
+  // 「先在目标路径安全创建/上传成功，再对源路径带源 baseHash + baseRevision 发送条件删除」。
+  // 旧模式保持原原生 rename 不变。
+  // Baseline mode (§2.4): native rename cannot carry a conditional delete for the source path.
+  // Create/upload the target safely first, then conditionally delete the source with its
+  // baseline. Compatibility mode keeps the original native rename.
+  if (plugin.isSyncBaselineModeEnabled?.() === true) {
+    if (retryGuard && !retryGuard()) return;
+    const sourceHasBaseline = plugin.fileHashManager.getPathHash(oldfile) !== null;
+    await noteModify(file, plugin, true);
+    const explicit = retryBaselineHash !== undefined
+      ? { hash: retryBaselineHash, hashMissing: false, revision: retryBaselineRevision || "" } as BaselineDeleteRecord
+      : undefined;
+    if (sourceHasBaseline || explicit) await noteDeleteByPath(oldfile, plugin, undefined, explicit);
+    dump(`Note rename converted to create-then-conditional-delete`, oldfile, file.path, sourceHasBaseline);
+    return;
   }
 
   // 重命名涉及两个路径，我们锁定新路径，旧路径由调用方或原子性保证
@@ -361,34 +587,34 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
           // Fail-safe：写盘前检查本地是否有未推送的编辑，避免服务端推送盲覆盖用户刚做的改动
           // Fail-safe: before overwriting, check for unsynced local edits so a server push
           // doesn't blindly clobber changes the user just made
-          const localContentHashNow = await hashContentAsync(await plugin.app.vault.read(file));
+          const localContentNow = await plugin.app.vault.read(file);
+          const localContentHashNow = await hashContentAsync(localContentNow);
           const remoteContentHashNow = await hashContentAsync(data.content);
           const contentsMatch = localContentHashNow === remoteContentHashNow;
           const baseHashNow = plugin.fileHashManager.getPathHash(normalizedPath);
-          // A replay of the unchanged server baseline is not a two-sided edit.
-          if (!contentsMatch && baseHashNow !== null && remoteContentHashNow === baseHashNow) {
+          // 旧版持久化基线只有当本地内容仍等于记录值时才算可信（阶段 B）
+          // A legacy persisted baseline counts only while local content still equals it (stage B)
+          const trustedBaseHash = typeof plugin.fileHashManager.getVerifiedPathHash === "function"
+            ? plugin.fileHashManager.getVerifiedPathHash(normalizedPath, localContentHashNow)
+            : baseHashNow;
+
+          // A replay of the unchanged server baseline is not a two-sided edit. Only a verified
+          // baseline proves the replay; an unverified legacy entry must not absorb it either.
+          // 只有可信基线才能证明这是服务端未变更的重放；不可信的旧基线不能据此改写 pending。
+          if (!contentsMatch && trustedBaseHash !== null && remoteContentHashNow === trustedBaseHash) {
             plugin.pendingNoteModifies.set(normalizedPath, localContentHashNow);
             plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies);
             return;
           }
           const hasPendingLocalEdit = plugin.pendingNoteModifies.has(data.path)
-          let hasDivergedSinceLastSync = false
-          if (!hasPendingLocalEdit) {
-            const knownSyncMtime = plugin.lastSyncMtime.get(data.path)
-            const localMtimeIsNewer = knownSyncMtime !== undefined && file.stat.mtime > knownSyncMtime
-            if (localMtimeIsNewer) {
-              // mtime 已比上次同步记录的新，进一步用内容哈希确认本地内容是否真的偏离了已知基准
-              // mtime is newer than what we last synced; confirm with content hash whether
-              // local content actually diverged from the known baseline
-              const knownBaseHash = plugin.fileHashManager.getPathHash(normalizedPath)
-              let localContentHash = plugin.fileHashManager.getValidHash(normalizedPath, file.stat.mtime, file.stat.size)
-              if (localContentHash === null) {
-                const localContent = await plugin.app.vault.read(file)
-                localContentHash = await hashContentAsync(localContent)
-              }
-              hasDivergedSinceLastSync = localContentHash !== knownBaseHash
-            }
-          }
+          // 有可信基线时，只要本地当前内容不等于基线就说明本地已偏离（内容哈希比较，与 mtime 无关：
+          // 打开 canvas 等只刷新 mtime 的操作不应改变判断，mtime 记录丢失也不应导致误覆盖）
+          // With a trusted baseline, any local content that differs from it has diverged. The check
+          // is content-based, not mtime-based: refreshed mtimes must not matter and a lost mtime
+          // record must not turn a real local edit into a silent overwrite.
+          const hasDivergedSinceLastSync = !hasPendingLocalEdit
+            && trustedBaseHash !== null
+            && localContentHashNow !== trustedBaseHash
 
           if (!contentsMatch && (hasPendingLocalEdit || hasDivergedSinceLastSync || plugin.syncState.conflictedPaths.has(normalizedPath))) {
             dump(`[FastSync] Skip overwrite, local unsynced edit detected: ${normalizedPath}`)
@@ -397,24 +623,25 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
             // If local unsynced edit exists or path is in conflict state, write/update the server's latest content into xxx.remote.md
             try {
               const adapter = plugin.app.vault.adapter;
-              const conflictDir = `${getPluginDir(plugin)}/conflict-notes`;
-              const safeName = normalizedPath.replace(/\.md$/, "").replace(/[/\\]/g, "_");
-              const pathHash = hashContent(normalizedPath);
-              const baseBackupPath = `${conflictDir}/${safeName}_${pathHash}.base.md`;
-              const remoteBackupPath = `${conflictDir}/${safeName}_${pathHash}.remote.md`;
+              const { dir, baseBackupPath, remoteBackupPath } = conflictBackupPaths(plugin, normalizedPath);
+              const previousMeta = await readConflictMeta(plugin, normalizedPath);
 
-              if (!(await adapter.exists(conflictDir))) {
-                await adapter.mkdir(conflictDir);
+              if (!(await adapter.exists(dir))) {
+                await adapter.mkdir(dir);
               }
 
               // 写入服务端最新推送的内容至 remote 备份文件
               await adapter.write(remoteBackupPath, data.content || "");
 
-              // 若 base 备份不存在，使用当前本地内容建立初始 base 备份
-              if (!(await adapter.exists(baseBackupPath))) {
-                const localContent = await plugin.app.vault.read(file);
-                await adapter.write(baseBackupPath, localContent);
-              }
+              // 只在已有真实 base 时保留它；绝不再用本地当前内容冒充共同祖先
+              // Keep an existing real base only; never pass current local content off as an ancestor
+              const hasRealBase = await adapter.exists(baseBackupPath);
+              await writeConflictMeta(plugin, normalizedPath, {
+                reason: previousMeta?.reason ?? (hasRealBase ? "diverged" : "diverged_no_base"),
+                baseMissing: !hasRealBase,
+                remoteHash: remoteContentHashNow,
+                localHashAtDetection: localContentHashNow,
+              });
 
               dump(`[FastSync] Updated remote backup file for conflict: ${remoteBackupPath}`);
             } catch (err) {
@@ -431,7 +658,25 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
             return
           }
 
-          await plugin.app.vault.modify(file, data.content, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
+          // 阶段 B：本地已有非空内容，却没有任何可信基线（首次接入、外部写入、本地状态丢失）。
+          // 绝不直接覆盖，也不在笔记目录生成冲突文件：保留本地，把远端版本存进插件内部目录，
+          // 进入待对齐集合并暂停该路径的自动上传，等用户在冲突与对齐面板统一处理。
+          // Stage B: local non-empty content with no trusted baseline (first attach, external write,
+          // lost local state). Never overwrite and never drop conflict files into the vault: keep
+          // the local copy, stash the remote version inside the plugin dir, queue it for alignment
+          // and pause uploads for that path until the user handles it.
+          if (!contentsMatch && trustedBaseHash === null && localContentNow.length > 0) {
+            dump(`[FastSync] No trusted baseline, keep local and queue alignment: ${normalizedPath}`)
+            await stashUnalignedNote(plugin, file, localContentNow, data.content || "", remoteContentHashNow)
+            return
+          }
+
+          // 无基线且内容一致时只确认基线、不写盘；有可信基线的原有写盘行为保持不变
+          // With no baseline and equal content, confirm the baseline without rewriting; existing
+          // trusted-baseline behaviour keeps writing as before
+          if (!contentsMatch || trustedBaseHash !== null) {
+            await plugin.app.vault.modify(file, data.content, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
+          }
         } else {
           const folder = normalizedPath.split("/").slice(0, -1).join("/")
           if (folder != "") {
@@ -453,7 +698,12 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
         // 服务端推送笔记更新,更新哈希表(使用内容哈希)
         // 注意：由于是服务端推送，我们信任服务端返回的 mtime，并尝试获取本地文件大小
         const updatedFile = plugin.app.vault.getFileByPath(normalizedPath);
-        plugin.fileHashManager.setFileHash(data.path, data.contentHash, mtime || 0, updatedFile?.stat.size || 0)
+        const pushedRevision = (data as { revision?: string }).revision
+        if (typeof pushedRevision === "string" && pushedRevision !== "") {
+          plugin.fileHashManager.setFileHash(data.path, data.contentHash, mtime || 0, updatedFile?.stat.size || 0, true, pushedRevision)
+        } else {
+          plugin.fileHashManager.setFileHash(data.path, data.contentHash, mtime || 0, updatedFile?.stat.size || 0)
+        }
         // 记录同步后的 mtime 用于拦截
         plugin.lastSyncMtime.set(data.path, mtime || 0)
         // 服务端版本已覆盖本地，清理 pending 避免增量过滤器旁路导致该笔记无限重传
@@ -519,7 +769,7 @@ export const receiveNoteUpload = async function (data: ReceivePathMessage, plugi
   }
   // 冲突未解决：不响应服务端的上传请求，避免旧稿覆盖服务端（#276）
   // Unresolved conflict: do not answer the server's upload request, so the stale copy never overwrites the server (#276)
-  if (plugin.syncState.conflictedPaths.has(file.path)) {
+  if (plugin.syncState?.conflictedPaths?.has(file.path)) {
     SyncLogManager.getInstance().addLog('send', 'NoteModifyConflict', `冲突未解决，暂停上传: ${file.path}`, 'cancelled', data.path)
     plugin.recordSyncCompleted('note', data.pageIndex)
     return
@@ -551,10 +801,54 @@ export const receiveNoteUpload = async function (data: ReceivePathMessage, plugi
     plugin.recordSyncCompleted('note', data.pageIndex)
     return
   }
+  // 阶段 B：空占位笔记的探测结论会在前面处理。
+  // 服务端已明确发 NoteSyncNeedPush（code 200）要求上传，说明该路径在服务端侧不需要冲突拦截：
+  // - 基线模式下服务端在 NoteSync 阶段已把“远端存在不同内容且无基线”的路径改走 SyncConflict，
+  //   走到这里的只可能是允许上传的新建/恢复；因此这里绝不拦截，直接以“无基线”字段上传。
+  //   否则离线新建的笔记永远传不上去（stash 后本地被冻结，NeedPush 每轮重来）。
+  // - 旧协议兼容模式下保留“首次接入防覆盖”的最小保护：仅当本机从未成功同步过
+  //   （lastNoteSyncTime === 0）、无任何可信基线且本地有内容时，先只读探测远端是否真有同名
+  //   存活笔记；只有远端存在且内容哈希不同才转待对齐，远端不存在或常规增量一律正常上传。
+  //
+  // Stage B: empty-placeholder probes are handled above.
+  // A server NoteSyncNeedPush (code 200) means the server itself decided this path may upload:
+  // - Baseline mode: NoteSync already routed every "remote differs, no baseline" path to
+  //   SyncConflict, so reaching here means a genuine create/restore — never intercept, upload
+  //   with explicit "no baseline" fields. Otherwise notes created offline could never be uploaded
+  //   (stash freezes the path locally and every round repeats the NeedPush).
+  // - Legacy compatibility mode keeps the minimal first-attach guard: only when this device never
+  //   synced successfully (lastNoteSyncTime === 0), no trusted baseline exists and local content is
+  //   non-empty, do a read-only probe for a live same-path remote note; only a real remote note
+  //   with a different hash is moved to pending alignment. Absent remotely, or a normal
+  //   incremental round, uploads as usual.
+  const baselineMode = plugin.isSyncBaselineModeEnabled?.() === true
+  const verifiedBaseForUpload = typeof plugin.fileHashManager.getVerifiedPathHash === "function"
+    ? plugin.fileHashManager.getVerifiedPathHash(file.path, contentHash)
+    : baseHash
+  if (!baselineMode && verifiedBaseForUpload === null && content.length > 0
+    && Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime")) === 0) {
+    const remote = await probeRemoteNoteState(plugin, file.path)
+    if (remote && remote.contentHash !== "" && remote.contentHash !== contentHash) {
+      await stashUnalignedNote(plugin, file, content)
+      plugin.removeIgnoredFile(file.path)
+      plugin.recordSyncCompleted('note', data.pageIndex)
+      return
+    }
+  }
 
   if (content.length === 0) {
     dump(`Empty note upload: ${data.path}`);
   }
+
+  // 无基线时显式携带 baseHashMissing，服务端据此核验，不把本地内容冒充成服务端基线
+  // With no baseline, explicitly carry baseHashMissing so the server verifies instead of
+  // treating the local bytes as a server baseline.
+  const verifiedBase = typeof plugin.fileHashManager.getVerifiedPathHash === "function"
+    ? plugin.fileHashManager.getVerifiedPathHash(file.path, contentHash)
+    : baseHash
+  const noBaselineFields = verifiedBase === null
+    ? { baseHash: "", baseHashMissing: true, baseRevision: "" }
+    : {}
 
   const sendData = {
     vault: plugin.settings.vault,
@@ -564,8 +858,8 @@ export const receiveNoteUpload = async function (data: ReceivePathMessage, plugi
     pathHash: hashContent(file.path),
     content: content,
     contentHash: contentHash,
-    // 始终传递 baseHash 信息，如果不可用则标记 baseHashMissing
-    ...(baseHash !== null ? { baseHash } : { baseHashMissing: true }),
+    ...buildBaselineFields(plugin, "note", file.path, contentHash),
+    ...noBaselineFields,
   }
   // 将 hash 写入 pending map，等待 NoteModifyAck 确认后再写 hashManager
   // 若此路径已有旧 pending（来自中断的 noteModify），覆盖为最新 hash
@@ -609,6 +903,11 @@ export const receiveNoteSyncMtime = async function (data: ReceiveMtimeMessage, p
       const file = plugin.app.vault.getFileByPath(normalizedPath)
       if (file) {
         const content: string = await plugin.app.vault.read(file)
+        // 内容一致确认通道：只有本地当前内容仍等于消息内容时才建立可信基线（设计稿 §5.2 第 3 条）
+        // Content-equality confirmation: only establish a trusted baseline when the local content
+        // still equals the message content (design §5.2 rule 3)
+        const localHashNow = typeof data.contentHash === "string" && data.contentHash !== ""
+          ? await hashContentAsync(content) : null
         plugin.addIgnoredFile(normalizedPath)
         try {
           await plugin.app.vault.modify(file, content, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
@@ -617,8 +916,14 @@ export const receiveNoteSyncMtime = async function (data: ReceiveMtimeMessage, p
           // 服务端走 UpdateMtime 说明内容 hash 与客户端发送的一致，提交 pending hash 到 hashManager
           // Server UpdateMtime means content hash matches what client sent; commit pending hash to hashManager
           const pendingHash = plugin.pendingNoteModifies.get(data.path)
-          if (pendingHash !== undefined) {
-            plugin.fileHashManager.setFileHash(data.path, pendingHash, mtime || 0, file.stat.size)
+          const revision = typeof data.revision === "string" && data.revision !== "" ? data.revision : "";
+          const confirmable = localHashNow !== null && localHashNow === data.contentHash;
+          if (confirmable && revision !== "" && plugin.fileHashManager.setConfirmedBaseline) {
+            plugin.fileHashManager.setConfirmedBaseline(data.path, data.contentHash as string, revision, mtime || 0, file.stat.size);
+          }
+          if (pendingHash !== undefined && (localHashNow === null || pendingHash === data.contentHash || localHashNow === pendingHash)) {
+            if (revision !== "") plugin.fileHashManager.setFileHash(data.path, pendingHash, mtime || 0, file.stat.size, true, revision)
+          else plugin.fileHashManager.setFileHash(data.path, pendingHash, mtime || 0, file.stat.size)
             plugin.pendingNoteModifies.delete(data.path)
             plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies)
           }
@@ -761,7 +1066,7 @@ export const receiveNoteSyncEnd = async function (data: unknown, plugin: FastSyn
 /**
  * 接收服务端笔记重命名通知
  */
-export const receiveNoteSyncRename = async function (data: { path: string, oldPath: string, contentHash: string, mtime?: number, ctime?: number, lastTime?: number, pathHash?: string, pageIndex?: number }, plugin: FastSync) {
+export const receiveNoteSyncRename = async function (data: { path: string, oldPath: string, contentHash: string, mtime?: number, ctime?: number, lastTime?: number, pathHash?: string, pageIndex?: number, revision?: string }, plugin: FastSync) {
   if (plugin.settings.syncEnabled == false) return
   if (isPathExcluded(data.path, plugin) || isPathExcluded(data.oldPath, plugin)) {
     plugin.recordSyncCompleted('note', data.pageIndex)
@@ -834,7 +1139,11 @@ export const receiveNoteSyncRename = async function (data: { path: string, oldPa
           // 更新哈希表：移除旧路径，添加新路径
           plugin.fileHashManager.removeFileHash(data.oldPath)
           const renamedFile = plugin.app.vault.getFileByPath(normalizedNewPath)
-          plugin.fileHashManager.setFileHash(data.path, data.contentHash, mtime || (renamedFile instanceof TFile ? renamedFile.stat.mtime : 0), renamedFile instanceof TFile ? renamedFile.stat.size : 0)
+          if (typeof data.revision === "string" && data.revision !== "") {
+            plugin.fileHashManager.setFileHash(data.path, data.contentHash, mtime || (renamedFile instanceof TFile ? renamedFile.stat.mtime : 0), renamedFile instanceof TFile ? renamedFile.stat.size : 0, true, data.revision)
+          } else {
+            plugin.fileHashManager.setFileHash(data.path, data.contentHash, mtime || (renamedFile instanceof TFile ? renamedFile.stat.mtime : 0), renamedFile instanceof TFile ? renamedFile.stat.size : 0)
+          }
 
           // 更新同步时间
           advanceLiveSyncTime(plugin, "lastNoteSyncTime", data.lastTime)
@@ -892,15 +1201,41 @@ export const receiveNoteSyncRename = async function (data: { path: string, oldPa
 
 // 收到 NoteModifyAck，将 pending hash 转移到正式 hashManager 并更新 lastNoteSyncTime
 // Receive NoteModifyAck, move pending hash to formal hashManager and update lastNoteSyncTime
-export const receiveNoteModifyAck = function (data: { lastTime?: number; path?: string }, plugin: FastSync, outsideRound = false) {
+export const receiveNoteModifyAck = async function (data: { lastTime?: number; path?: string; contentHash?: string; revision?: string }, plugin: FastSync, outsideRound = false) {
   // 服务端确认笔记写入成功，将 pending hash 转移到正式 hashManager
   // Server confirmed note write success, move pending hash to formal hashManager
   if (data.path) {
-    const contentHash = plugin.pendingNoteModifies.get(data.path)
-    if (contentHash !== undefined) {
-      // 尝试获取本地文件信息以存入缓存
-      const file = plugin.app.vault.getFileByPath(normalizePath(data.path))
-      plugin.fileHashManager.setFileHash(data.path, contentHash, file?.stat.mtime || 0, file?.stat.size || 0)
+    const file = plugin.app.vault.getFileByPath(normalizePath(data.path))
+    const pendingHash = plugin.pendingNoteModifies.get(data.path)
+    const ackHash = typeof data.contentHash === "string" && data.contentHash !== "" ? data.contentHash : undefined
+    if (ackHash && plugin.isSyncBaselineModeEnabled?.() === true && plugin.fileHashManager.setConfirmedBaseline) {
+      // 回执只能确认“发送时的快照”，绝不能把上传途中产生的新编辑当成已同步（设计稿 §5.2）
+      // An Ack confirms only the sent snapshot, never an edit made during the upload (§5.2)
+      let diskHash: string | null = null
+      if (file) {
+        try { diskHash = await hashContentAsync(await plugin.app.vault.read(file)) } catch { diskHash = null }
+      }
+      plugin.fileHashManager.setConfirmedBaseline(data.path, ackHash,
+        typeof data.revision === "string" ? data.revision : "",
+        file?.stat.mtime || 0, file?.stat.size || 0, diskHash === ackHash)
+      if (pendingHash === ackHash) {
+        plugin.pendingNoteModifies.delete(data.path)
+        plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies)
+      }
+      if (diskHash !== null && diskHash !== ackHash) {
+        // 上传途中继续编辑：保留新编辑并立即安排携带刚确认基线的后续上传
+        // Edited during upload: keep the new edit and immediately schedule a follow-up upload
+        // carrying the just-confirmed baseline
+        dump(`[Baseline] Ack confirmed ${ackHash}, disk changed to ${diskHash}; scheduling follow-up upload`, data.path)
+        plugin.pendingNoteModifies.set(data.path, diskHash)
+        plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies)
+        window.setTimeout(() => {
+          const current = plugin.app.vault.getFileByPath(normalizePath(data.path as string))
+          if (current) void noteModify(current, plugin, true)
+        }, 0)
+      }
+    } else if (pendingHash !== undefined) {
+      plugin.fileHashManager.setFileHash(data.path, pendingHash, file?.stat.mtime || 0, file?.stat.size || 0)
       plugin.pendingNoteModifies.delete(data.path)
       plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies)
     } else {
@@ -954,6 +1289,11 @@ export const receiveNoteRenameAck = function (data: { lastTime?: number; path?: 
 // Receive NoteDeleteAck; only remove from hashManager if path is still pending
 export const receiveNoteDeleteAck = function (data: { lastTime?: number; path?: string }, plugin: FastSync) {
   const retryAck = plugin.retryQueue?.matchesAck("NoteDeleteAck", data.path) ?? false
+  if (data.path) {
+    // 删除已确认：待删基线完成使命，连同活跃缓存一起清除
+    // Delete confirmed: the pre-delete record has served its purpose; drop it with the active cache
+    plugin.fileHashManager.clearPendingDeleteBaseline?.(data.path)
+  }
   if (data.path && plugin.pendingNoteDeleteAcks.has(data.path)) {
     plugin.fileHashManager.removeFileHash(data.path)
     plugin.pendingNoteDeleteAcks.delete(data.path)

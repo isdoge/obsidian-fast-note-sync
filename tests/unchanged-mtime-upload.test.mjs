@@ -18,7 +18,7 @@ let localHash = "base";
 const ops = load("src/lib/sync/operator_file.ts", id => id === "obsidian" ? { TFile, normalizePath: p => p, Platform: { isMobile: false } }
   : id.includes("helpers") ? new Proxy({ isPathExcluded: () => false, isLargeBinarySyncRisk: () => false, hashFileAsync: async () => localHash,
       hashContent: () => "p", getSafeCtime: s => s.ctime }, { get: (t, k) => t[k] ?? noop })
-  : id.includes("sync_log_manager") ? { SyncLogManager: { getInstance: () => ({ addLog: noop }) } } : {});
+  : id.includes("sync_log_manager") ? { SyncLogManager: { getInstance: () => ({ addLog: noop }) } } : id.includes("baseline_scope") ? { buildBaselineFields: (plugin, kind, path) => { if (kind === "folder" || !plugin) return {}; const m = kind === "setting" ? plugin.configHashManager : plugin.fileHashManager; const b = m && typeof m.getPathHash === "function" ? m.getPathHash(path) : null; return b !== null && b !== undefined ? { baseHash: b } : { baseHashMissing: true }; }, buildDeleteBaselineFields: () => ({}), baselineFieldsFromDeleteRecord: () => ({}), computeRemoteScope: () => "scope", parseScopedState: () => ({ state: { scope: "scope", revisions: {}, pendingDeletes: {} }, scopeChanged: false }), serializeScopedState: (state) => JSON.stringify(state) } : id.includes("conflict_store") ? { storeSyncConflict: async () => false, normalizeConflict: () => null, conflictKindToSyncType: () => "note", conflictReasonLabel: () => "", conflictKindLabel: () => "" } : {});
 
 async function modify({ hash, pending = false, force = false }) {
   localHash = hash;
@@ -41,7 +41,7 @@ assert.equal(await modify({ hash: "base", force: true }), 1, "forced checks stil
 
 const storage = new Map();
 const { FileHashManager } = load("src/lib/storage/file_hash_manager.ts", id => id.includes("helpers")
-  ? { debounce: fn => fn, dump: noop, LocalStateFileMirror: class { scheduleWrite() {} flush() {} write() {} } } : id.includes("i18n") ? { $: k => k } : {});
+  ? { debounce: fn => fn, dump: noop, LocalStateFileMirror: class { scheduleWrite() {} flush() {} write() {} } } : id.includes("i18n") ? { $: k => k } : id.includes("baseline_scope") ? { buildBaselineFields: (plugin, kind, path) => { if (kind === "folder" || !plugin) return {}; const m = kind === "setting" ? plugin.configHashManager : plugin.fileHashManager; const b = m && typeof m.getPathHash === "function" ? m.getPathHash(path) : null; return b !== null && b !== undefined ? { baseHash: b } : { baseHashMissing: true }; }, buildDeleteBaselineFields: () => ({}), baselineFieldsFromDeleteRecord: () => ({}), computeRemoteScope: () => "scope", parseScopedState: () => ({ state: { scope: "scope", revisions: {}, pendingDeletes: {} }, scopeChanged: false }), serializeScopedState: (state) => JSON.stringify(state) } : id.includes("conflict_store") ? { storeSyncConflict: async () => false, normalizeConflict: () => null, conflictKindToSyncType: () => "note", conflictReasonLabel: () => "", conflictKindLabel: () => "" } : {});
 const m = new FileHashManager({ app: { saveLocalStorage: (k, v) => storage.set(k, v) } });
 m.setFileHash("board.canvas", "base", 100, 10);
 assert.equal(m.getSyncedMtime("board.canvas"), 100, "synced mtime available while the cache matches the baseline");

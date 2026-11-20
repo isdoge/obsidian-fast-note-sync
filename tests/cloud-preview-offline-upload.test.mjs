@@ -36,7 +36,9 @@ function load(rel, modules = {}) {
     module, exports: module.exports, console, Map, Set, WeakMap, URLSearchParams, TextEncoder,
     window: { setTimeout: () => 1, clearTimeout: noop },
     require(id) {
-      if (id in modules) return modules[id];
+      if (id.includes("baseline_scope")) return { buildBaselineFields: (plugin, kind, path) => { if (kind === "folder" || !plugin) return {}; const m = kind === "setting" ? plugin.configHashManager : plugin.fileHashManager; const b = m && typeof m.getPathHash === "function" ? m.getPathHash(path) : null; return b !== null && b !== undefined ? { baseHash: b } : { baseHashMissing: true }; }, buildDeleteBaselineFields: () => ({}), baselineFieldsFromDeleteRecord: () => ({}), computeRemoteScope: () => "scope", parseScopedState: () => ({ state: { scope: "scope", revisions: {}, pendingDeletes: {} }, scopeChanged: false }), serializeScopedState: (state) => JSON.stringify(state) };
+    if (id.includes("conflict_store")) return { storeSyncConflict: async () => false, normalizeConflict: () => null, conflictKindToSyncType: () => "note", conflictReasonLabel: () => "", conflictKindLabel: () => "" };
+          if (id in modules) return modules[id];
       if (id === "obsidian") return {
         TFile, normalizePath: p => p, Platform: { isMobile: false },
         requestUrl: async ({ url }) => {

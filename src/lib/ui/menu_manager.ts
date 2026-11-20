@@ -4,13 +4,15 @@ import { startupSync, startupFullSync, resetSettingSyncTime, rebuildAllHashes, c
 import { AppWithInternal, MenuItemWithDom, MenuWithHide, MenuItemWithInternal } from "../utils/types";
 import { NoteHistoryModal } from '../../views/note-history/history-modal';
 import { RecycleBinModal } from '../../views/recycle-bin-modal';
-import { showSyncNotice, getPluginDir, hashContent } from '../utils/helpers';
+import { showSyncNotice } from '../utils/helpers';
 import { ShareModal } from '../../views/share-modal';
 import { AboutModal } from '../../views/about-modal';
 import { $ } from "../../i18n/lang";
 import FastSync from "../../main";
 import { StatusBarManager } from './status_bar_manager';
 import { SyncLogManager } from '../sync/sync_log_manager';
+import { conflictBackupPaths, readConflictMeta } from '../sync/operator_note';
+import { FireflyPostModal, CreateFireflyPostModal, CheckFireflyPostModal, activeMarkdownFile, triggerFireflyPublish } from '../../views/firefly-post-modal';
 
 
 
@@ -207,6 +209,52 @@ export class MenuManager {
         }
       },
     })
+
+    this.registerFireflyCommands()
+  }
+
+  /**
+   * 注册 Firefly 博客相关命令（属性面板 / 新建 / 合规检查 / 立即发布）。
+   * Register the Firefly blog commands.
+   */
+  private registerFireflyCommands() {
+    this.plugin.addCommand({
+      id: "firefly-edit-post-meta",
+      name: $("ui.firefly.cmd_edit_meta"),
+      checkCallback: (checking: boolean) => {
+        const file = activeMarkdownFile(this.plugin.app);
+        if (!file) return false;
+        if (!checking) new FireflyPostModal(this.plugin.app, this.plugin, file).open();
+        return true;
+      },
+    });
+
+    this.plugin.addCommand({
+      id: "firefly-create-post",
+      name: $("ui.firefly.cmd_create_post"),
+      callback: () => {
+        new CreateFireflyPostModal(this.plugin.app, this.plugin).open();
+      },
+    });
+
+    this.plugin.addCommand({
+      id: "firefly-check-post",
+      name: $("ui.firefly.cmd_check_post"),
+      checkCallback: (checking: boolean) => {
+        const file = activeMarkdownFile(this.plugin.app);
+        if (!file) return false;
+        if (!checking) new CheckFireflyPostModal(this.plugin.app, this.plugin, file).open();
+        return true;
+      },
+    });
+
+    this.plugin.addCommand({
+      id: "firefly-trigger-publish",
+      name: $("ui.firefly.cmd_trigger_publish"),
+      callback: () => {
+        void triggerFireflyPublish(this.plugin);
+      },
+    });
   }
 
 
@@ -764,6 +812,32 @@ export class MenuManager {
     }
   }
 
+  /**
+   * 判定一个配置路径的本地内容是否为二进制（含 NUL 或严格 UTF-8 解码失败）。
+   * 虚拟配置（`_localStorage/`）始终是字符串，不算二进制；磁盘项用 readBinary 判定，
+   * 与配置通道的编码规则一致。读取失败按文本处理，交给差异编辑器。
+   *
+   * Whether a setting path's local content is binary (contains NUL or fails strict UTF-8). Virtual
+   * settings (`_localStorage/`) are always strings; disk items are judged from readBinary, matching
+   * the config-channel encoding rule. A read failure is treated as text for the diff editor.
+   */
+  private async isBinarySettingFile(path: string): Promise<boolean> {
+    if (path.startsWith("_localStorage/")) return false;
+    try {
+      const adapter = this.plugin.app.vault.adapter;
+      const normalized = normalizePath(path);
+      if (!(await adapter.exists(normalized))) return false;
+      const bytes = new Uint8Array(await adapter.readBinary(normalized));
+      for (let i = 0; i < bytes.length; i++) {
+        if (bytes[i] === 0) return true;
+      }
+      new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
   removeConflictedPath(path: string): void {
     const normalizedPath = normalizePath(path);
     this.plugin.syncState.conflictedPaths.delete(normalizedPath);
@@ -778,27 +852,110 @@ export class MenuManager {
       return;
     }
     const file = this.plugin.app.vault.getFileByPath(normalizedPath);
-    if (!file) {
-      new Notice($("ui.conflict.missing_local", { path: normalizedPath }));
-      new NoteHistoryModal(this.plugin.app, this.plugin, normalizedPath).open();
-      return;
-    }
 
     try {
       const adapter = this.plugin.app.vault.adapter;
-      const safeName = normalizedPath.replace(/\.md$/, "").replace(/[/\\]/g, "_");
-      const pathHash = hashContent(normalizedPath);
-      const conflictDir = `${getPluginDir(this.plugin)}/conflict-notes`;
-      const baseBackupPath = `${conflictDir}/${safeName}_${pathHash}.base.md`;
-      const remoteBackupPath = `${conflictDir}/${safeName}_${pathHash}.remote.md`;
+      const { baseBackupPath, remoteBackupPath } = conflictBackupPaths(this.plugin, normalizedPath);
+      const meta = await readConflictMeta(this.plugin, normalizedPath);
+      // 四类资源分流：附件/目录用选择框，笔记与文本配置用差异编辑器（设计稿 §5.3）
+      // Route by kind: attachments/folders use a choice modal, notes and text settings use the
+      // diff editor (design §5.3)
+      const conflictStoreMod = await import("../sync/conflict_store");
+      const conflictResolveMod = await import("../sync/conflict_resolve");
+      const unified = typeof conflictStoreMod.readUnifiedConflictMeta === "function"
+        ? await conflictStoreMod.readUnifiedConflictMeta(this.plugin, normalizedPath)
+        : null;
+      const configPrefix = `${this.plugin.app.vault.configDir}/`;
+      const conflictKind = unified?.kind
+        || ((this.plugin.app.vault.configDir && normalizedPath.startsWith(configPrefix)) || normalizedPath.startsWith("_localStorage/")
+          ? "setting"
+          : (normalizedPath.endsWith(".md") ? "note" : "file"));
+      // 二进制配置（fns-bin-v1 信封 / 磁盘非 UTF-8 或含 NUL）绝不能进文本三栏编辑器：
+      // 元数据标记为二进制，或本地文件读出来不是合法 UTF-8，一律改走三选一选择框。
+      // Binary settings (fns-bin-v1 envelope / non-UTF-8 or NUL-bearing disk file) must never enter
+      // the text diff editor: when the metadata marks it binary, or the local file is not valid
+      // UTF-8, route to the three-way choice modal instead.
+      let binarySetting = false;
+      if (conflictKind === "setting") {
+        binarySetting = unified?.isBinary === true || await this.isBinarySettingFile(normalizedPath);
+      }
+      const supportsDiff = typeof conflictResolveMod.conflictSupportsDiffEditor === "function"
+        ? conflictResolveMod.conflictSupportsDiffEditor(conflictKind)
+        : (conflictKind === "note" || conflictKind === "setting");
+      if (binarySetting || !supportsDiff || (!file && conflictKind !== "setting" && unified)) {
+        const { ConflictChoiceModal } = await import("../../views/conflict-choice-modal");
+        new ConflictChoiceModal(this.plugin.app, this.plugin, normalizedPath).open();
+        return;
+      }
+      if (!file && conflictKind !== "setting") {
+        new Notice($("ui.conflict.missing_local", { path: normalizedPath }));
+        new NoteHistoryModal(this.plugin.app, this.plugin, normalizedPath).open();
+        return;
+      }
+      // base 文件存在才算有共同祖先；空文件是“真实空 base”，不存在是“缺基线”，两者文案不同
+      // base exists => real ancestor (an empty file is a real empty base); absent => missing base
+      const baseExists = await adapter.exists(baseBackupPath);
+      const baseMissing = !baseExists;
 
       let baseContent = "";
       let serverContent = "";
-      if (await adapter.exists(baseBackupPath)) {
+      if (baseExists) {
         baseContent = await adapter.read(baseBackupPath);
       }
       if (await adapter.exists(remoteBackupPath)) {
         serverContent = await adapter.read(remoteBackupPath);
+      }
+
+      if (conflictKind === "setting") {
+        // 未内联正文的配置无法通过 HTTP 单条拉取：绝不把“没有 .remote”当成远端空串打开三栏。
+        // A setting whose body was not inlined cannot be fetched through the single-item HTTP
+        // endpoint: never open the diff editor with an empty remote pane.
+        if (unified?.hasServerContent === false && !unified.serverDeleted) {
+          new Notice($("ui.conflict.remote_unavailable") || "Could not fetch the remote version.");
+          return;
+        }
+        let settingLocalContent = "";
+        if (normalizedPath.startsWith("_localStorage/")) {
+          const lsKey = normalizedPath.slice("_localStorage/".length);
+          settingLocalContent = window.localStorage.getItem(lsKey) || "";
+        } else if (await adapter.exists(normalizedPath)) {
+          settingLocalContent = await adapter.read(normalizedPath);
+        }
+        const { ConflictResolveModal } = await import("../../views/conflict-resolve-modal");
+        // TFile 不覆盖 .obsidian：用最小路径对象交给弹窗，写盘分支按 kind 走 adapter
+        // TFile does not cover .obsidian: hand the modal a minimal path object; the write branch
+        // uses the adapter for settings
+        const pseudoFile = { path: normalizedPath, stat: { ctime: 0, mtime: 0 } } as unknown as NonNullable<typeof file>;
+        new ConflictResolveModal(this.plugin.app, this.plugin, pseudoFile, settingLocalContent, serverContent, baseContent,
+          unified?.serverHash || unified?.remoteHash || "", baseMissing, {
+            kind: "setting",
+            path: normalizedPath,
+            serverRevision: unified?.serverRevision,
+            serverDeleted: unified?.serverDeleted,
+          }).open();
+        return;
+      }
+
+      if (!file) {
+        new Notice($("ui.conflict.missing_local", { path: normalizedPath }));
+        new NoteHistoryModal(this.plugin.app, this.plugin, normalizedPath).open();
+        return;
+      }
+
+      // 530 未内联正文时 .remote 不存在并不代表远端为空：按需单条拉取并核对检测时的 serverHash。
+      // 拉不到就提示并拒绝打开，绝不让空远端栏冒充“远端已清空”。
+      // A missing .remote for an un-inlined (530) body does not mean the remote is empty: fetch the
+      // single note and verify it against the detection-time serverHash. Refuse to open the editor
+      // when it is unavailable so an empty remote pane is never mistaken for empty remote content.
+      if (unified?.hasServerContent === false && !unified.serverDeleted) {
+        const remoteBody = typeof conflictResolveMod.loadRemoteNoteBody === "function"
+          ? await conflictResolveMod.loadRemoteNoteBody(this.plugin, normalizedPath, unified)
+          : null;
+        if (!remoteBody) {
+          new Notice($("ui.conflict.remote_unavailable") || "Could not fetch the remote version.");
+          return;
+        }
+        serverContent = remoteBody.body;
       }
 
       const localContent = await this.plugin.app.vault.read(file);
@@ -826,8 +983,15 @@ export class MenuManager {
         }
       }
 
+      serverHash = unified?.serverHash || serverHash;
+      if (baseMissing && meta?.remoteHash && !serverHash) serverHash = meta.remoteHash;
       const { ConflictResolveModal } = await import("../../views/conflict-resolve-modal");
-      new ConflictResolveModal(this.plugin.app, this.plugin, file, localContent, serverContent, baseContent, serverHash).open();
+      new ConflictResolveModal(this.plugin.app, this.plugin, file, localContent, serverContent, baseContent, serverHash, baseMissing, {
+        kind: conflictKind,
+        path: normalizedPath,
+        serverRevision: unified?.serverRevision,
+        serverDeleted: unified?.serverDeleted,
+      }).open();
     } catch (e) {
       console.error("Failed to open conflict resolver for path:", e);
       new Notice($("ui.conflict.open_failed", { path: normalizedPath }));

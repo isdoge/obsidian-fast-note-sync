@@ -83,7 +83,9 @@ const fhmRequireStub = (id) => {
     case "../../main":
       return {};
     default:
-      throw new Error(`Unexpected require in file_hash_manager: ${id}`);
+      if (id.includes("baseline_scope")) return { buildBaselineFields: (plugin, kind, path) => { if (kind === "folder" || !plugin) return {}; const m = kind === "setting" ? plugin.configHashManager : plugin.fileHashManager; const b = m && typeof m.getPathHash === "function" ? m.getPathHash(path) : null; return b !== null && b !== undefined ? { baseHash: b } : { baseHashMissing: true }; }, buildDeleteBaselineFields: () => ({}), baselineFieldsFromDeleteRecord: () => ({}), computeRemoteScope: () => "scope", parseScopedState: () => ({ state: { scope: "scope", revisions: {}, pendingDeletes: {} }, scopeChanged: false }), serializeScopedState: (state) => JSON.stringify(state) };
+    if (id.includes("conflict_store")) return { storeSyncConflict: async () => false, normalizeConflict: () => null, conflictKindToSyncType: () => "note", conflictReasonLabel: () => "", conflictKindLabel: () => "" };
+    throw new Error(`Unexpected require in file_hash_manager: ${id}`);
   }
 };
 const { FileHashManager } = loadModule("src/lib/storage/file_hash_manager.ts", fhmRequireStub);
@@ -176,7 +178,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const plugin = makeFakePlugin(ls, files);
   const mgr = new FileHashManager(plugin);
   await mgr.initialize();
-  assert.equal(mgr.getPathHash("old/n.md"), "h-old", "旧 key 数据应可读到");
+  // 阶段 B：旧 key 迁移只恢复磁盘缓存，不伪造可信同步基线
+  // Stage B: legacy-key migration restores the disk cache only, never a trusted baseline
+  assert.equal(mgr.getValidHash("old/n.md", 1, 2), "h-old", "旧 key 数据应可读到");
+  assert.equal(mgr.getPathHash("old/n.md"), null, "旧 key 数据不冒充可信基线");
   assert.equal(ls.has("fns-fileHashMap"), true, "旧 key 数据应迁移到稳定 key");
 }
 

@@ -1,7 +1,9 @@
-import { App, Modal, setIcon, TFile, Platform, Notice } from "obsidian";
+import { App, Modal, setIcon, TFile, Platform, Notice, normalizePath } from "obsidian";
 import type FastSync from "../main";
 import { $ } from "../i18n/lang";
-import { hashContent, hashContentAsync, getPluginDir } from "../lib/utils/helpers";
+import { hashContent, hashContentAsync } from "../lib/utils/helpers";
+import { removeConflictBackups } from "../lib/sync/operator_note";
+import { configModify } from "../lib/sync/operator_config";
 
 /**
  * ConflictResolveModal provides a 3-column diff view for manual note conflict resolution.
@@ -24,6 +26,13 @@ export class ConflictResolveModal extends Modal {
   private serverContent: string;
   private baseContent: string;
   private serverHash: string;
+  /** 是否缺少共同祖先基线（区分“真实空 base”与“无基线”）/ Whether the common ancestor is missing */
+  private baseMissing: boolean;
+  /** 资源类型与完整路径（配置冲突时 file 对象不可用）/ Kind and full path (config conflicts have no TFile) */
+  private kind: string;
+  private targetPath: string;
+  private serverRevision: string;
+  private serverDeleted: boolean;
 
   private editorEl: HTMLTextAreaElement;
   private editorContainerEl: HTMLElement;
@@ -38,7 +47,9 @@ export class ConflictResolveModal extends Modal {
     localContent: string,
     serverContent: string,
     baseContent: string,
-    serverHash: string
+    serverHash: string,
+    baseMissing: boolean = false,
+    options: { kind?: string; path?: string; serverRevision?: string; serverDeleted?: boolean } = {}
   ) {
     super(app);
     this.plugin = plugin;
@@ -47,6 +58,43 @@ export class ConflictResolveModal extends Modal {
     this.serverContent = serverContent;
     this.baseContent = baseContent;
     this.serverHash = serverHash;
+    this.baseMissing = baseMissing;
+    this.kind = options.kind || "note";
+    this.targetPath = options.path || file.path;
+    this.serverRevision = options.serverRevision || "";
+    this.serverDeleted = options.serverDeleted === true;
+  }
+
+  /**
+   * 应用文本配置的合并结果：虚拟配置必须写回 localStorage，否则随后 receiveConfigModifyAck
+   * 读到的本地哈希仍是被合并前的旧值，会被当成“上传途中又编辑”并触发一次回环重传。
+   * 走 handleReceivedUpdate 同时记录哈希与时间戳，不产生回环。磁盘配置仍写文件。
+   * Apply a merged text setting: virtual configs must be written back into localStorage, otherwise
+   * the following receiveConfigModifyAck reads the pre-merge value, treats it as an edit made
+   * during upload and schedules a loop resend. handleReceivedUpdate records the hash/mtime and
+   * breaks the loop. Disk configs are still written to their file.
+   */
+  private async applySettingResolution(finalContent: string): Promise<void> {
+    const isVirtual = this.plugin.localStorageManager.isVirtualPath(this.targetPath);
+    if (isVirtual) {
+      await this.plugin.localStorageManager.handleReceivedUpdate(this.targetPath, finalContent);
+    } else {
+      await this.app.vault.adapter.write(normalizePath(this.targetPath), finalContent);
+    }
+    this.plugin.menuManager.removeConflictedPath(this.targetPath);
+    // 先受控提交，提交成功后才清理冲突备份：清理在前会让提交失败时既丢了远端版本，
+    // 又失去了冲突标记（无法再次打开解决窗口）
+    // Submit first, clean up backups only after it succeeds: cleaning first loses both the
+    // stashed remote version and the conflict marker when the submit fails
+    await this.plugin.lockManager.withLock(this.targetPath, async () => {
+      await configModify(this.targetPath, this.plugin, false, isVirtual ? finalContent : undefined, true,
+        { isConflictResolved: true, baseRevision: this.serverRevision });
+    }, { maxRetries: 2, retryInterval: 50 });
+    try {
+      await removeConflictBackups(this.plugin, this.targetPath);
+    } catch (e) {
+      console.error("Failed to clean up conflict-notes files on resolve:", e);
+    }
   }
 
   onOpen() {
@@ -60,15 +108,25 @@ export class ConflictResolveModal extends Modal {
     const { contentEl, titleEl } = this;
 
     titleEl.createSpan({ text: $("ui.conflict.modal_title") || "冲突解决" });
-    titleEl.createDiv({ cls: "title-path", text: ` - ${this.file.path}` });
+    titleEl.createDiv({ cls: "title-path", text: ` - ${this.targetPath}` });
 
     const container = contentEl.createDiv({ cls: "conflict-resolve-container" });
 
     // Render description bar // 渲染描述文案栏
+    // 缺少共同祖先时不能用“对比 Base”的措辞，否则用户会误以为空文本就是真实祖先
+    // Without an ancestor the diff-vs-base wording is misleading: empty text is not a real base
     container.createDiv({
-      cls: "conflict-resolve-desc",
-      text: $("ui.conflict.modal_desc") || "本地版本和远端版本为只读对照，请在最右侧的「冲突解决版本」中编辑出最终内容，然后点击下方「解决冲突」进行保存和提交。"
+      cls: this.baseMissing ? "conflict-resolve-desc conflict-resolve-desc-base-missing" : "conflict-resolve-desc",
+      text: this.baseMissing
+        ? ($("ui.conflict.modal_desc_no_base") || "本地笔记与远端同名笔记内容不同，但两端没有可用的共同基线（可能是首次接入或本地同步状态丢失）。两侧内容均未被改动，请在最右侧编辑最终内容后提交；差异仅作对照，不代表本地或远端是对方的修改。")
+        : ($("ui.conflict.modal_desc") || "本地版本和远端版本为只读对照，请在最右侧的「冲突解决版本」中编辑出最终内容，然后点击下方「解决冲突」进行保存和提交。")
     });
+    if (this.baseMissing) {
+      container.createDiv({
+        cls: "conflict-resolve-base-missing-badge",
+        text: $("ui.conflict.base_missing_badge") || "缺少共同基线 · 两侧均保留",
+      });
+    }
 
     const diffWrap = container.createDiv({ cls: "conflict-resolve-diff-wrap" });
 
@@ -341,6 +399,12 @@ export class ConflictResolveModal extends Modal {
         // Use raw textarea content directly — no diff markup to clean // 直接使用编辑器纯文本，无需清洗差异标记
         const finalContent = this.editorEl.value;
 
+        if (this.kind === "setting") {
+          await this.applySettingResolution(finalContent);
+          this.close();
+          return;
+        }
+
         // 1. Overwrite local file // 覆写本地文件
         await this.app.vault.modify(this.file, finalContent);
 
@@ -348,9 +412,11 @@ export class ConflictResolveModal extends Modal {
         const contentHash = await hashContentAsync(finalContent);
         const data = {
           vault: this.plugin.settings.vault,
-          path: this.file.path,
-          pathHash: hashContent(this.file.path),
+          path: this.targetPath,
+          pathHash: hashContent(this.targetPath),
           baseHash: this.serverHash,
+          ...(this.serverDeleted || this.serverHash === "" ? { baseHashMissing: true } : {}),
+          ...(this.serverRevision ? { baseRevision: this.serverRevision } : {}),
           content: finalContent,
           contentHash: contentHash,
           ctime: this.file.stat.ctime,
@@ -359,46 +425,24 @@ export class ConflictResolveModal extends Modal {
         };
 
         // Remove path from suppressed collection // 解除路径抑制
-        this.plugin.menuManager.removeConflictedPath(this.file.path);
+        this.plugin.menuManager.removeConflictedPath(this.targetPath);
 
-        // 清理本地 conflict-notes 中的备份文件 (位于插件目录下，文件名附加路径哈希以防碰撞)
-        try {
-          const adapter = this.app.vault.adapter;
-          const safeName = this.file.path.replace(/\.md$/, "").replace(/[/\\]/g, "_");
-          const pathHash = hashContent(this.file.path);
-          const conflictDir = `${getPluginDir(this.plugin)}/conflict-notes`;
-          const baseBackupPath = `${conflictDir}/${safeName}_${pathHash}.base.md`;
-          const remoteBackupPath = `${conflictDir}/${safeName}_${pathHash}.remote.md`;
-
-          const deletePromises: Promise<void>[] = [];
-          if (await adapter.exists(baseBackupPath)) {
-            deletePromises.push(adapter.remove(baseBackupPath));
-          }
-          if (await adapter.exists(remoteBackupPath)) {
-            deletePromises.push(adapter.remove(remoteBackupPath));
-          }
-          await Promise.all(deletePromises);
-
-          // 如果 conflict-notes 文件夹已空，则尝试一并清理（若被 Windows 锁定 busy 则静默忽略）
-          if (await adapter.exists(conflictDir)) {
-            const files = await adapter.list(conflictDir);
-            if (files && files.files.length === 0 && files.folders.length === 0) {
-              try {
-                await adapter.rmdir(conflictDir, true);
-              } catch {
-                // Ignore EBUSY/locked folder error, keeping empty folder is harmless // 忽略文件夹繁忙/锁定错误，保留空文件夹无害
-              }
-            }
-          }
-        } catch (e) {
-          console.error("Failed to clean up conflict-notes files on resolve:", e);
-        }
-
-        if (!await this.plugin.concurrencyLimiter.waitForSlot(this.file.path)) {
+        if (!await this.plugin.concurrencyLimiter.waitForSlot(this.targetPath)) {
           this.close();
           return;
         }
-        void this.plugin.websocket.SendMessage("NoteModify", data);
+        // 先受控提交（等消息写入连接），再清理备份：提交失败时保留冲突备份与元数据，便于重新打开解决窗口
+        // Submit under control (wait until the frame is written), then clean up backups: a failed
+        // submit keeps the backups and metadata so the resolver can be reopened
+        await this.plugin.websocket.SendMessage("NoteModify", data);
+
+        // 清理本地 conflict-notes 中的备份文件（含阶段 B 的元数据与本地侧备份）
+        // Clean up conflict-notes backups, including the stage-B metadata and local-side copy
+        try {
+          await removeConflictBackups(this.plugin, this.targetPath);
+        } catch (e) {
+          console.error("Failed to clean up conflict-notes files on resolve:", e);
+        }
 
         this.close();
       } catch (err) {

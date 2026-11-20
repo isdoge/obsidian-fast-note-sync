@@ -3,9 +3,9 @@ import { TFolder, TFile, normalizePath } from "obsidian";
 import { receiveFileUpload, receiveFileSyncUpdate, receiveFileSyncDelete, receiveFileSyncMtime, receiveFileSyncChunkDownload, receiveFileSyncEnd, checkAndUploadAttachments, receiveFileSyncRename, receiveFileRenameAck, receiveFileUploadAck, receiveFileDeleteAck, isPluginUnloading, sweepStalledDownloadSessions, invalidateFileDownloads, isAttachmentUploadActive } from "./operator_file";
 import { hashContent, hashContentAsync, dump, isPathExcluded, isFolderSyncPathExcluded, configIsPathExcluded, getConfigSyncCustomDirs, generateUUID, showSyncNotice, isLargeBinarySyncRisk, describeBinarySyncLimit, hashFileAsync, formatFileSize, yieldToMain, getPluginDir } from "../utils/helpers";
 import { receiveConfigSyncModify, receiveConfigUpload, receiveConfigSyncMtime, receiveConfigSyncDelete, receiveConfigSyncEnd, configAllPaths, receiveConfigSyncClear, receiveConfigModifyAck, receiveConfigDeleteAck } from "./operator_config";
-import { receiveNoteSyncModify, receiveNoteUpload, receiveNoteSyncMtime, receiveNoteSyncDelete, receiveNoteSyncEnd, receiveNoteSyncRename, receiveNoteModifyAck, receiveNoteRenameAck, receiveNoteDeleteAck } from "./operator_note";
+import { receiveNoteSyncModify, receiveNoteUpload, receiveNoteSyncMtime, receiveNoteSyncDelete, receiveNoteSyncEnd, receiveNoteSyncRename, receiveNoteModifyAck, receiveNoteRenameAck, receiveNoteDeleteAck, conflictBackupPaths } from "./operator_note";
 import { SyncMode, SnapFile, SnapFolder, SyncEndData, PathHashFile, NoteSyncData, FileSyncData, ConfigSyncData, FolderSyncData } from "../utils/types";
-import { receiveFolderSyncModify, receiveFolderSyncDelete, receiveFolderSyncRename, receiveFolderSyncEnd, receiveFolderRetryAck } from "./operator_folder";
+import { receiveFolderSyncModify, receiveFolderSyncDelete, receiveFolderSyncRename, receiveFolderSyncEnd, receiveFolderModifyAck, receiveFolderDeleteAckWithRevision, receiveFolderRenameAckWithRevision } from "./operator_folder";
 import { FileCloudPreview } from "../storage/file_cloud_preview";
 import { SyncLogManager } from "./sync_log_manager";
 import * as WSAction from "./websocket_action";
@@ -13,6 +13,8 @@ import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
 import { SyncType } from "./sync_progress_tracker";
 import { ConfirmModal } from "../../views/confirm-modal";
+import { buildBaselineFields, buildDeleteBaselineFields } from "../storage/baseline_scope";
+import { conflictKindToSyncType, normalizeConflict, storeSyncConflict } from "./conflict_store";
 
 // C9: 离线超墓碑期保护 — 默认与服务端 soft-delete-retention-time 默认值对应（90 天），
 // 先硬编码常量；服务端墓碑物理清除窗口过后，长期离线设备重连若检测到"本地有服务端无"的
@@ -220,6 +222,7 @@ function restartStalledSync(plugin: FastSync, intervalId?: number): void {
   plugin.totalChunksToUpload = 0;
   plugin.uploadedChunksCount = 0;
   plugin.isSyncing = false;
+  plugin.syncState.silentSync = false;
   plugin.progressTracker.forceComplete();
   if (giveUp) {
     plugin.updateStatusBar($("ui.status.stalled_gave_up"));
@@ -379,10 +382,33 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, _sync
     const completionText = totalFailed > 0
       ? $("ui.status.completed_with_failures", { count: String(totalFailed) })
       : $("ui.status.completed");
-    if (plugin.settings.isShowNotice) {
+    if (plugin.settings.isShowNotice && !plugin.syncState.silentSync) {
       showSyncNotice(completionText);
     }
+    plugin.syncState.silentSync = false;
     plugin.updateStatusBar(completionText);
+
+    // 本轮因“本地有内容但无可信基线”进入待对齐的笔记合并提示一次，避免逐篇 Notice 刷屏
+    // One aggregated notice for notes queued for alignment this round, not one Notice per note
+    const unalignedThisRound = plugin.syncState.newUnalignedPathsThisRound?.size ?? 0;
+    if (unalignedThisRound > 0) {
+      if (plugin.settings.isShowNotice) {
+        showSyncNotice($("ui.conflict.unaligned_summary", { count: String(unalignedThisRound) }), 12000);
+      }
+      plugin.syncState.newUnalignedPathsThisRound.clear();
+    }
+
+    // 本轮存在基线冲突时合并提示一次：冲突已计入冲突计数，但绝不当作上传成功
+    // One aggregated notice when this round persisted baseline conflicts; they are counted as
+    // conflicts, never as successful uploads
+    const conflictCount = Array.from(plugin.syncState.conflictCountsThisRound?.values() ?? [])
+      .reduce((sum, count) => sum + count, 0);
+    if (conflictCount > 0) {
+      if (plugin.settings.isShowNotice) {
+        showSyncNotice($("ui.conflict.round_summary", { count: String(conflictCount) }), 12000);
+      }
+      plugin.syncState.conflictCountsThisRound?.clear();
+    }
 
     // 同步成功完成后，如果在此次同步中捕获到了需要手动合并解决的新冲突，则在此时一并弹出冲突文件列表视图
     if (plugin.syncState.newConflictedPathsThisRound.size > 0) {
@@ -486,8 +512,9 @@ export const receiveOperators: Map<WSAction.WSReceiveAction, OperatorHandler> = 
   [WSAction.SettingSyncClear, receiveConfigSyncClear],
   [WSAction.SettingModifyAck, receiveConfigModifyAck],
   [WSAction.SettingDeleteAck, receiveConfigDeleteAck],
-  [WSAction.FolderDeleteAck, (data, plugin) => receiveFolderRetryAck("FolderDeleteAck", data as { path?: string }, plugin)],
-  [WSAction.FolderRenameAck, (data, plugin) => receiveFolderRetryAck("FolderRenameAck", data as { path?: string }, plugin)],
+  [WSAction.FolderModifyAck, (data, plugin) => receiveFolderModifyAck(data as { path?: string; revision?: string }, plugin)],
+  [WSAction.FolderDeleteAck, (data, plugin) => receiveFolderDeleteAckWithRevision(data as { path?: string; revision?: string }, plugin)],
+  [WSAction.FolderRenameAck, (data, plugin) => receiveFolderRenameAckWithRevision(data as { path?: string; revision?: string }, plugin)],
   [WSAction.FolderSyncModify, receiveFolderSyncModify],
   [WSAction.FolderSyncDelete, receiveFolderSyncDelete],
   [WSAction.FolderSyncRename, receiveFolderSyncRename],
@@ -499,6 +526,7 @@ export const receiveOperators: Map<WSAction.WSReceiveAction, OperatorHandler> = 
   [WSAction.SettingSyncBatchAck, (data, plugin) => { plugin.websocket.emit("SettingSyncBatchAck", data); }],
   [WSAction.FolderSyncBatchAck, (data, plugin) => { plugin.websocket.emit("FolderSyncBatchAck", data); }],
   [WSAction.ShareSyncRefresh, receiveShareSyncRefresh],
+  [WSAction.SyncConflict, receiveSyncConflict],
   [WSAction.FolderSyncPage, (data, plugin) => handleSyncPage(data, plugin, "folder")],
   [WSAction.NoteSyncPage, (data, plugin) => handleSyncPage(data, plugin, "note")],
   [WSAction.FileSyncPage, (data, plugin) => handleSyncPage(data, plugin, "file")],
@@ -559,6 +587,28 @@ async function handleSyncPage(data: unknown, plugin: FastSync, type: "note" | "f
  * 收到分享状态变更通知，全量刷新分享路径
  * Received share state change notification, full refresh share paths
  */
+/**
+ * SyncConflict：统一基线冲突通知。阶段 C 只做协议接通与记录，不改变兼容模式下的同步决策
+ * （统一冲突处理在阶段 E 接入）。载荷的 baseHash 由 protobuf_mapper 的
+ * normalizeConflictPayload 归一，空文本哈希 "0" 原样保留。
+ * SyncConflict: the unified baseline conflict notification. Stage C only wires the protocol and
+ * logs it; compatibility-mode decisions are unchanged (unified conflict handling lands in
+ * stage E). The payload's baseHash is normalized by protobuf_mapper.normalizeConflictPayload,
+ * keeping the empty-text hash "0" verbatim.
+ */
+export async function receiveSyncConflict(data: unknown, plugin: FastSync): Promise<void> {
+  const payload = normalizeConflict(data);
+  if (!payload || payload.path === "") return;
+  // 分页下发与单条条件写拒绝共用同一载荷：不受 manualMerge 限制，也不要求远端正文非空
+  // Paged delivery and single conditional-write rejection share one payload: never gated on
+  // manualMerge, and an empty remote body is a legal conflict value
+  const stored = await storeSyncConflict(plugin, data);
+  if (!stored) return;
+  const type = conflictKindToSyncType(payload.kind);
+  const pageIndex = (data as { pageIndex?: number } | null)?.pageIndex;
+  plugin.recordSyncCompleted(type, pageIndex);
+}
+
 function receiveShareSyncRefresh(_data: unknown, plugin: FastSync): void {
   dump("Receive ShareSyncRefresh, triggering share indicator sync");
   void plugin.shareIndicatorManager?.syncWithServer();
@@ -587,6 +637,14 @@ async function receiveSyncEndWrapper(data: unknown, plugin: FastSync, type: "not
   tasks.needModify = syncData.needModifyCount || 0;
   tasks.needSyncMtime = syncData.needSyncMtimeCount || 0;
   tasks.needDelete = syncData.needDeleteCount || 0;
+  // 冲突条目同样经分页下发（SyncConflict 明细 + PageAck 归账），必须计入下载期望：
+  // 漏掉它会让纯冲突轮次 trueTotal===0、不发首拉 PageAck(-1) 就收尾并错误推进游标，
+  // 混合轮次也会因分母偏小而提前判定完成、丢掉后续页的冲突
+  // Conflicts are delivered through the same paged flow (SyncConflict details settled by PageAck),
+  // so they must count toward the download expectation: omitting them makes a conflict-only round
+  // compute trueTotal === 0, skip the initial PageAck(-1), finish early and wrongly advance the
+  // cursor; a mixed round would also finish before the later conflict pages arrive.
+  tasks.needConflict = syncData.needConflictCount || 0;
 
   // C9: 离线超墓碑期保护 — 本类型即将上传"本地有服务端无"的文件，且本机已长期离线超过墓碑
   // 保留期，先弹窗确认；取消则本轮跳过该类型同步（上传/修改/删除/时间戳一并推迟到下次），
@@ -608,7 +666,7 @@ async function receiveSyncEndWrapper(data: unknown, plugin: FastSync, type: "not
     }
   }
 
-  const trueTotal = tasks.needUpload + tasks.needModify + tasks.needSyncMtime + tasks.needDelete;
+  const trueTotal = tasks.needUpload + tasks.needModify + tasks.needSyncMtime + tasks.needDelete + (tasks.needConflict || 0);
   const trackerType: SyncType = type === "config" ? "setting" : type;
   plugin.progressTracker.setDownloadTotal(trackerType, trueTotal, plugin.syncState.syncDownChunkNum);
   plugin.progressTracker.recordUploadComplete(trackerType, tasks.completed);
@@ -720,7 +778,7 @@ async function receiveSyncEndWrapper(data: unknown, plugin: FastSync, type: "not
 /**
  * 启动全量/增量同步
  */
-export const handleSync = async function (plugin: FastSync, isLoadLastTime: boolean = true, syncMode: SyncMode = "auto") {
+export const handleSync = async function (plugin: FastSync, isLoadLastTime: boolean = true, syncMode: SyncMode = "auto", silent: boolean = false) {
   if (plugin.isSyncing) {
     dump("Sync already in progress, skipping");
     return;
@@ -730,6 +788,9 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
   });
   if (plugin.isSyncing) return;
   plugin.isSyncing = true;
+  // 每轮开始时覆盖静默标记：普通同步会立即恢复提示行为
+  // Overwrite the silent flag at every round start so a normal sync restores notices
+  plugin.syncState.silentSync = silent;
 
   // 同步开始前，全局清空上一轮残留的 conflict-notes 物理冲突临时目录中的文件（位于插件目录下，避免 Windows 锁定目录报错）
   // Before sync: clear any leftover conflict-notes backup files from the previous round
@@ -742,9 +803,13 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       // Keep the base/remote backups of unresolved conflicts for the resolve modal (their uploads are paused, see #276)
       const keep = new Set<string>();
       for (const p of plugin.syncState.conflictedPaths) {
-        const stem = `${conflictDir}/${p.replace(/\.md$/, "").replace(/[/\\]/g, "_")}_${hashContent(p)}`;
-        keep.add(`${stem}.base.md`);
-        keep.add(`${stem}.remote.md`);
+        // 与 conflictBackupPaths() 保持一致：元数据与本地侧备份同属未解决条目，必须保留
+        // Keep metadata and the local-side copy for unresolved entries (see conflictBackupPaths)
+        const backup = conflictBackupPaths(plugin, p);
+        keep.add(backup.baseBackupPath);
+        keep.add(backup.remoteBackupPath);
+        keep.add(backup.metaPath);
+        keep.add(backup.localBackupPath);
       }
       const deletePromises: Promise<void>[] = [];
       if (files && files.files) {
@@ -762,6 +827,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
   // 仅清空本轮捕获的局部新冲突集合，防止上一轮残留的冲突引起本轮再次多余弹出冲突列表。
   // 我们不再清空全局和持久化的 conflictedPaths 集合，这样在未解决冲突前，角标和状态栏均会一直保留它。
   plugin.syncState.newConflictedPathsThisRound.clear();
+  plugin.syncState.newUnalignedPathsThisRound?.clear();
   // 提到 try 外部，使 catch/finally 也能引用本次会话的 context 做归属判断
   // Hoisted outside try so catch/finally can reference this session's context for ownership checks
   let context = "";
@@ -849,7 +915,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       return;
     }
 
-    if (plugin.settings.isShowNotice && (plugin.settings.syncEnabled || plugin.settings.configSyncEnabled)) {
+    if (plugin.settings.isShowNotice && !plugin.syncState.silentSync && (plugin.settings.syncEnabled || plugin.settings.configSyncEnabled)) {
       showSyncNotice($("ui.status.starting"));
     }
     plugin.updateStatusBar($("ui.status.syncing"), 0, 1);
@@ -959,10 +1025,18 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
             if (file.path === "/") continue;
             if (isFolderSyncPathExcluded(file.path, plugin)) continue;
             let mtime = plugin.folderSnapshotManager.getMtime(file.path) || Date.now();
-            if (isLoadLastTime && mtime < Number(plugin.localStorageManager.getMetadata("lastFolderSyncTime")) && plugin.folderSnapshotManager.getMtime(file.path) !== undefined) continue;
+            // 基线模式：尚无服务端确认 revision 的存量目录必须纳入清单，否则永远拿不到 revision
+            // Baseline mode: existing folders without a confirmed revision must still be listed,
+            // or they can never obtain one
+            const folderNeedsBaseline = plugin.isSyncBaselineModeEnabled?.() === true
+              && !plugin.folderSnapshotManager.isBaselineConfirmed(file.path);
+            if (isLoadLastTime && !folderNeedsBaseline
+              && mtime < Number(plugin.localStorageManager.getMetadata("lastFolderSyncTime"))
+              && plugin.folderSnapshotManager.getMtime(file.path) !== undefined) continue;
             folders.push({
               path: file.path,
               pathHash: hashContent(file.path),
+              ...buildBaselineFields(plugin, "folder", file.path, null),
             });
             continue;
           }
@@ -975,7 +1049,12 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                 && plugin.fileHashManager.getPathHash(file.path) !== null
                 && plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size) === plugin.fileHashManager.getPathHash(file.path)
                 && !plugin.pendingNoteModifies.has(file.path)
-                && !plugin.syncState.conflictedPaths.has(file.path)) continue;
+                && !plugin.syncState.conflictedPaths.has(file.path)
+                // 基线模式：尚无服务端确认 revision 的存活文件必须参与对账，以获取 *SyncMtime 令牌
+                // Baseline mode: live files without a confirmed revision must still be reconciled
+                // so the server can confirm a *SyncMtime token
+                && (plugin.isSyncBaselineModeEnabled?.() !== true || !plugin.fileHashManager.isBaselineConfirmed
+                  || plugin.fileHashManager.isBaselineConfirmed(file.path))) continue;
 
               // Skip excessively large .md files (>noteSyncLimit MB)
               const noteLimit = (plugin.settings.noteSyncLimit ?? 20) * 1024 * 1024;
@@ -983,7 +1062,6 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
 
               const cachedNoteHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size);
               if (cachedNoteHash !== null) {
-                const baseHash = plugin.fileHashManager.getPathHash(file.path);
                 notes.push({
                   path: file.path,
                   pathHash: hashContent(file.path),
@@ -991,7 +1069,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                   mtime: file.stat.mtime,
                   ctime: file.stat.ctime,
                   size: file.stat.size,
-                  ...(baseHash !== null ? { baseHash } : { baseHashMissing: true }),
+                  ...buildBaselineFields(plugin, "note", file.path, cachedNoteHash),
                 });
               } else {
                 if (hashComputeCount >= MAX_HASH_PER_CYCLE) {
@@ -1007,7 +1085,6 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                       new Promise<never>((_, reject) => window.setTimeout(() => reject(Object.assign(new Error(`Hash timeout`), { name: "HashTimeoutError" })), 15000))
                     ]);
                     plugin.scannedNoteHashes.set(notePath, { hash: contentHash, mtime: noteMtime, size: noteSize });
-                    const baseHash = plugin.fileHashManager.getPathHash(notePath);
                     notes.push({
                       path: notePath,
                       pathHash: hashContent(notePath),
@@ -1015,7 +1092,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                       mtime: noteMtime,
                       ctime: noteCtime,
                       size: noteSize,
-                      ...(baseHash !== null ? { baseHash } : { baseHashMissing: true }),
+                      ...buildBaselineFields(plugin, "note", notePath, contentHash),
                     });
                   } catch (error) {
                     // 超时单独计数，受影响类型保留游标供下轮重试。 / Count timeouts separately and retry the type next round.
@@ -1035,11 +1112,12 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                 && file.stat.mtime < Number(plugin.localStorageManager.getMetadata("lastFileSyncTime"))
                 && plugin.fileHashManager.getPathHash(file.path) !== null
                 && plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size) === plugin.fileHashManager.getPathHash(file.path)
-                && !plugin.pendingUploadHashes.has(file.path)) continue;
+                && !plugin.pendingUploadHashes.has(file.path)
+                && (plugin.isSyncBaselineModeEnabled?.() !== true || !plugin.fileHashManager.isBaselineConfirmed
+                  || plugin.fileHashManager.isBaselineConfirmed(file.path))) continue;
 
               const cachedFileHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size);
               if (cachedFileHash !== null) {
-                const baseHash = plugin.fileHashManager.getPathHash(file.path);
                 files.push({
                   path: file.path,
                   pathHash: hashContent(file.path),
@@ -1047,7 +1125,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                   mtime: file.stat.mtime,
                   ctime: file.stat.ctime,
                   size: file.stat.size,
-                  ...(baseHash !== null ? { baseHash } : { baseHashMissing: true }),
+                  ...buildBaselineFields(plugin, "file", file.path, cachedFileHash),
                 });
               } else {
                 if (hashComputeCount >= MAX_HASH_PER_CYCLE) {
@@ -1062,12 +1140,12 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                       hashFileAsync(plugin.app, attPath),
                       new Promise<never>((_, reject) => window.setTimeout(() => reject(Object.assign(new Error(`Hash timeout`), { name: "HashTimeoutError" })), 15000))
                     ]);
-                    const baseHash = plugin.fileHashManager.getPathHash(attPath);
                     // 内容未变只是 mtime 被刷新：上报同步时的 mtime，服务端有新版本时按下载处理而非要求上传；
                     // 此时不缓存新 mtime，下一轮仍能取回同步时的 mtime（#256）
                     // Unchanged content with a refreshed mtime: report the synced mtime so a newer server
                     // version is downloaded instead of overwritten; the new mtime is not cached so the synced
                     // one is still available next round (#256)
+                    const baseHash = plugin.fileHashManager.getPathHash(attPath);
                     const syncedMtime = contentHash === baseHash && !plugin.pendingUploadHashes.has(attPath)
                       ? plugin.fileHashManager.getSyncedMtime(attPath) : undefined;
                     if (syncedMtime === undefined) plugin.scannedFileHashes.set(attPath, { hash: contentHash, mtime: attMtime, size: attSize });
@@ -1078,7 +1156,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                       mtime: syncedMtime ?? attMtime,
                       ctime: attCtime,
                       size: attSize,
-                      ...(baseHash !== null ? { baseHash } : { baseHashMissing: true }),
+                      ...buildBaselineFields(plugin, "file", attPath, contentHash),
                     });
                   } catch (error) {
                     // 超时单独计数，受影响类型保留游标供下轮重试。 / Count timeouts separately and retry the type next round.
@@ -1128,12 +1206,14 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         for (const path of trackedPaths) {
           if (++delCount % 100 === 0) await yieldToMain();
           if (isPathExcluded(path, plugin) || plugin.retryQueue?.shouldSkipScanDelete(path)) continue;
+          // 冲突冻结的路径不由批量扫描替用户决定删除 / Frozen conflicted paths are never batch-deleted
+          if (plugin.syncState.conflictedPaths.has(path)) continue;
           if (!localPathsSet.has(path)) {
             const item = { path: path, pathHash: hashContent(path) };
             if (path.endsWith(".md")) {
-              delNotes.push(item);
+              delNotes.push({ ...item, ...buildDeleteBaselineFields(plugin, "note", path) });
             } else {
-              delFiles.push(item);
+              delFiles.push({ ...item, ...buildDeleteBaselineFields(plugin, "file", path) });
             }
           }
         }
@@ -1146,8 +1226,9 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
           for (const path of trackedFolderPaths) {
             if (++folderCount % 100 === 0) await yieldToMain();
             if (isFolderSyncPathExcluded(path, plugin) || plugin.retryQueue?.shouldSkipScanDelete(path)) continue;
+            if (plugin.syncState.conflictedPaths.has(path)) continue;
             if (!localFolderPathsSet.has(path)) {
-              delFolders.push({ path: path, pathHash: hashContent(path) });
+              delFolders.push({ path: path, pathHash: hashContent(path), ...buildDeleteBaselineFields(plugin, "folder", path) });
             }
           }
         }
@@ -1159,6 +1240,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         for (const path of trackedPaths) {
           if (++missingCount % 100 === 0) await yieldToMain();
           if (isPathExcluded(path, plugin)) continue;
+          if (plugin.syncState.conflictedPaths.has(path)) continue;
           if (!localPathsSet.has(path)) {
             const item = { path: path, pathHash: hashContent(path) };
             if (path.endsWith(".md")) {
@@ -1231,7 +1313,9 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         if (isLoadLastTime
           && stat.mtime < Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime"))
           && plugin.configHashManager.getPathHash(path) !== null
-          && !plugin.pendingConfigModifies.has(path)) continue;
+          && !plugin.pendingConfigModifies.has(path)
+          && (plugin.isSyncBaselineModeEnabled?.() !== true || !plugin.configHashManager.isBaselineConfirmed
+            || plugin.configHashManager.isBaselineConfirmed(path))) continue;
 
         // 处理大配置文件时更新消息
         if (stat.size > 2 * 1024 * 1024) {
@@ -1265,7 +1349,8 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
           contentHash: contentHash,
           mtime: stat.mtime,
           ctime: stat.ctime,
-          size: stat.size
+          size: stat.size,
+          ...buildBaselineFields(plugin, "setting", path, contentHash),
         });
       } catch (e) {
         const errorMsg = e instanceof Error ? e.message : String(e);
@@ -1296,8 +1381,9 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
 
         for (const path of trackedConfigPaths) {
           if (configIsPathExcluded(path, plugin)) continue;
+          if (plugin.syncState.conflictedPaths.has(path)) continue;
           if (!localConfigPathsSet.has(path)) {
-            delConfigs.push({ path: path, pathHash: hashContent(path) });
+            delConfigs.push({ path: path, pathHash: hashContent(path), ...buildDeleteBaselineFields(plugin, "setting", path) });
           }
         }
       }
@@ -1315,6 +1401,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
 
         for (const path of trackedConfigPaths) {
           if (configIsPathExcluded(path, plugin)) continue;
+          if (plugin.syncState.conflictedPaths.has(path)) continue;
           if (!localConfigPathsSet.has(path)) {
             missingConfigs.push({ path: path, pathHash: hashContent(path) });
           }
@@ -1404,6 +1491,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     // session (or no session is active), so a stale session cannot interrupt a running new one.
     if (plugin.syncState.activeSyncContext === null) {
       plugin.isSyncing = false;
+      plugin.syncState.silentSync = false;
     }
   }
 };
@@ -1485,6 +1573,7 @@ export function cancelSync(plugin: FastSync): void {
 
   // 确保重置同步状态标志 / Ensure sync state flag is reset
   plugin.isSyncing = false;
+  plugin.syncState.silentSync = false;
 
   dump("Sync cancelled by user");
 }
@@ -1773,6 +1862,19 @@ async function sendSyncInBatches<T1, T2, T3>(
  */
 export const handleRequestSend = async function (plugin: FastSync, syncMode: SyncMode, noteData: NoteSyncData, fileData: FileSyncData, configData: ConfigSyncData, folderData: FolderSyncData) {
   const queue = plugin.retryQueue;
+  // 冲突冻结的路径既不上传删除也不参与本轮上行，统一在发送前剔除（扫描侧已跳过，这里再兜一层）
+  // Frozen conflicted paths are never uploaded as deletes or as this round's upstream items; the
+  // scan already skips them, this is a final guard before sending
+  const conflicts = plugin.syncState?.conflictedPaths;
+  const notConflicted = <T extends { path: string }>(items: T[] | undefined) => (items ?? []).filter(item => !conflicts?.has(item.path));
+  noteData.notes = notConflicted(noteData.notes);
+  fileData.files = notConflicted(fileData.files);
+  folderData.folders = notConflicted(folderData.folders);
+  configData.configs = notConflicted(configData.configs);
+  noteData.delNotes = notConflicted(noteData.delNotes);
+  fileData.delFiles = notConflicted(fileData.delFiles);
+  folderData.delFolders = notConflicted(folderData.delFolders);
+  configData.delConfigs = notConflicted(configData.delConfigs);
   if (queue) {
     noteData.delNotes = noteData.delNotes.filter(item => !queue.shouldSkipScanDelete(item.path));
     fileData.delFiles = fileData.delFiles.filter(item => !queue.shouldSkipScanDelete(item.path));

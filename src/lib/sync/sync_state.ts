@@ -43,6 +43,7 @@ export interface SyncTaskStats {
   needModify: number;   // 需要修改 / Need to modify
   needSyncMtime: number; // 需要同步时间戳 / Need to sync mtime
   needDelete: number;   // 需要删除 / Need to delete
+  needConflict: number; // 本轮已持久化的基线冲突数（随分页下发，必须计入下载期望，否则纯冲突轮次不会发首拉 ACK） / Persisted baseline conflicts this round (delivered as pages; must count toward the download expectation or a conflict-only round never sends the initial ACK)
   completed: number;    // 已处理数量（含成功与失败，驱动完成判定/翻页 ACK，语义不变） / Processed count (success + failure; drives completion detection / page ACK, semantics unchanged)
   failed: number;       // 其中处理失败的数量，仅用于统计展示，不参与完成判定 / Subset that failed; stats-only, does not affect completion detection
 }
@@ -58,6 +59,20 @@ export class SyncState {
   public conflictedPaths: Set<string> = new Set();
   /** 本轮同步中新捕获到的需要手动解决的冲突路径集合，用以在同步结束时判定是否弹出冲突列表框 / New conflicted paths detected in this round */
   public newConflictedPathsThisRound: Set<string> = new Set();
+  /**
+   * 本轮因“本地有内容但无任何可信基线”而进入待对齐的路径，用于同步结束时合并提示一次。
+   * Paths queued for alignment this round because local content had no trusted baseline;
+   * used to show one aggregated notice when the round completes.
+   */
+  public newUnalignedPathsThisRound: Set<string> = new Set();
+  /**
+   * 本轮已持久化的基线冲突数（按类型）。SyncConflict 既可能作为分页条目到达，
+   * 也可能由条件写 530 拒绝返回；两者都必须计入本轮冲突提示，不能混入上传成功计数。
+   * Baseline conflicts persisted this round by type. A SyncConflict may arrive as a paged item
+   * or as a 530 rejection of a conditional write; both must count toward the round's conflict
+   * notice and never toward upload success.
+   */
+  public conflictCountsThisRound: Map<"note" | "file" | "setting" | "folder", number> = new Map();
 
   // ─── Chunk size settings from server ─────────────────────────────────────────
   /** 上传分片数量 / Upload chunk size from server */
@@ -70,6 +85,78 @@ export class SyncState {
   pipelineWindowDown = 0;
   /** 本次连接是否已完成 pv2 协商（auth 响应携带协商块）/ Whether this connection completed pv2 negotiation (auth response carried a negotiation block) */
   negotiated = false;
+
+  // ─── 同步基线能力协商（设计稿 §2.1，阶段 C 只建闸门）─────────────────────────
+  /**
+   * 服务端在鉴权应答里广告的最高基线版本（缺省 0）。它只是能力广告，不能据此启用新模式。
+   * Highest baseline version advertised in the auth reply (0 when absent). This is only an
+   * advertisement and must never switch this connection to the new mode by itself.
+   */
+  serverAdvertisedBaselineVersion = 0;
+  /**
+   * 本连接经 ClientInfo 应答确认的基线版本：0 = 兼容模式，>=1 = 基线模式。
+   * 每次新建连接/断线都重置为 0；后台版本广播不得修改它。
+   * Baseline version confirmed for this connection via the ClientInfo reply: 0 = compatibility
+   * mode, >=1 = baseline mode. Reset to 0 on every new connection / disconnect; background
+   * version broadcasts must never change it.
+   */
+  negotiatedSyncBaselineVersion = 0;
+  /**
+   * 本连接是否已完成一次 ClientInfo 应答确认。未确认前闸门阻塞（服务端广告 >=1 时）。
+   * Whether this connection completed one ClientInfo reply confirmation. The gate blocks until
+   * then when the server advertises >= 1.
+   */
+  clientInfoConfirmed = false;
+  /** 客户端请求的基线版本（阶段 C 固定为 1）/ Baseline version requested by the client (fixed at 1 in stage C) */
+  requestedSyncBaselineVersion = 1;
+
+  /**
+   * 重置连接级基线协商状态。新建连接与断线都必须调用，避免上一条连接的结论泄漏。
+   * Resets connection-level baseline negotiation state. Must be called on every new connection
+   * and disconnect so the previous connection's verdict cannot leak.
+   */
+  resetSyncBaselineNegotiation(): void {
+    this.serverAdvertisedBaselineVersion = 0;
+    this.negotiatedSyncBaselineVersion = 0;
+    this.clientInfoConfirmed = false;
+  }
+
+  /**
+   * 记录鉴权应答广告（仅能力广告）/ Records the auth-reply advertisement (advertisement only).
+   */
+  applyServerBaselineAdvertisement(advertised: unknown): void {
+    this.serverAdvertisedBaselineVersion = typeof advertised === "number" && advertised > 0
+      ? Math.floor(advertised) : 0;
+  }
+
+  /**
+   * 记录 ClientInfo 应答确认结果并关闭闸门。缺省（老服务端）视为 0，立即进入兼容模式。
+   * Records the ClientInfo reply verdict and opens the gate. An absent value (old server) means
+   * 0 and enters compatibility mode immediately.
+   */
+  confirmSyncBaseline(accepted: unknown): void {
+    const value = typeof accepted === "number" && accepted > 0 ? Math.floor(accepted) : 0;
+    this.negotiatedSyncBaselineVersion = value;
+    this.clientInfoConfirmed = true;
+  }
+
+  /**
+   * 基线模式是否启用（协商成功且版本 >= 1）。
+   * Whether baseline mode is active (negotiation succeeded and version >= 1).
+   */
+  isSyncBaselineModeEnabled(): boolean {
+    return this.clientInfoConfirmed && this.negotiatedSyncBaselineVersion >= 1;
+  }
+
+  /**
+   * 闸门：服务端广告 >= 1 但本连接尚未确认时，不得开始同步或实时写。
+   * 老服务端广告 0 时立即放行，不阻塞兼容模式。
+   * Gate: when the server advertises >= 1 but this connection is not yet confirmed, sync and
+   * live writes must not start. A server advertising 0 lets the client through immediately.
+   */
+  isSyncBaselineGateOpen(): boolean {
+    return this.serverAdvertisedBaselineVersion < 1 || this.clientInfoConfirmed;
+  }
 
   // ─── C3 多页在途归属：completed 计数的 pageIndex 透传通道 ─────────────────────
   /**
@@ -114,6 +201,12 @@ export class SyncState {
   isSyncing = false;
   /** 是否正在发起同步请求 / Whether sync request is being initiated */
   isSyncRequesting = false;
+  /**
+   * 本轮由空闲连接兜底触发：抑制开始/完成提示，保持静默（服务端 #503）。
+   * This round was triggered by the idle fallback: suppress start/completion notices
+   * so it stays silent (server #503).
+   */
+  silentSync = false;
   /** 是否为首次同步 / Whether this is the first sync */
   isFirstSync = false;
   /** 是否正在等待清理确认以便后续同步 / Whether waiting for clear-sync confirmation */
@@ -226,19 +319,19 @@ export class SyncState {
     });
   }
 
-  private _noteSyncTasks = this.createStatsProxy("note", { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, completed: 0, failed: 0 });
+  private _noteSyncTasks = this.createStatsProxy("note", { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, needConflict: 0, completed: 0, failed: 0 });
   get noteSyncTasks() { return this._noteSyncTasks; }
   set noteSyncTasks(v: SyncTaskStats) { this._noteSyncTasks = this.createStatsProxy("note", v); }
 
-  private _fileSyncTasks = this.createStatsProxy("file", { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, completed: 0, failed: 0 });
+  private _fileSyncTasks = this.createStatsProxy("file", { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, needConflict: 0, completed: 0, failed: 0 });
   get fileSyncTasks() { return this._fileSyncTasks; }
   set fileSyncTasks(v: SyncTaskStats) { this._fileSyncTasks = this.createStatsProxy("file", v); }
 
-  private _configSyncTasks = this.createStatsProxy("setting", { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, completed: 0, failed: 0 });
+  private _configSyncTasks = this.createStatsProxy("setting", { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, needConflict: 0, completed: 0, failed: 0 });
   get configSyncTasks() { return this._configSyncTasks; }
   set configSyncTasks(v: SyncTaskStats) { this._configSyncTasks = this.createStatsProxy("setting", v); }
 
-  private _folderSyncTasks = this.createStatsProxy("folder", { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, completed: 0, failed: 0 });
+  private _folderSyncTasks = this.createStatsProxy("folder", { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, needConflict: 0, completed: 0, failed: 0 });
   get folderSyncTasks() { return this._folderSyncTasks; }
   set folderSyncTasks(v: SyncTaskStats) { this._folderSyncTasks = this.createStatsProxy("folder", v); }
 
@@ -342,10 +435,10 @@ export class SyncState {
       window.clearInterval(this.progressCheckIntervalId);
       this.progressCheckIntervalId = null;
     }
-    this.noteSyncTasks = { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, completed: 0, failed: 0 };
-    this.fileSyncTasks = { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, completed: 0, failed: 0 };
-    this.configSyncTasks = { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, completed: 0, failed: 0 };
-    this.folderSyncTasks = { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, completed: 0, failed: 0 };
+    this.noteSyncTasks = { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, needConflict: 0, completed: 0, failed: 0 };
+    this.fileSyncTasks = { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, needConflict: 0, completed: 0, failed: 0 };
+    this.configSyncTasks = { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, needConflict: 0, completed: 0, failed: 0 };
+    this.folderSyncTasks = { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, needConflict: 0, completed: 0, failed: 0 };
     this.lastStatusBarPercentage = 0;
     this.noteSyncEnd = false;
     this.fileSyncEnd = false;
@@ -354,6 +447,7 @@ export class SyncState {
     this.offlineGuardSkippedThisRound = false;
     this.truncatedSyncFields.clear();
     this.hashTimeoutCounts.clear();
+    this.conflictCountsThisRound.clear();
     // 注意：不再清空 scannedXxxHashes。这些哈希是扫描期实打实算出来的，条目自带 mtime/size 校验，
     // 留到下一轮同步结束时提交依然有效；在这里清空会把上一轮（可能仍在收尾）算出的哈希白白丢掉，
     // 导致同一批文件每次同步都要重算。提交由 operator.ts 的 commitScannedHashes 按键移除。
@@ -367,7 +461,7 @@ export class SyncState {
    * 计算总任务数 / Calculate total task count
    */
   getTotalTasks(): number {
-    const sum = (t: SyncTaskStats) => t.needUpload + t.needModify + t.needSyncMtime + t.needDelete;
+    const sum = (t: SyncTaskStats) => t.needUpload + t.needModify + t.needSyncMtime + t.needDelete + (t.needConflict || 0);
     return sum(this.noteSyncTasks) + sum(this.fileSyncTasks) + sum(this.configSyncTasks) + sum(this.folderSyncTasks);
   }
 
