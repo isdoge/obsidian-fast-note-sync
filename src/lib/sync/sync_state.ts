@@ -114,6 +114,12 @@ export class SyncState {
   isSyncing = false;
   /** 是否正在发起同步请求 / Whether sync request is being initiated */
   isSyncRequesting = false;
+  /**
+   * 本轮由空闲连接兜底触发：抑制开始/完成提示，保持静默（服务端 #503）。
+   * This round was triggered by the idle fallback: suppress start/completion notices
+   * so it stays silent (server #503).
+   */
+  silentSync = false;
   /** 是否为首次同步 / Whether this is the first sync */
   isFirstSync = false;
   /** 是否正在等待清理确认以便后续同步 / Whether waiting for clear-sync confirmation */

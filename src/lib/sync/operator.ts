@@ -220,6 +220,7 @@ function restartStalledSync(plugin: FastSync, intervalId?: number): void {
   plugin.totalChunksToUpload = 0;
   plugin.uploadedChunksCount = 0;
   plugin.isSyncing = false;
+  plugin.syncState.silentSync = false;
   plugin.progressTracker.forceComplete();
   if (giveUp) {
     plugin.updateStatusBar($("ui.status.stalled_gave_up"));
@@ -379,9 +380,10 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, _sync
     const completionText = totalFailed > 0
       ? $("ui.status.completed_with_failures", { count: String(totalFailed) })
       : $("ui.status.completed");
-    if (plugin.settings.isShowNotice) {
+    if (plugin.settings.isShowNotice && !plugin.syncState.silentSync) {
       showSyncNotice(completionText);
     }
+    plugin.syncState.silentSync = false;
     plugin.updateStatusBar(completionText);
 
     // 同步成功完成后，如果在此次同步中捕获到了需要手动合并解决的新冲突，则在此时一并弹出冲突文件列表视图
@@ -720,7 +722,7 @@ async function receiveSyncEndWrapper(data: unknown, plugin: FastSync, type: "not
 /**
  * 启动全量/增量同步
  */
-export const handleSync = async function (plugin: FastSync, isLoadLastTime: boolean = true, syncMode: SyncMode = "auto") {
+export const handleSync = async function (plugin: FastSync, isLoadLastTime: boolean = true, syncMode: SyncMode = "auto", silent: boolean = false) {
   if (plugin.isSyncing) {
     dump("Sync already in progress, skipping");
     return;
@@ -730,6 +732,9 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
   });
   if (plugin.isSyncing) return;
   plugin.isSyncing = true;
+  // 每轮开始时覆盖静默标记：普通同步会立即恢复提示行为
+  // Overwrite the silent flag at every round start so a normal sync restores notices
+  plugin.syncState.silentSync = silent;
 
   // 同步开始前，全局清空上一轮残留的 conflict-notes 物理冲突临时目录中的文件（位于插件目录下，避免 Windows 锁定目录报错）
   // Before sync: clear any leftover conflict-notes backup files from the previous round
@@ -849,7 +854,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       return;
     }
 
-    if (plugin.settings.isShowNotice && (plugin.settings.syncEnabled || plugin.settings.configSyncEnabled)) {
+    if (plugin.settings.isShowNotice && !plugin.syncState.silentSync && (plugin.settings.syncEnabled || plugin.settings.configSyncEnabled)) {
       showSyncNotice($("ui.status.starting"));
     }
     plugin.updateStatusBar($("ui.status.syncing"), 0, 1);
@@ -1404,6 +1409,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     // session (or no session is active), so a stale session cannot interrupt a running new one.
     if (plugin.syncState.activeSyncContext === null) {
       plugin.isSyncing = false;
+      plugin.syncState.silentSync = false;
     }
   }
 };
@@ -1485,6 +1491,7 @@ export function cancelSync(plugin: FastSync): void {
 
   // 确保重置同步状态标志 / Ensure sync state flag is reset
   plugin.isSyncing = false;
+  plugin.syncState.silentSync = false;
 
   dump("Sync cancelled by user");
 }

@@ -14,6 +14,10 @@ const module = { exports: {} };
 vm.runInNewContext(code, { module, exports: module.exports, console, TextDecoder, TextEncoder,
   window: { setTimeout: () => 1, clearTimeout() {} },
   require: id => id === "obsidian" ? { normalizePath: p => p }
+    : id.includes("config_codec") ? {
+        encodeConfigContent: buf => new TextDecoder().decode(buf),
+        decodeConfigContent: s => ({ kind: "text", text: s }),
+      }
     : id.includes("helpers") ? new Proxy({ isPathInConfigSyncDirs: () => true, configIsPathExcluded: () => false,
         hashFileAsync: async () => "local-hash", hashContent: () => "p", getSafeCtime: s => s.ctime }, { get: (t, k) => t[k] ?? (() => undefined) })
     : id.includes("sync_log_manager") ? { SyncLogManager: { getInstance: () => ({ addLog: (...a) => logs.push(a) }) } }

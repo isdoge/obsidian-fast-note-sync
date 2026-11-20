@@ -1,6 +1,7 @@
 import { normalizePath, App } from "obsidian";
 
 import { hashContent, dump, dumpError, configIsPathExcluded, getSafeCtime, isPathInConfigSyncDirs, showSyncNotice, isInWhitelist, hashFileAsync, checkAndNotifyCaseConflict, isLargeBinarySyncRisk, normalizeServerTimestamp } from "../utils/helpers";
+import { decodeConfigContent, encodeConfigContent } from "../utils/config_codec";
 import { SyncLogManager } from "./sync_log_manager";
 import { advanceLiveSyncTime } from "./sync_state";
 import { ReceiveMessage, ReceiveMtimeMessage, ReceivePathMessage, SyncEndData } from "../utils/types";
@@ -12,16 +13,36 @@ import { $ } from "../../i18n/lang";
  * 排除监听文件的常量（针对 .obsidian 根目录）
  */
 export const CONFIG_ROOT_FILES_EXCLUDE = ["workspace.json", "workspace-mobile.json"]
-// 配置通道按 UTF-8 文本传输，仅扩展文本资源，不能直接纳入图片等二进制文件。
-export const CONFIG_PLUGIN_EXTS_TO_WATCH = [".json", ".js", ".css", ".dict", ".dic", ".aff", ".txt"]
+// 静态/字体/图片资源扩展名：配置通道用 fns-bin-v1 信封承载二进制内容（#234 主题图片、#264 字体）。
+// Static/font/image extensions: the config channel carries binary content in fns-bin-v1 envelopes
+// (theme images #234, custom fonts #264).
+export const CONFIG_ASSET_EXTS_TO_WATCH = [
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp", ".avif",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+]
+export const CONFIG_PLUGIN_EXTS_TO_WATCH = [".json", ".js", ".css", ".dict", ".dic", ".aff", ".txt", ...CONFIG_ASSET_EXTS_TO_WATCH]
 const CONFIG_PLUGIN_DIRS_EXCLUDE = new Set(["node_modules", ".git", ".cache", "cache", "caches", ".trash", ".tmp", "tmp", "temp"])
 
+// 插件与主题目录下的生成/缓存目录都不参与同步 / Generated/cache dirs under plugins and themes are never synced
+export const isConfigResourcePathExcluded = (path: string, configDir: string): boolean => {
+    const normalized = path.replace(/\\/g, "/")
+    for (const topDir of ["plugins", "themes"]) {
+        const prefix = `${configDir}/${topDir}/`
+        if (normalized.startsWith(prefix)) {
+            return normalized.slice(prefix.length).split("/").slice(1)
+                .some(part => CONFIG_PLUGIN_DIRS_EXCLUDE.has(part.toLowerCase()))
+        }
+    }
+    return false
+}
 export const isPluginConfigPathExcluded = (path: string, configDir: string): boolean => {
     const prefix = `${configDir}/plugins/`
     return path.startsWith(prefix) && path.slice(prefix.length).split("/").slice(1)
         .some(part => CONFIG_PLUGIN_DIRS_EXCLUDE.has(part.toLowerCase()))
 }
-export const CONFIG_THEME_EXTS_TO_WATCH = [".css", ".json"]
+export const CONFIG_THEME_EXTS_TO_WATCH = [".css", ".json", ...CONFIG_ASSET_EXTS_TO_WATCH]
+// 代码片段目录：样式本身 + 片段引用到的图片/字体资源 / Snippets: styles plus images/fonts they reference
+export const CONFIG_SNIPPET_EXTS_TO_WATCH = [".css", ...CONFIG_ASSET_EXTS_TO_WATCH]
 // 插件目录中决定插件代码与版本的文件 / Files in a plugin folder that make up its code and version
 const PLUGIN_CODE_FILES = ["main.js", "manifest.json", "styles.css"]
 
@@ -180,9 +201,12 @@ export const configModify = async function (path: string, plugin: FastSync, even
                         plugin.removeIgnoredConfigFile(path)
                         return
                     }
+                    // contentHash 始终针对磁盘原始字节；content 用 fns-bin-v1 信封承载二进制
+                    // contentHash always hashes the raw on-disk bytes; content wraps binary in
+                    // the fns-bin-v1 envelope
                     contentHash = await hashFileAsync(plugin.app, filePath)
                     const contentBuf = await plugin.app.vault.adapter.readBinary(filePath)
-                    contentStr = new TextDecoder().decode(contentBuf)
+                    contentStr = encodeConfigContent(contentBuf)
                     mtime = stat.mtime
                     ctime = getSafeCtime(stat)
                     size = stat.size
@@ -293,6 +317,8 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
     }
 
     plugin.addIgnoredConfigFile(data.path)
+    // 二进制信封只用于传输；配置重载与写入各取所需 / Envelopes are transport-only; reload and write consume the decoded value
+    const decodedContent = isVirtual ? null : decodeConfigContent(data.content ?? "")
     try {
         // 拦截 LocalStorage 更新
         if (isVirtual) {
@@ -357,7 +383,13 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
         // Legacy server rows may hold second-scale mtime/ctime (#461); normalize to milliseconds
         const mtime = normalizeServerTimestamp(data.mtime)
         const ctime = normalizeServerTimestamp(data.ctime)
-        await plugin.app.vault.adapter.write(filePath, data.content, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
+        // fns-bin-v1:b64 信封还原为原始字节写盘；普通文本仍走 write，保持零变化
+        // Restore fns-bin-v1:b64 envelopes to raw bytes; plain text still goes through write
+        if (decodedContent?.kind === "binary") {
+            await plugin.app.vault.adapter.writeBinary(filePath, decodedContent.bytes, { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
+        } else {
+            await plugin.app.vault.adapter.write(filePath, decodedContent?.text ?? "", { ...(ctime > 0 && { ctime }), ...(mtime > 0 && { mtime }) })
+        }
 
         // 游标推进放在写盘成功之后：写盘失败走 catch，不应越过本条（service#101）
         // Advance only after the write succeeded: a failure takes the catch path and must
@@ -372,7 +404,9 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
     }
 
     // 保持对该文件的忽略直到 configReload 中的 checkAndReload 落盘并更新状态后再解除（#114）
-    await configReload(data.path, plugin, false, data.content)
+    // 二进制信封只用于传输，配置重载只需要文本内容
+    // Binary envelopes are transport-only; config reload only needs text content
+    await configReload(data.path, plugin, false, decodedContent?.kind === "text" ? decodedContent.text : "")
 
     // 更新 ConfigManager 的文件状态，防止重复触发 configModify
     // （mtime 已归一化为毫秒，与 config_manager 读到的本地 stat.mtime 单位一致）
@@ -446,7 +480,7 @@ export const receiveConfigUpload = async function (data: ReceivePathMessage, plu
                 }
                 contentHash = await hashFileAsync(plugin.app, filePath);
                 const contentBufRead = await plugin.app.vault.adapter.readBinary(filePath);
-                contentStr = new TextDecoder().decode(contentBufRead);
+                contentStr = encodeConfigContent(contentBufRead);
                 contentBuf = contentBufRead; // 保持兼容性逻辑
                 mtime = stat.mtime;
                 ctime = getSafeCtime(stat);
@@ -702,20 +736,21 @@ export const configAllPaths = async function (configDirs: string[], plugin: Fast
     const isExcluded = (p: string) => configIsPathExcluded(p, plugin)
 
     /**
-     * 递归扫描通用目录
+     * 递归扫描通用目录；传入 exts 时按资源扩展名过滤并跳过生成目录
+     * Recursive directory scan; when exts is provided, filter by resource extension and skip generated dirs
      */
-    const scanDirRecursive = async (dirPath: string, pluginResources: boolean = false) => {
+    const scanDirRecursive = async (dirPath: string, exts?: string[]) => {
         try {
             if (!(await adapter.exists(normalizePath(dirPath)))) return
             const result = await adapter.list(normalizePath(dirPath))
             for (const file of result.files) {
                 if (isExcluded(file)) continue
-                if (pluginResources && !CONFIG_PLUGIN_EXTS_TO_WATCH.some(ext => file.toLowerCase().endsWith(ext))) continue
+                if (exts && !exts.some(ext => file.toLowerCase().endsWith(ext))) continue
                 paths.push(file)
             }
             for (const folder of result.folders) {
-                if (isExcluded(folder) || (pluginResources && isPluginConfigPathExcluded(folder, plugin.app.vault.configDir))) continue
-                await scanDirRecursive(folder, pluginResources)
+                if (isExcluded(folder) || (exts && isConfigResourcePathExcluded(folder, plugin.app.vault.configDir))) continue
+                await scanDirRecursive(folder, exts)
             }
         } catch (e) {
             dump(`Error scanning directory ${dirPath}:`, e)
@@ -753,32 +788,27 @@ export const configAllPaths = async function (configDirs: string[], plugin: Fast
                     const result = await adapter.list(pluginsPath)
                     for (const folderPath of result.folders) {
                         if (isExcluded(folderPath)) continue
-                        await scanDirRecursive(folderPath, true)
+                        await scanDirRecursive(folderPath, CONFIG_PLUGIN_EXTS_TO_WATCH)
                     }
                 }
                 const themesPath = normalizePath(`${configDir}/themes`)
                 if (await adapter.exists(themesPath)) {
                     const result = await adapter.list(themesPath)
                     for (const folderPath of result.folders) {
-                        const folderName = folderPath.split("/").pop()
-                        const folderItems = await adapter.list(folderPath)
-                        for (const file of folderItems.files) {
-                            const fileName = file.split("/").pop() || ""
-                            if (CONFIG_THEME_EXTS_TO_WATCH.some(ext => fileName.endsWith(ext))) {
-                                const rel = `${configDir}/themes/${folderName}/${fileName}`
-                                if (!isExcluded(rel)) paths.push(rel)
-                            }
-                        }
+                        if (isExcluded(folderPath)) continue
+                        // 主题可能把图片/字体放在子目录（#234），按资源扩展名递归扫描
+                        // Themes may nest images/fonts in subfolders (#234); scan recursively by extension
+                        await scanDirRecursive(folderPath, CONFIG_THEME_EXTS_TO_WATCH)
                     }
                 }
                 const snippetsPath = normalizePath(`${configDir}/snippets`)
                 if (await adapter.exists(snippetsPath)) {
                     const result = await adapter.list(snippetsPath)
                     for (const filePath of result.files) {
-                        if (filePath.endsWith(".css")) {
-                            const rel = `${configDir}/snippets/${filePath.split("/").pop()}`
-                            if (!isExcluded(rel)) paths.push(rel)
-                        }
+                        const fileName = filePath.split("/").pop() || ""
+                        if (!CONFIG_SNIPPET_EXTS_TO_WATCH.some(ext => fileName.toLowerCase().endsWith(ext))) continue
+                        const rel = `${configDir}/snippets/${fileName}`
+                        if (!isExcluded(rel)) paths.push(rel)
                     }
                 }
             } else {
