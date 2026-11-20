@@ -839,8 +839,9 @@ export class MenuManager {
       const unified = typeof conflictStoreMod.readUnifiedConflictMeta === "function"
         ? await conflictStoreMod.readUnifiedConflictMeta(this.plugin, normalizedPath)
         : null;
+      const configPrefix = `${this.plugin.app.vault.configDir}/`;
       const conflictKind = unified?.kind
-        || (normalizedPath.startsWith(".obsidian/") || normalizedPath.startsWith("_localStorage/")
+        || ((this.plugin.app.vault.configDir && normalizedPath.startsWith(configPrefix)) || normalizedPath.startsWith("_localStorage/")
           ? "setting"
           : (normalizedPath.endsWith(".md") ? "note" : "file"));
       const supportsDiff = typeof conflictResolveMod.conflictSupportsDiffEditor === "function"
