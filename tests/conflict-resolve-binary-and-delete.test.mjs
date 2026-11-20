@@ -42,16 +42,38 @@ class TFolder {
 
 const helpers = new Proxy({
   isPathExcluded: () => false,
+  isFolderSyncPathExcluded: () => false,
   hashContent: (s) => `p${s.length}`,
   hashContentAsync: async (s) => `h:${s}`,
   hashFileAsync: async (_app, p) => `file:${p}`,
   hashArrayBuffer: async () => "arr",
+  computeMirrorDigest: (s) => `digest:${s.length}`,
   getPluginDir: () => ".obsidian/plugins/fns",
   checkAndNotifyCaseConflict: () => false,
   getSafeCtime: (stat) => stat?.ctime ?? 0,
   normalizeServerTimestamp: (v) => v,
+  waitForFolderEmpty: async () => true,
   dump: noop, dumpError: noop,
 }, { get: (t, n) => t[n] ?? noop });
+
+// The folder delete must be exercised through the real operator + baseline helpers so the
+// assertion sees the payload that actually goes over the wire.
+const baselineScope = loadModule("src/lib/storage/baseline_scope.ts", (id) => {
+  if (id === "../utils/helpers") return helpers;
+  if (id === "../utils/types") return {};
+  throw new Error(`Unexpected require in baseline_scope: ${id}`);
+});
+const folderOps = loadModule("src/lib/sync/operator_folder.ts", (id) => {
+  if (id === "obsidian") return { normalizePath: (p) => p, TFolder };
+  if (id === "./remote_path_guard") return { blockAliasedRemoteMutation: () => false };
+  if (id === "./sync_state") return { advanceLiveSyncTime: noop };
+  if (id === "../utils/types") return {};
+  if (id === "../utils/helpers") return helpers;
+  if (id === "./sync_log_manager") return { SyncLogManager: { getInstance: () => ({ addLog: noop }) } };
+  if (id === "../storage/baseline_scope") return baselineScope;
+  if (id === "../../main") return {};
+  throw new Error(`Unexpected require in operator_folder: ${id}`);
+});
 
 const codec = loadModule("src/lib/utils/config_codec.ts", (id) => {
   if (id === "obsidian") return {};
@@ -86,8 +108,8 @@ const fileStub = {
   fileModify: async (file, plugin) => { plugin.modifies.push(file.path); },
 };
 const folderStub = {
-  folderModify: async (folder, plugin) => { plugin.folderModifies.push(folder.path); },
-  folderDeleteByPath: async (p, plugin, _guard, baseline) => { plugin.deletes.push(["FolderDelete", p, baseline]); },
+  folderModify: (folder, plugin) => folderOps.folderModify(folder, plugin),
+  folderDeleteByPath: (p, plugin, guard, baseline) => folderOps.folderDeleteByPath(p, plugin, guard, baseline),
 };
 const configStub = {
   configModify: async (p, plugin) => { plugin.configModifies.push(p); },
@@ -133,8 +155,14 @@ function makePlugin(overrides = {}) {
   const configModifies = [];
   const confirmed = [];
   const folders = new Map();
+  const canSend = [];
   const p = {
     settings: { vault: "v", syncEnabled: true, configSyncEnabled: true },
+    isSyncBaselineModeEnabled: () => true,
+    retryQueue: { canSend: (action, data) => { canSend.push([action, data]); return false; } },
+    lastSyncPathDeleted: new Set(),
+    addIgnoredFile: noop,
+    removeIgnoredFile: noop,
     app: {
       vault: {
         getFileByPath: (p) => files.get(p) ?? null,
@@ -178,6 +206,9 @@ function makePlugin(overrides = {}) {
       removeFolder: (p) => removedFolders.push(p),
       setFolderMtime: (p, m) => folderSnapshots.push([p, m]),
       setConfirmedRevision: (p, r) => confirmed.push(["folder", p, r]),
+      recordPendingDeleteBaseline: noop,
+      // Stale pre-conflict baseline: it must never win over the explicit detection-time baseline.
+      getPendingDeleteBaseline: () => ({ hash: "", hashMissing: true, revision: "rev-old" }),
     },
     lastSyncMtime: new Map(),
     meta: new Map(),
@@ -187,7 +218,7 @@ function makePlugin(overrides = {}) {
     ...overrides,
   };
   Object.assign(p, {
-    files, created, written, sent, trashed, deletes, modifies, folderModifies, configModifies, confirmed, folders,
+    files, created, written, sent, trashed, deletes, modifies, folderModifies, configModifies, confirmed, folders, canSend,
   });
   plugin = p;
   return p;
@@ -320,8 +351,11 @@ const storeMeta = (p, path, meta) => {
   assert.equal(p.sent[0][1].baseRevision, "rev-5");
 }
 
-// 8. P0-04: local_deleted folder + "keep local" deletes the remote folder (not creating it).
+// 8. P0-04 / B-01: local_deleted folder + "keep local" deletes the remote folder (not creating it)
+//    and the real operator payload carries the detection-time serverRevision. The stale
+//    pre-conflict pending-delete record must not win, and canSend sees the same payload.
 {
+  removedFolders.length = 0;
   const p = makePlugin();
   storeMeta(p, "Blog/gone", {
     kind: "folder", reason: "local_deleted", serverRevision: "rev-2",
@@ -330,7 +364,12 @@ const storeMeta = (p, path, meta) => {
   const result = await resolve.resolveConflictEntry(p, "Blog/gone", "local");
   assert.equal(result.ok, true);
   assert.equal(p.folders.has("Blog/gone"), false, "keep-local does not recreate the folder");
-  assert.deepEqual(plain(p.deletes), [["FolderDelete", "Blog/gone", { hash: "", hashMissing: true, revision: "rev-2" }]]);
+  const expected = { vault: "v", path: "Blog/gone", pathHash: "p9", baseRevision: "rev-2" };
+  assert.equal(p.sent.length, 1, "the real operator sends exactly one FolderDelete over the wire");
+  assert.deepEqual(plain(p.sent[0]), ["FolderDelete", expected], "the wire payload keeps baseRevision: rev-2");
+  assert.equal(p.sent[0][1].baseRevision, "rev-2", "the detection-time revision is not dropped");
+  assert.equal(p.sent[0][1].baseHash, undefined, "a folder delete never fabricates a content baseHash");
+  assert.deepEqual(plain(p.canSend), [["FolderDelete", expected]], "canSend sees the same baseline as the wire payload");
   assert.deepEqual(plain(removedFolders), ["Blog/gone"], "the local snapshot is dropped");
 }
 

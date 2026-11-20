@@ -62,7 +62,7 @@ async function confirmBaseline(plugin: FastSync, kind: string, path: string, has
  * (endpoint down / hash mismatch / remote gone); callers must then refuse to clear the local copy
  * and ask the user to sync first.
  */
-async function loadRemoteNoteBody(
+export async function loadRemoteNoteBody(
   plugin: FastSync,
   path: string,
   meta: NonNullable<Awaited<ReturnType<typeof readUnifiedConflictMeta>>>,
@@ -405,9 +405,13 @@ async function resolveFolder(plugin: FastSync, folderPath: string, mode: Conflic
   //   remote still exists; when the remote is a tombstone only the snapshot is dropped.
   if (!folder) {
     if (mode === "local") {
+      // 目录没有内容哈希：只要拿到检测时的 serverRevision 就必须保留它，
+      // 不能用恒为空的 serverHash 把 revision 一起丢掉。
+      // Folders have no content hash: whenever the detection-time serverRevision is known it must
+      // survive, otherwise the always-empty serverHash would silently drop the revision too.
       await folderDeleteByPath(folderPath, plugin, undefined, {
-        hash: meta.serverHash || "",
-        hashMissing: !meta.serverHash,
+        hash: "",
+        hashMissing: !meta.serverRevision,
         revision: meta.serverRevision || "",
       });
       snapshot?.removeFolder?.(folderPath);

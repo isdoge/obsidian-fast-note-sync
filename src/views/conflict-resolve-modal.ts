@@ -65,6 +65,38 @@ export class ConflictResolveModal extends Modal {
     this.serverDeleted = options.serverDeleted === true;
   }
 
+  /**
+   * 应用文本配置的合并结果：虚拟配置必须写回 localStorage，否则随后 receiveConfigModifyAck
+   * 读到的本地哈希仍是被合并前的旧值，会被当成“上传途中又编辑”并触发一次回环重传。
+   * 走 handleReceivedUpdate 同时记录哈希与时间戳，不产生回环。磁盘配置仍写文件。
+   * Apply a merged text setting: virtual configs must be written back into localStorage, otherwise
+   * the following receiveConfigModifyAck reads the pre-merge value, treats it as an edit made
+   * during upload and schedules a loop resend. handleReceivedUpdate records the hash/mtime and
+   * breaks the loop. Disk configs are still written to their file.
+   */
+  private async applySettingResolution(finalContent: string): Promise<void> {
+    const isVirtual = this.plugin.localStorageManager.isVirtualPath(this.targetPath);
+    if (isVirtual) {
+      await this.plugin.localStorageManager.handleReceivedUpdate(this.targetPath, finalContent);
+    } else {
+      await this.app.vault.adapter.write(normalizePath(this.targetPath), finalContent);
+    }
+    this.plugin.menuManager.removeConflictedPath(this.targetPath);
+    // 先受控提交，提交成功后才清理冲突备份：清理在前会让提交失败时既丢了远端版本，
+    // 又失去了冲突标记（无法再次打开解决窗口）
+    // Submit first, clean up backups only after it succeeds: cleaning first loses both the
+    // stashed remote version and the conflict marker when the submit fails
+    await this.plugin.lockManager.withLock(this.targetPath, async () => {
+      await configModify(this.targetPath, this.plugin, false, isVirtual ? finalContent : undefined, true,
+        { isConflictResolved: true, baseRevision: this.serverRevision });
+    }, { maxRetries: 2, retryInterval: 50 });
+    try {
+      await removeConflictBackups(this.plugin, this.targetPath);
+    } catch (e) {
+      console.error("Failed to clean up conflict-notes files on resolve:", e);
+    }
+  }
+
   onOpen() {
     ConflictResolveModal.activePaths.add(this.file.path);
     this.containerEl.addClass("note-history-modal");
@@ -368,28 +400,7 @@ export class ConflictResolveModal extends Modal {
         const finalContent = this.editorEl.value;
 
         if (this.kind === "setting") {
-          // 文本配置：先落盘，再按条件提交；虚拟配置由 configModify 以 content 参数提交
-          // Text settings: write first, then submit conditionally; virtual configs submit their
-          // content directly through configModify
-          if (!this.targetPath.startsWith(this.plugin.localStorageManager.syncPathPrefix)) {
-            await this.app.vault.adapter.write(normalizePath(this.targetPath), finalContent);
-          }
-          this.plugin.menuManager.removeConflictedPath(this.targetPath);
-          // 先受控提交，提交成功后才清理冲突备份：清理在前会让提交失败时既丢了远端版本，
-          // 又失去了冲突标记（无法再次打开解决窗口）
-          // Submit first, clean up backups only after it succeeds: cleaning first loses both the
-          // stashed remote version and the conflict marker when the submit fails
-          await this.plugin.lockManager.withLock(this.targetPath, async () => {
-            await configModify(this.targetPath, this.plugin, false,
-              this.targetPath.startsWith(this.plugin.localStorageManager.syncPathPrefix) ? finalContent : undefined,
-              true,
-              { isConflictResolved: true, baseRevision: this.serverRevision });
-          }, { maxRetries: 2, retryInterval: 50 });
-          try {
-            await removeConflictBackups(this.plugin, this.targetPath);
-          } catch (e) {
-            console.error("Failed to clean up conflict-notes files on resolve:", e);
-          }
+          await this.applySettingResolution(finalContent);
           this.close();
           return;
         }

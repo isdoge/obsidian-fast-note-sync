@@ -6,7 +6,7 @@ import { SyncEndData, FolderSyncRenameMessage } from "../utils/types";
 import { hashContent, dump, dumpError, isFolderSyncPathExcluded, waitForFolderEmpty, checkAndNotifyCaseConflict, normalizeServerTimestamp } from "../utils/helpers";
 import { SyncLogManager } from "./sync_log_manager";
 import type FastSync from "../../main";
-import { BaselineDeleteRecord, baselineFieldsFromDeleteRecord, buildBaselineFields, buildDeleteBaselineFields } from "../storage/baseline_scope";
+import { BaselineDeleteRecord, buildBaselineFields, buildDeleteBaselineFields } from "../storage/baseline_scope";
 
 
 /**
@@ -101,19 +101,24 @@ export const folderDeleteByPath = async function (folderPath: string, plugin: Fa
         plugin.addIgnoredFile(folderPath)
         try {
             if (plugin.isSyncBaselineModeEnabled?.() === true) plugin.folderSnapshotManager.recordPendingDeleteBaseline?.(folderPath)
+            // 冲突解决传入的显式基线优先：目录没有内容哈希，只要 revision 还在就必须随删除一起发出。
+            // 同一份 data 先交给 canSend 再发给 Send，避免排队判定与实际载荷不一致。
+            // An explicit baseline from conflict resolution wins: folders carry no content hash, so
+            // the revision must be sent with the delete. The same payload goes to canSend and Send
+            // so the queue decision sees exactly what is transmitted.
+            const baselineFields = explicitBaseline && plugin.isSyncBaselineModeEnabled?.() === true
+                ? (explicitBaseline.revision ? { baseRevision: explicitBaseline.revision } : {})
+                : buildDeleteBaselineFields(plugin, "folder", folderPath)
             const data = {
                 vault: plugin.settings.vault,
                 path: folderPath,
                 pathHash: hashContent(folderPath),
-                ...buildDeleteBaselineFields(plugin, "folder", folderPath),
+                ...baselineFields,
             }
             const queued = plugin.retryQueue?.canSend("FolderDelete", data) ?? false
             if (queued && !await plugin.concurrencyLimiter.waitForSlot(folderPath)) return
             if (retryGuard && !retryGuard()) { plugin.concurrencyLimiter.releaseSlot(folderPath); return }
-            await plugin.websocket.SendMessage("FolderDelete", {
-                ...data,
-                ...(explicitBaseline ? baselineFieldsFromDeleteRecord(explicitBaseline) : {}),
-            }, () => retryGuard ? !retryGuard() : false, () => {
+            await plugin.websocket.SendMessage("FolderDelete", data, () => retryGuard ? !retryGuard() : false, () => {
                 if (!queued) plugin.folderSnapshotManager.removeFolder(folderPath)
             })
             dump('Folder delete by path send', folderPath)

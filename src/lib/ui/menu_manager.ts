@@ -907,6 +907,13 @@ export class MenuManager {
       }
 
       if (conflictKind === "setting") {
+        // 未内联正文的配置无法通过 HTTP 单条拉取：绝不把“没有 .remote”当成远端空串打开三栏。
+        // A setting whose body was not inlined cannot be fetched through the single-item HTTP
+        // endpoint: never open the diff editor with an empty remote pane.
+        if (unified?.hasServerContent === false && !unified.serverDeleted) {
+          new Notice($("ui.conflict.remote_unavailable") || "Could not fetch the remote version.");
+          return;
+        }
         let settingLocalContent = "";
         if (normalizedPath.startsWith("_localStorage/")) {
           const lsKey = normalizedPath.slice("_localStorage/".length);
@@ -935,6 +942,22 @@ export class MenuManager {
         return;
       }
 
+      // 530 未内联正文时 .remote 不存在并不代表远端为空：按需单条拉取并核对检测时的 serverHash。
+      // 拉不到就提示并拒绝打开，绝不让空远端栏冒充“远端已清空”。
+      // A missing .remote for an un-inlined (530) body does not mean the remote is empty: fetch the
+      // single note and verify it against the detection-time serverHash. Refuse to open the editor
+      // when it is unavailable so an empty remote pane is never mistaken for empty remote content.
+      if (unified?.hasServerContent === false && !unified.serverDeleted) {
+        const remoteBody = typeof conflictResolveMod.loadRemoteNoteBody === "function"
+          ? await conflictResolveMod.loadRemoteNoteBody(this.plugin, normalizedPath, unified)
+          : null;
+        if (!remoteBody) {
+          new Notice($("ui.conflict.remote_unavailable") || "Could not fetch the remote version.");
+          return;
+        }
+        serverContent = remoteBody.body;
+      }
+
       const localContent = await this.plugin.app.vault.read(file);
 
       interface SyncLogItem {
@@ -960,6 +983,7 @@ export class MenuManager {
         }
       }
 
+      serverHash = unified?.serverHash || serverHash;
       if (baseMissing && meta?.remoteHash && !serverHash) serverHash = meta.remoteHash;
       const { ConflictResolveModal } = await import("../../views/conflict-resolve-modal");
       new ConflictResolveModal(this.plugin.app, this.plugin, file, localContent, serverContent, baseContent, serverHash, baseMissing, {

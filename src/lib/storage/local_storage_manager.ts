@@ -549,6 +549,14 @@ export class LocalStorageManager {
     }
 
     /**
+     * 是否为 localStorage 虚拟配置路径（不落在磁盘上）
+     * Whether the path is a virtual localStorage config (it has no on-disk file)
+     */
+    isVirtualPath(path: string): boolean {
+        return this.pathToKey(path) !== null;
+    }
+
+    /**
      * 读取同步项内容
      */
     getItemValue(key: string): string | null {
