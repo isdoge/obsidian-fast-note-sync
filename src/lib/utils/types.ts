@@ -17,6 +17,10 @@ export interface SnapFile {
     ctime: number;
     size: number;
     baseHash?: string | null;
+    /** 无可信内容基线（基线模式）/ No trusted content baseline (baseline mode) */
+    baseHashMissing?: boolean;
+    /** 服务端确认的版本令牌（基线模式）/ Server-confirmed revision token (baseline mode) */
+    baseRevision?: string;
 }
 
 export interface SnapFolder {
@@ -29,6 +33,10 @@ export interface SnapFolder {
 export interface PathHashFile {
     path: string;
     pathHash: string;
+    /** 删除前的内容基线（基线模式）/ Pre-delete content baseline (baseline mode) */
+    baseHash?: string;
+    baseHashMissing?: boolean;
+    baseRevision?: string;
 }
 
 export interface ReceiveMessage {
@@ -42,6 +50,10 @@ export interface ReceiveMessage {
     mtime: number;
     lastTime: number;
     context?: string;
+    /** 服务端确认的版本令牌（基线模式下行）/ Server-confirmed revision (baseline-mode downlink) */
+    revision?: string;
+    /** 当前是墓碑（基线模式）/ Current state is a tombstone (baseline mode) */
+    serverDeleted?: boolean;
     // 所属下载页（0-based，内部值，由 websocket_manager.ts 从 WSResponse 信封 1-based 转换后并入 payload）；
     // 旧服务端/非分页项为 undefined，下游按 undefined 走旧的单页全局计数路径（设计稿 §4.3）
     // Owning download page (0-based, internal value, merged into payload by websocket_manager.ts
@@ -61,6 +73,8 @@ export interface ReceiveFileSyncUpdateMessage {
     vault: string;
     pathHash: string;
     contentHash: string;
+    /** 服务端确认的版本令牌（基线模式）/ Server-confirmed revision (baseline mode) */
+    revision?: string;
     size: number;
     mtime: number;
     ctime: number;
@@ -72,6 +86,8 @@ export interface ReceiveFileSyncUpdateMessage {
 export interface FileUploadMessage {
     path: string;
     pathHash: string;
+    /** 服务端确认的版本令牌（基线模式）/ Server-confirmed revision (baseline mode) */
+    revision?: string;
     ctime: number;
     mtime: number;
     sessionId: string;
@@ -89,6 +105,8 @@ export interface FileSyncChunkDownloadMessage {
     chunkSize: number;
     totalChunks: number;
     size: number;
+    /** 服务端确认的版本令牌（基线模式）/ Server-confirmed revision (baseline mode) */
+    revision?: string;
 }
 
 export interface FileDownloadSession {
@@ -108,6 +126,8 @@ export interface FileDownloadSession {
     sessionId: string;
     totalChunks: number;
     size: number;
+    /** 服务端确认的版本令牌，下载落盘后绑定 / Server-confirmed revision, bound when the download lands */
+    revision?: string;
     chunks?: Map<number, ArrayBuffer>;
     tempDir?: string;
     downloadedChunks?: Set<number>;
@@ -125,6 +145,10 @@ export interface ReceiveMtimeMessage {
     ctime: number;
     mtime: number;
     lastTime?: number;
+    /** 内容一致确认通道（基线模式，设计稿 §2.5）/ Content-equality confirmation (baseline mode, §2.5) */
+    contentHash?: string;
+    /** 服务端确认的版本令牌（基线模式）/ Server-confirmed revision (baseline mode) */
+    revision?: string;
     /** 所属下载页（0-based），见 ReceiveMessage.pageIndex 注释 / owning download page, see ReceiveMessage.pageIndex */
     pageIndex?: number;
 }

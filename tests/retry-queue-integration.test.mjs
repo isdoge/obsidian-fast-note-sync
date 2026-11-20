@@ -40,7 +40,9 @@ function load(rel) {
       async getRetryQueueState(kind, p) { return this.p.remote.get(p) ?? null; }
     } };
     if (id.includes('websocket_action')) return new Proxy({}, { get: (_, k) => k });
-    if (['./sync_state', './concurrency_limiter', './operator_note', './operator_file', './operator_folder', '../storage/file_hash_manager'].includes(id)) return load(path.resolve(path.dirname(file), id + '.ts'));
+    if (['./sync_state', './concurrency_limiter', './operator_note', './operator_file', './operator_folder', '../storage/file_hash_manager', '../storage/baseline_scope'].includes(id)) return load(path.resolve(path.dirname(file), id + '.ts'));
+    if (id.includes('baseline_scope')) return { buildBaselineFields: (plugin, kind, path) => { if (kind === "folder" || !plugin) return {}; const m = kind === "setting" ? plugin.configHashManager : plugin.fileHashManager; const b = m && typeof m.getPathHash === "function" ? m.getPathHash(path) : null; return b !== null && b !== undefined ? { baseHash: b } : { baseHashMissing: true }; }, buildDeleteBaselineFields: () => ({}), baselineFieldsFromDeleteRecord: () => ({}), computeRemoteScope: () => "scope", parseScopedState: () => ({ state: { scope: "scope", revisions: {}, pendingDeletes: {} }, scopeChanged: false }), serializeScopedState: (state) => JSON.stringify(state) };
+    if (id.includes('conflict_store')) return { storeSyncConflict: async () => false, normalizeConflict: () => null, conflictKindToSyncType: () => "note", conflictReasonLabel: () => "", conflictKindLabel: () => "" };
     return {};
   };
   vm.runInNewContext(ts.transpileModule(fs.readFileSync(file, 'utf8'), { compilerOptions: {

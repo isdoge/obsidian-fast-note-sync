@@ -80,7 +80,9 @@ assert.deepEqual(Array.from(toU8(codec.decodeConfigContent(invalidEncoded).bytes
 //    encode/decode, for both binary and text payloads (no ping-pong re-upload).
 const helpers = load("src/lib/utils/helpers.ts", {
   require: (id) => {
-    if (id === "obsidian") return { Notice: class {}, normalizePath: (p) => p, TFolder: class {}, Platform: { isMobile: false } };
+      if (id.includes("baseline_scope")) return { buildBaselineFields: (plugin, kind, path) => { if (kind === "folder" || !plugin) return {}; const m = kind === "setting" ? plugin.configHashManager : plugin.fileHashManager; const b = m && typeof m.getPathHash === "function" ? m.getPathHash(path) : null; return b !== null && b !== undefined ? { baseHash: b } : { baseHashMissing: true }; }, buildDeleteBaselineFields: () => ({}), baselineFieldsFromDeleteRecord: () => ({}), computeRemoteScope: () => "scope", parseScopedState: () => ({ state: { scope: "scope", revisions: {}, pendingDeletes: {} }, scopeChanged: false }), serializeScopedState: (state) => JSON.stringify(state) };
+    if (id.includes("conflict_store")) return { storeSyncConflict: async () => false, normalizeConflict: () => null, conflictKindToSyncType: () => "note", conflictReasonLabel: () => "", conflictKindLabel: () => "" };
+        if (id === "obsidian") return { Notice: class {}, normalizePath: (p) => p, TFolder: class {}, Platform: { isMobile: false } };
     if (id.includes("i18n")) return { $: (k) => k };
     if (id.includes("sync_log_manager")) return { SyncLogManager: { getInstance: () => ({ addLog: noop }) } };
     if (id.includes("helpers_obsidian_bypass")) {
@@ -134,6 +136,7 @@ const ops = load("src/lib/sync/operator_config.ts", {
     if (id.includes("sync_log_manager")) return { SyncLogManager: { getInstance: () => ({ addLog: noop }) } };
     if (id.includes("sync_state")) return { advanceLiveSyncTime: noop };
     if (id.includes("i18n")) return { $: (k) => k };
+    if (id.includes("baseline_scope")) return { buildBaselineFields: (plugin, kind, path) => { if (kind === "folder" || !plugin) return {}; const m = kind === "setting" ? plugin.configHashManager : plugin.fileHashManager; const b = m && typeof m.getPathHash === "function" ? m.getPathHash(path) : null; return b !== null && b !== undefined ? { baseHash: b } : { baseHashMissing: true }; }, buildDeleteBaselineFields: () => ({}), baselineFieldsFromDeleteRecord: () => ({}), computeRemoteScope: () => "scope", parseScopedState: () => ({ state: { scope: "scope", revisions: {}, pendingDeletes: {} }, scopeChanged: false }), serializeScopedState: (state) => JSON.stringify(state) }; if (id.includes("conflict_store")) return { storeSyncConflict: async () => false, normalizeConflict: () => null, conflictKindToSyncType: () => "note", conflictReasonLabel: () => "", conflictKindLabel: () => "" }; 
     return {};
   },
 });

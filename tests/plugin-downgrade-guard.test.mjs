@@ -21,7 +21,7 @@ vm.runInNewContext(code, { module, exports: module.exports, console, TextDecoder
     : id.includes("helpers") ? new Proxy({ isPathInConfigSyncDirs: () => true, configIsPathExcluded: () => false,
         hashFileAsync: async () => "local-hash", hashContent: () => "p", getSafeCtime: s => s.ctime }, { get: (t, k) => t[k] ?? (() => undefined) })
     : id.includes("sync_log_manager") ? { SyncLogManager: { getInstance: () => ({ addLog: (...a) => logs.push(a) }) } }
-    : id.includes("i18n") ? { $: k => k } : {} });
+    : id.includes("i18n") ? { $: k => k } : id.includes("baseline_scope") ? { buildBaselineFields: (plugin, kind, path) => { if (kind === "folder" || !plugin) return {}; const m = kind === "setting" ? plugin.configHashManager : plugin.fileHashManager; const b = m && typeof m.getPathHash === "function" ? m.getPathHash(path) : null; return b !== null && b !== undefined ? { baseHash: b } : { baseHashMissing: true }; }, buildDeleteBaselineFields: () => ({}), baselineFieldsFromDeleteRecord: () => ({}), computeRemoteScope: () => "scope", parseScopedState: () => ({ state: { scope: "scope", revisions: {}, pendingDeletes: {} }, scopeChanged: false }), serializeScopedState: (state) => JSON.stringify(state) } : id.includes("conflict_store") ? { storeSyncConflict: async () => false, normalizeConflict: () => null, conflictKindToSyncType: () => "note", conflictReasonLabel: () => "", conflictKindLabel: () => "" } : {} });
 const ops = module.exports;
 const enc = s => new TextEncoder().encode(s).buffer, dec = b => new TextDecoder().decode(b);
 const dir = ".obsidian/plugins/qa";

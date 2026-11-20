@@ -2,6 +2,7 @@ import { TFolder } from "obsidian";
 
 import { dump, isFolderSyncPathExcluded, debounce, LocalStateFileMirror, computeMirrorDigest } from "../utils/helpers";
 import type FastSync from "../../main";
+import { BaselineDeleteRecord, computeRemoteScope, parseScopedState, serializeScopedState, ScopedBaselineState } from "./baseline_scope";
 
 // 对账延迟：初始化后等待若干秒再比对，避开插件刚加载时的启动开销高峰
 // Reconciliation delay: wait a few seconds after init to avoid the plugin's startup load spike
@@ -16,6 +17,12 @@ const RECONCILE_DELAY_MS = 5000;
 export class FolderSnapshotManager {
     private plugin: FastSync;
     private snapshotMap: Map<string, number> = new Map();
+    /** 服务端确认的目录 revision（设计稿 §5.1）/ Server-confirmed folder revisions (§5.1) */
+    private revisions: Map<string, string> = new Map();
+    private pendingDeleteBaselines: Map<string, BaselineDeleteRecord> = new Map();
+    private baselineScope: string = "";
+    private baselineStorageKey: string;
+    private baselineMirror: LocalStateFileMirror;
     private storageKey: string;
     private isInitialized: boolean = false;
     // 脏标记 + 防抖落盘：高频单条写入（下载/Ack 路径）不再逐条同步整表 JSON.stringify，
@@ -32,8 +39,11 @@ export class FolderSnapshotManager {
         // 与 vault 名无关的稳定存储键：iCloud 手机端会把库文件夹改名，绑定 vault 名的旧 key 会失效
         // (与 local_storage_manager.ts getInternalKey 的修复同理)，历史键迁移见 loadFromStorage
         this.storageKey = `fns-folderSnapshot`;
+        this.baselineStorageKey = `fns-folderBaselineState`;
         this.debouncedFlush = debounce(() => this.flush(), 500);
         this.mirror = new LocalStateFileMirror(plugin, "folderSnapshot.json");
+        this.baselineMirror = new LocalStateFileMirror(plugin, "folderBaselineState.json");
+        this.baselineScope = computeRemoteScope(plugin.settings);
     }
 
     /**
@@ -54,12 +64,16 @@ export class FolderSnapshotManager {
         }
         // 最后冲镜像：既包含 saveToStorage 刚安排的一份，也包含与 isDirty 无关的防抖中镜像写
         this.mirror.flush();
+        this.baselineMirror.flush();
     }
 
     /**
      * 初始化快照表
      */
     async initialize(): Promise<void> {
+        // revision 令牌按远端作用域恢复；切换目标后旧令牌作废
+        // Revisions are restored per remote scope; old tokens are void after a target switch
+        await this.loadBaselineState();
         const loaded = this.loadFromStorage();
         if (loaded) {
             this.restoredFromPersisted = true;
@@ -188,6 +202,95 @@ export class FolderSnapshotManager {
         }
     }
 
+    // ─── 阶段 E：服务端确认的目录 revision 与待删基线（设计稿 §5.1）──────────────
+
+    private ensureBaselineScope(): void {
+        const scope = computeRemoteScope(this.plugin.settings);
+        if (scope === this.baselineScope) return;
+        this.baselineScope = scope;
+        this.revisions.clear();
+        this.pendingDeleteBaselines.clear();
+        dump("FolderSnapshotManager: remote scope changed; folder revisions cleared");
+        this.saveBaselineState();
+    }
+
+    private async loadBaselineState(): Promise<void> {
+        const scope = computeRemoteScope(this.plugin.settings);
+        this.baselineScope = scope;
+        let raw = this.plugin.app.loadLocalStorage(this.baselineStorageKey) as string | null;
+        if (!raw) {
+            raw = await this.baselineMirror.read();
+            if (raw) this.plugin.app.saveLocalStorage(this.baselineStorageKey, raw);
+        }
+        const { state, scopeChanged } = parseScopedState(raw, scope);
+        this.revisions = new Map(Object.entries(state.revisions));
+        this.pendingDeleteBaselines = new Map(Object.entries(state.pendingDeletes));
+        if (scopeChanged) {
+            this.revisions.clear();
+            this.pendingDeleteBaselines.clear();
+            dump("FolderSnapshotManager: stored folder revisions belong to another remote target; discarded");
+            this.saveBaselineState();
+        }
+    }
+
+    private saveBaselineState(): void {
+        const state: ScopedBaselineState = {
+            scope: this.baselineScope,
+            revisions: Object.fromEntries(this.revisions),
+            pendingDeletes: Object.fromEntries(this.pendingDeleteBaselines),
+        };
+        const data = serializeScopedState(state);
+        try {
+            this.plugin.app.saveLocalStorage(this.baselineStorageKey, data);
+        } catch (error) {
+            dump("FolderSnapshotManager: failed to save baseline state", error);
+        }
+        this.baselineMirror.scheduleWrite(data);
+    }
+
+    getBaselineRevision(path: string): string | null {
+        this.ensureBaselineScope();
+        return this.revisions.get(path) ?? null;
+    }
+
+    isBaselineConfirmed(path: string): boolean {
+        this.ensureBaselineScope();
+        return this.revisions.has(path);
+    }
+
+    /** 只允许在服务端确认（Ack / 远端落盘）后调用 / Only call after server confirmation */
+    setConfirmedRevision(path: string, revision: string): void {
+        this.ensureBaselineScope();
+        if (revision === "") return;
+        this.revisions.set(path, revision);
+        this.scheduleSave();
+    }
+
+    /** 删除前快照（目录只有 revision）/ Pre-delete snapshot (folders only have a revision) */
+    recordPendingDeleteBaseline(path: string): BaselineDeleteRecord {
+        this.ensureBaselineScope();
+        const revision = this.revisions.get(path) ?? "";
+        const record: BaselineDeleteRecord = { hash: "", hashMissing: revision === "", revision };
+        this.pendingDeleteBaselines.set(path, record);
+        this.scheduleSave();
+        return record;
+    }
+
+    getPendingDeleteBaseline(path: string): BaselineDeleteRecord | null {
+        this.ensureBaselineScope();
+        return this.pendingDeleteBaselines.get(path) ?? null;
+    }
+
+    clearPendingDeleteBaseline(path: string): void {
+        if (this.pendingDeleteBaselines.delete(path)) this.scheduleSave();
+    }
+
+    clearPendingDeleteBaselines(paths: Iterable<string>): void {
+        let changed = false;
+        for (const path of paths) changed = this.pendingDeleteBaselines.delete(path) || changed;
+        if (changed) this.scheduleSave();
+    }
+
     /**
      * 获取路径的快照时间
      */
@@ -224,7 +327,9 @@ export class FolderSnapshotManager {
      * 删除路径快照
      */
     removeFolder(path: string): void {
-        if (this.snapshotMap.delete(path)) {
+        const removed = this.snapshotMap.delete(path);
+        const removedRevision = this.revisions.delete(path);
+        if (removed || removedRevision) {
             this.scheduleSave();
         }
     }
@@ -235,7 +340,7 @@ export class FolderSnapshotManager {
     removeFolders(paths: Iterable<string>): void {
         let changed = false;
         for (const path of paths) {
-            if (this.snapshotMap.delete(path)) {
+            if (this.snapshotMap.delete(path) || this.revisions.delete(path)) {
                 changed = true;
             }
         }
@@ -318,5 +423,6 @@ export class FolderSnapshotManager {
 
         // 即使 localStorage 写入失败，镜像写入也照常进行
         this.mirror.scheduleWrite(data);
+        this.saveBaselineState();
     }
 }

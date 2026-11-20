@@ -24,6 +24,10 @@ export interface RetryQueueEntry {
     createdAt: number;
     attempts: number;
     baselineHash: string;
+    /** 源路径服务端 revision（基线模式）/ Source-path server revision (baseline mode) */
+    baselineRevision?: string;
+    /** 源路径没有可信基线 / Source path had no trusted baseline */
+    baselineMissing?: boolean;
 }
 
 /** Only observed vault mutations enter here; scans must never manufacture tombstones. */
@@ -68,7 +72,9 @@ export class RetryQueue {
                     && ["note", "file", "folder"].includes(e.objectType) && ["delete", "rename"].includes(e.operation)
                     && this.validPath(e.path) && (e.operation !== "rename" || this.validPath(e.oldPath))
                     && Number.isFinite(e.createdAt) && e.createdAt >= 0 && e.createdAt <= Date.now()
-                    && Number.isInteger(e.attempts) && e.attempts >= 0 && typeof e.baselineHash === "string");
+                    && Number.isInteger(e.attempts) && e.attempts >= 0 && typeof e.baselineHash === "string"
+                    && (e.baselineRevision === undefined || typeof e.baselineRevision === "string")
+                    && (e.baselineMissing === undefined || typeof e.baselineMissing === "boolean"));
             } else if (raw) dump("[RetryQueue] Invalid file or scope changed; discarding queue");
         } catch (error) {
             dump("[RetryQueue] Corrupt file; ignoring queue", error);
@@ -129,12 +135,24 @@ export class RetryQueue {
         const previous = [...this.entries].reverse().find(e => e.objectType === objectType
             && e.path === (oldPath || path));
         let baselineHash = objectType === "folder" ? "" : p.fileHashManager.getPathHash(oldPath || path) || "";
+        // 源路径删除前的服务端 revision：切换远端目标后管理器已清空旧令牌，这里只取当前作用域的值
+        // The source path's server revision before deletion; the manager already dropped tokens of
+        // another remote target, so this is current-scope only
+        const baselineMode = p.isSyncBaselineModeEnabled?.() === true;
+        let baselineRevision = !baselineMode ? ""
+            : objectType === "folder"
+                ? (p.folderSnapshotManager?.getBaselineRevision?.(oldPath || path) ?? "")
+                : (p.fileHashManager?.getBaselineRevision?.(oldPath || path) ?? "");
+        let baselineMissing = baselineMode && (baselineRevision === ""
+            || (objectType !== "folder" && !p.fileHashManager?.getConfirmedBaseline?.(oldPath || path, null)));
         let createdAt = Date.now();
         if (previous) {
             // Sent operations are immutable until ACK/GET settles them. Keep a successor
             // behind them, carrying the original baseline, rather than guessing the outcome.
             if (previous.attempts > 0) {
                 baselineHash = previous.baselineHash;
+                baselineRevision = previous.baselineRevision ?? baselineRevision;
+                baselineMissing = previous.baselineMissing ?? baselineMissing;
             } else {
                 baselineHash = previous.baselineHash;
                 createdAt = previous.createdAt;
@@ -147,7 +165,8 @@ export class RetryQueue {
             }
         }
         const entry: RetryQueueEntry = { id: generateUUID(), objectType, operation, path,
-            ...(operation === "rename" ? { oldPath } : {}), createdAt, attempts: 0, baselineHash };
+            ...(operation === "rename" ? { oldPath } : {}), createdAt, attempts: 0, baselineHash,
+            ...(baselineRevision ? { baselineRevision } : {}), ...(baselineMode ? { baselineMissing } : {}) };
         this.entries.push(entry);
         // Folders have no queryable content version. Only the current continuous connection
         // may retry its observed events; restored/offline entries are discarded before sync.
@@ -421,14 +440,15 @@ export class RetryQueue {
             const action = `${e.objectType[0].toUpperCase() + e.objectType.slice(1)}${e.operation === "delete" ? "Delete" : "Rename"}`;
             const guard = this.sendGuard(action, { path: e.path, oldPath: e.oldPath });
             if (e.operation === "delete") {
+                const explicit = { hash: e.baselineHash, hashMissing: e.baselineMissing === true, revision: e.baselineRevision || "" };
                 const send = e.objectType === "note" ? noteDeleteByPath : e.objectType === "file" ? fileDeleteByPath : folderDeleteByPath;
-                await send(e.path, this.plugin, guard);
+                await send(e.path, this.plugin, guard, explicit);
             } else {
                 const file = this.plugin.app.vault.getAbstractFileByPath(e.path);
                 if (!file) { this.remove(e); this.persist(); return; }
-                if (e.objectType === "note") await noteRename(file, e.oldPath!, this.plugin, false, guard, e.baselineHash);
-                else if (e.objectType === "file") await fileRename(file, e.oldPath!, this.plugin, false, guard, e.baselineHash);
-                else await folderRename(file as Parameters<typeof folderRename>[0], e.oldPath!, this.plugin, false, guard);
+                if (e.objectType === "note") await noteRename(file, e.oldPath!, this.plugin, false, guard, e.baselineHash, e.baselineRevision);
+                else if (e.objectType === "file") await fileRename(file, e.oldPath!, this.plugin, false, guard, e.baselineHash, e.baselineRevision);
+                else await folderRename(file as Parameters<typeof folderRename>[0], e.oldPath!, this.plugin, false, guard, e.baselineRevision);
             }
         } catch (error) {
             dump("[RetryQueue] Send failed; retaining operation", e?.path, error);

@@ -11,6 +11,7 @@ import { WebSocketClient } from "./websocket_client";
 import { CLIENT_TYPE } from "../utils/types";
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
+import { conflictKindToSyncType, normalizeConflict, storeSyncConflict } from "./conflict_store";
 
 
 // 冲突相关错误码
@@ -553,16 +554,20 @@ export class WebSocketManager {
       // 处理冲突相关错误码
       if (data.code === ERROR_SYNC_CONFLICT) {
         void this.handleConflictError(data);
-        const payloadData = data.data;
-        let path: unknown = null;
-        if (payloadData && typeof payloadData === "object") {
-          path = payloadData.path ?? payloadData.Path;
-        }
-        if (typeof path === "string") {
+        const conflict = normalizeConflict(data.data);
+        const path = conflict?.path || "";
+        if (path !== "") {
           this.plugin.concurrencyLimiter.releaseSlot(path);
-          const pageIndex = this.plugin.syncState.pendingNotePushPageIndex.get(path);
-          this.plugin.syncState.pendingNotePushPageIndex.delete(path);
-          this.plugin.recordSyncCompleted('note', pageIndex);
+          // 四类资源共用同一拒绝载荷：按 kind 归账，不能一律记到笔记上
+          // All four kinds share the rejection payload: account by kind, never always as a note
+          const type = conflictKindToSyncType(conflict?.kind || "note");
+          const pageIndex = type === "note" ? this.plugin.syncState.pendingNotePushPageIndex.get(path)
+            : type === "setting" ? this.plugin.syncState.pendingConfigPushPageIndex.get(path)
+            : type === "file" ? this.plugin.syncState.pendingFilePushPageIndex.get(path) : undefined;
+          if (type === "note") this.plugin.syncState.pendingNotePushPageIndex.delete(path);
+          else if (type === "setting") this.plugin.syncState.pendingConfigPushPageIndex.delete(path);
+          else if (type === "file") this.plugin.syncState.pendingFilePushPageIndex.delete(path);
+          this.plugin.recordSyncCompleted(type, pageIndex);
         }
       } else if (data.code === 463 && typeof data.data?.sessionID === "string") {
         receiveFileUploadSessionNotFound(data.data.sessionID, this.plugin);
@@ -1009,6 +1014,13 @@ export class WebSocketManager {
   }
 
   private async handleConflictError(data: StructuredMessageData) {
+    // 基线模式：统一冲突载荷一律持久化，不受 manualMerge 限制，也不要求远端正文非空；
+    // 旧服务端的 530 旧载荷在兼容模式下保持原有行为（设计稿 §2.6）
+    // Baseline mode: always persist the unified payload, never gated on manualMerge or a non-empty
+    // body. Legacy 530 payloads from old servers keep the compatibility behavior (§2.6)
+    if (this.plugin.syncState.isSyncBaselineModeEnabled?.() === true) {
+      if (await storeSyncConflict(this.plugin, data.data)) return;
+    }
     const payloadData = data.data;
     let path = "";
     let serverContent = "";

@@ -1,6 +1,7 @@
 import { hashContentAsync, dump, isPathExcluded, showSyncNotice, isLargeBinarySyncRisk, describeBinarySyncLimit, logMemorySnapshot, hashFileAsync, debounce, LocalStateFileMirror, computeMirrorDigest } from "../utils/helpers";
 import { $ } from "../../i18n/lang";
 import type FastSync from "../../main";
+import { BaselineDeleteRecord, computeRemoteScope, parseScopedState, serializeScopedState, ScopedBaselineState } from "./baseline_scope";
 
 
 /**
@@ -52,6 +53,13 @@ export class FileHashManager {
   private storageKey: string;
   private syncStorageKey: string;
   private confirmedStorageKey: string;
+  // 服务端确认的 revision 令牌与待删基线，按远端作用域隔离持久化（设计稿 §5.1）
+  // Server-confirmed revision tokens and pre-delete baselines, persisted per remote scope (§5.1)
+  private baselineStorageKey: string;
+  private revisions: Map<string, string> = new Map();
+  private pendingDeleteBaselines: Map<string, BaselineDeleteRecord> = new Map();
+  private baselineScope: string = "";
+  private baselineMirror: LocalStateFileMirror;
   private isInitialized: boolean = false;
   // 脏标记 + 防抖落盘：高频单条写入（下载/Ack 路径）不再逐条同步整表 JSON.stringify，
   // 避免高频写 localStorage 阻塞主线程导致界面白屏
@@ -70,9 +78,12 @@ export class FileHashManager {
     this.storageKey = `fns-fileHashMap`;
     this.syncStorageKey = `fns-syncHashMap`;
     this.confirmedStorageKey = `fns-syncHashMapConfirmed`;
+    this.baselineStorageKey = `fns-fileBaselineState`;
     this.debouncedFlush = debounce(() => this.flush(), 500);
     this.mirror = new LocalStateFileMirror(plugin, "fileHashMap.json");
     this.syncMirror = new LocalStateFileMirror(plugin, "syncHashMap.json");
+    this.baselineMirror = new LocalStateFileMirror(plugin, "fileBaselineState.json");
+    this.baselineScope = computeRemoteScope(plugin.settings);
   }
 
   /**
@@ -94,6 +105,7 @@ export class FileHashManager {
     // 最后冲镜像：既包含 saveToStorage 刚安排的一份，也包含与 isDirty 无关的防抖中镜像写
     this.mirror.flush();
     this.syncMirror.flush();
+    this.baselineMirror.flush();
   }
 
   /**
@@ -126,6 +138,10 @@ export class FileHashManager {
     // Restore the confirmation table separately: legacy installs lack it, so every old baseline
     // is treated as needing an equality check before it can be trusted.
     this.loadConfirmedFromStorage();
+    // revision 令牌与待删基线：绑定远端作用域恢复；切换目标后旧令牌作废
+    // Revision tokens and pre-delete baselines: restored per remote scope; old tokens are void
+    // after a target switch
+    await this.loadBaselineState();
     if (hasRestoredSync && this.syncHashMap.size > 0) {
       dump(`FileHashManager: ${this.confirmedPaths.size} of ${this.syncHashMap.size} baselines are server-confirmed`);
     }
@@ -371,6 +387,138 @@ export class FileHashManager {
     return localContentHash !== null && localContentHash === stored ? "persisted_verified" : "unverified";
   }
 
+  // ─── 阶段 E：服务端确认的 revision 与待删基线（设计稿 §5.1）──────────────────
+  // ─── Stage E: server-confirmed revisions and pre-delete baselines (§5.1) ─────
+
+  /** 远端目标变化时立即隔离旧令牌；旧目标的可信结论降级为内容相等自证 */
+  /** Isolate old tokens when the remote target changes; confirmed provenance degrades to equality-only */
+  private ensureBaselineScope(): void {
+    const scope = computeRemoteScope(this.plugin.settings);
+    if (scope === this.baselineScope) return;
+    this.baselineScope = scope;
+    this.revisions.clear();
+    this.pendingDeleteBaselines.clear();
+    this.confirmedPaths.clear();
+    dump("FileHashManager: remote scope changed; revisions and confirmed provenance cleared");
+    this.saveBaselineState();
+    this.saveSyncToStorage();
+  }
+
+  private async loadBaselineState(): Promise<void> {
+    const scope = computeRemoteScope(this.plugin.settings);
+    this.baselineScope = scope;
+    let raw = this.plugin.app.loadLocalStorage(this.baselineStorageKey) as string | null;
+    if (!raw) {
+      raw = await this.baselineMirror.read();
+      if (raw) this.plugin.app.saveLocalStorage(this.baselineStorageKey, raw);
+    }
+    const { state, scopeChanged } = parseScopedState(raw, scope);
+    this.revisions = new Map(Object.entries(state.revisions));
+    this.pendingDeleteBaselines = new Map(Object.entries(state.pendingDeletes));
+    if (scopeChanged) {
+      // 旧目标的令牌绝不能发往新目标；哈希表保留，用作内容相等自证
+      // Old-target tokens must never reach the new target; hashes stay for equality checks
+      this.revisions.clear();
+      this.pendingDeleteBaselines.clear();
+      this.confirmedPaths.clear();
+      dump("FileHashManager: stored baseline belongs to another remote target; tokens discarded");
+      this.saveBaselineState();
+      this.saveSyncToStorage();
+    }
+  }
+
+  private saveBaselineState(): void {
+    const state: ScopedBaselineState = {
+      scope: this.baselineScope,
+      revisions: Object.fromEntries(this.revisions),
+      pendingDeletes: Object.fromEntries(this.pendingDeleteBaselines),
+    };
+    const data = serializeScopedState(state);
+    try {
+      this.plugin.app.saveLocalStorage(this.baselineStorageKey, data);
+    } catch (error) {
+      dump("FileHashManager: failed to save baseline state", error);
+    }
+    this.baselineMirror.scheduleWrite(data);
+  }
+
+  /** 该路径服务端确认过的 revision 令牌 / Server-confirmed revision token for a path */
+  getBaselineRevision(path: string): string | null {
+    this.ensureBaselineScope();
+    return this.revisions.get(path) ?? null;
+  }
+
+  /**
+   * 服务端确认过的可信 `{hash, revision}`；旧版持久化基线不算。
+   * Server-confirmed trusted `{hash, revision}`; legacy persisted baselines don't qualify.
+   */
+  getConfirmedBaseline(path: string, localContentHash: string | null = null): { hash: string; revision: string } | null {
+    this.ensureBaselineScope();
+    if (!this.confirmedPaths.has(path)) return null;
+    const hash = this.getVerifiedPathHash(path, localContentHash);
+    const revision = this.revisions.get(path);
+    if (hash === null || !revision) return null;
+    return { hash, revision };
+  }
+
+  /** 是否已有服务端确认的 revision（扫描增量过滤用） / Whether a confirmed revision exists (scan filter) */
+  isBaselineConfirmed(path: string): boolean {
+    this.ensureBaselineScope();
+    return this.confirmedPaths.has(path) && this.revisions.has(path);
+  }
+
+  /**
+   * 建立/前移服务端确认的基线。只允许在 Ack、远端落盘或内容一致确认后调用。
+   * Establish/advance a server-confirmed baseline. Only Ack / remote landing / equality may call this.
+   */
+  setConfirmedBaseline(path: string, hash: string, revision: string, mtime: number = 0, size: number = 0, cacheContent = true): void {
+    this.ensureBaselineScope();
+    if (cacheContent) this.hashMap.set(path, { hash, mtime, size });
+    this.syncHashMap.set(path, hash);
+    this.confirmedPaths.add(path);
+    if (revision !== "") this.revisions.set(path, revision);
+    this.scheduleSave();
+  }
+
+  /**
+   * 删除前快照：在清掉活跃缓存前记录最后确认的基线，供实时删除、回放与批量删除携带。
+   * Pre-delete snapshot: capture the last confirmed baseline before active cache is cleared, so
+   * live deletes, replay and batch deletes can carry it.
+   */
+  recordPendingDeleteBaseline(path: string): BaselineDeleteRecord {
+    this.ensureBaselineScope();
+    const confirmed = this.confirmedPaths.has(path);
+    const revision = confirmed ? (this.revisions.get(path) ?? "") : "";
+    const record: BaselineDeleteRecord = {
+      hash: confirmed ? (this.syncHashMap.get(path) ?? "") : "",
+      hashMissing: !confirmed || revision === "",
+      revision,
+    };
+    this.pendingDeleteBaselines.set(path, record);
+    this.scheduleSave();
+    return record;
+  }
+
+  getPendingDeleteBaseline(path: string): BaselineDeleteRecord | null {
+    this.ensureBaselineScope();
+    return this.pendingDeleteBaselines.get(path) ?? null;
+  }
+
+  clearPendingDeleteBaseline(path: string): void {
+    if (this.pendingDeleteBaselines.delete(path)) this.scheduleSave();
+  }
+
+  clearPendingDeleteBaselines(paths: Iterable<string>): void {
+    let changed = false;
+    for (const path of paths) changed = this.pendingDeleteBaselines.delete(path) || changed;
+    if (changed) this.scheduleSave();
+  }
+
+  getAllPendingDeleteBaselines(): BaselineDeleteRecord[] {
+    this.ensureBaselineScope();
+    return Array.from(this.pendingDeleteBaselines.values());
+  }
+
   /**
    * 内容仍是同步基准时，返回缓存记录的同步时 mtime（没有则 undefined）。
    * 打开 canvas 等只改写 mtime 不改内容时，用它代替被刷新的本地 mtime 上报（#256）
@@ -393,15 +541,24 @@ export class FileHashManager {
   /**
    * 添加或更新单个文件的对齐基准哈希值 (在 Ack 确认或收到推送时调用)
    */
-  setFileHash(path: string, hash: string, mtime: number = 0, size: number = 0, cacheContent = true): void {
+  setFileHash(path: string, hash: string, mtime: number = 0, size: number = 0, cacheContent = true, revision?: string): void {
+    this.ensureBaselineScope();
     // A rename confirms the server baseline, not the current local bytes.
     if (cacheContent) this.hashMap.set(path, { hash, mtime, size });
     else this.hashMap.delete(path);
+    const previousHash = this.syncHashMap.get(path);
     this.syncHashMap.set(path, hash);
     // 只有服务端确认过的写入才能把基线标为 confirmed；扫描/本地缓存路径不经过这里
     // Only server-confirmed writes reach here, so the baseline is marked confirmed. Scans and
     // local-cache-only paths never call this method.
     this.confirmedPaths.add(path);
+    if (revision !== undefined && revision !== "") {
+      this.revisions.set(path, revision);
+    } else if (previousHash !== undefined && previousHash !== hash) {
+      // 内容已变但本次确认没有令牌：旧 revision 已对应旧内容，必须丢弃
+      // Content changed without a token: the old revision describes old content, drop it
+      this.revisions.delete(path);
+    }
     this.scheduleSave();
   }
 
@@ -426,6 +583,7 @@ export class FileHashManager {
     const deleted1 = this.hashMap.delete(path);
     const deleted2 = this.syncHashMap.delete(path);
     this.confirmedPaths.delete(path);
+    this.revisions.delete(path);
     if (deleted1 || deleted2) {
       this.scheduleSave();
     }
@@ -437,6 +595,7 @@ export class FileHashManager {
       changed = this.hashMap.delete(path) || changed;
       changed = this.syncHashMap.delete(path) || changed;
       this.confirmedPaths.delete(path);
+      this.revisions.delete(path);
     }
     if (changed) this.scheduleSave();
   }
@@ -535,8 +694,9 @@ export class FileHashManager {
     // 即使 localStorage 写入失败 (如配额)，镜像写入也照常进行
     this.mirror.scheduleWrite(data);
 
-    // 同步保存基准哈希表
+    // 同步保存基准哈希表与 revision/待删基线
     this.saveSyncToStorage();
+    this.saveBaselineState();
   }
 
   private saveSyncToStorage(): void {
@@ -588,6 +748,8 @@ export class FileHashManager {
     this.hashMap.clear();
     this.syncHashMap.clear();
     this.confirmedPaths.clear();
+    this.revisions.clear();
+    this.pendingDeleteBaselines.clear();
     this.saveToStorage();
   }
 
@@ -637,6 +799,8 @@ export class FileHashManager {
       if (isPathExcluded(path, this.plugin)) {
         this.hashMap.delete(path);
         this.syncHashMap.delete(path);
+        this.confirmedPaths.delete(path);
+        this.revisions.delete(path);
         deletedCount++;
       }
     }

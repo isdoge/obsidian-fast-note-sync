@@ -1,8 +1,9 @@
-import { App, Modal, setIcon, TFile, Platform, Notice } from "obsidian";
+import { App, Modal, setIcon, TFile, Platform, Notice, normalizePath } from "obsidian";
 import type FastSync from "../main";
 import { $ } from "../i18n/lang";
 import { hashContent, hashContentAsync } from "../lib/utils/helpers";
 import { removeConflictBackups } from "../lib/sync/operator_note";
+import { configModify } from "../lib/sync/operator_config";
 
 /**
  * ConflictResolveModal provides a 3-column diff view for manual note conflict resolution.
@@ -27,6 +28,11 @@ export class ConflictResolveModal extends Modal {
   private serverHash: string;
   /** 是否缺少共同祖先基线（区分“真实空 base”与“无基线”）/ Whether the common ancestor is missing */
   private baseMissing: boolean;
+  /** 资源类型与完整路径（配置冲突时 file 对象不可用）/ Kind and full path (config conflicts have no TFile) */
+  private kind: string;
+  private targetPath: string;
+  private serverRevision: string;
+  private serverDeleted: boolean;
 
   private editorEl: HTMLTextAreaElement;
   private editorContainerEl: HTMLElement;
@@ -42,7 +48,8 @@ export class ConflictResolveModal extends Modal {
     serverContent: string,
     baseContent: string,
     serverHash: string,
-    baseMissing: boolean = false
+    baseMissing: boolean = false,
+    options: { kind?: string; path?: string; serverRevision?: string; serverDeleted?: boolean } = {}
   ) {
     super(app);
     this.plugin = plugin;
@@ -52,6 +59,10 @@ export class ConflictResolveModal extends Modal {
     this.baseContent = baseContent;
     this.serverHash = serverHash;
     this.baseMissing = baseMissing;
+    this.kind = options.kind || "note";
+    this.targetPath = options.path || file.path;
+    this.serverRevision = options.serverRevision || "";
+    this.serverDeleted = options.serverDeleted === true;
   }
 
   onOpen() {
@@ -65,7 +76,7 @@ export class ConflictResolveModal extends Modal {
     const { contentEl, titleEl } = this;
 
     titleEl.createSpan({ text: $("ui.conflict.modal_title") || "冲突解决" });
-    titleEl.createDiv({ cls: "title-path", text: ` - ${this.file.path}` });
+    titleEl.createDiv({ cls: "title-path", text: ` - ${this.targetPath}` });
 
     const container = contentEl.createDiv({ cls: "conflict-resolve-container" });
 
@@ -356,6 +367,29 @@ export class ConflictResolveModal extends Modal {
         // Use raw textarea content directly — no diff markup to clean // 直接使用编辑器纯文本，无需清洗差异标记
         const finalContent = this.editorEl.value;
 
+        if (this.kind === "setting") {
+          // 文本配置：先落盘，再按条件提交；虚拟配置由 configModify 以 content 参数提交
+          // Text settings: write first, then submit conditionally; virtual configs submit their
+          // content directly through configModify
+          if (!this.targetPath.startsWith(this.plugin.localStorageManager.syncPathPrefix)) {
+            await this.app.vault.adapter.write(normalizePath(this.targetPath), finalContent);
+          }
+          this.plugin.menuManager.removeConflictedPath(this.targetPath);
+          try {
+            await removeConflictBackups(this.plugin, this.targetPath);
+          } catch (e) {
+            console.error("Failed to clean up conflict-notes files on resolve:", e);
+          }
+          await this.plugin.lockManager.withLock(this.targetPath, async () => {
+            await configModify(this.targetPath, this.plugin, false,
+              this.targetPath.startsWith(this.plugin.localStorageManager.syncPathPrefix) ? finalContent : undefined,
+              true,
+              { isConflictResolved: true, baseRevision: this.serverRevision });
+          }, { maxRetries: 2, retryInterval: 50 });
+          this.close();
+          return;
+        }
+
         // 1. Overwrite local file // 覆写本地文件
         await this.app.vault.modify(this.file, finalContent);
 
@@ -363,9 +397,11 @@ export class ConflictResolveModal extends Modal {
         const contentHash = await hashContentAsync(finalContent);
         const data = {
           vault: this.plugin.settings.vault,
-          path: this.file.path,
-          pathHash: hashContent(this.file.path),
+          path: this.targetPath,
+          pathHash: hashContent(this.targetPath),
           baseHash: this.serverHash,
+          ...(this.serverDeleted || this.serverHash === "" ? { baseHashMissing: true } : {}),
+          ...(this.serverRevision ? { baseRevision: this.serverRevision } : {}),
           content: finalContent,
           contentHash: contentHash,
           ctime: this.file.stat.ctime,
@@ -374,17 +410,17 @@ export class ConflictResolveModal extends Modal {
         };
 
         // Remove path from suppressed collection // 解除路径抑制
-        this.plugin.menuManager.removeConflictedPath(this.file.path);
+        this.plugin.menuManager.removeConflictedPath(this.targetPath);
 
         // 清理本地 conflict-notes 中的备份文件（含阶段 B 的元数据与本地侧备份）
         // Clean up conflict-notes backups, including the stage-B metadata and local-side copy
         try {
-          await removeConflictBackups(this.plugin, this.file.path);
+          await removeConflictBackups(this.plugin, this.targetPath);
         } catch (e) {
           console.error("Failed to clean up conflict-notes files on resolve:", e);
         }
 
-        if (!await this.plugin.concurrencyLimiter.waitForSlot(this.file.path)) {
+        if (!await this.plugin.concurrencyLimiter.waitForSlot(this.targetPath)) {
           this.close();
           return;
         }

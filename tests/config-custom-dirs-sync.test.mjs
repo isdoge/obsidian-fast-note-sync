@@ -26,7 +26,9 @@ const plain = v => JSON.parse(JSON.stringify(v));
     module, exports: module.exports, console, WebSocket: { OPEN: 1 }, sleep: async () => {},
     window: { setTimeout: () => 1, clearTimeout: noop, setInterval: () => 1, clearInterval: noop },
     require: id => {
-      if (id === "obsidian") return { normalizePath: p => p, TFolder: class {}, TFile: class {}, Platform: {} };
+      if (id.includes("baseline_scope")) return { buildBaselineFields: (plugin, kind, path) => { if (kind === "folder" || !plugin) return {}; const m = kind === "setting" ? plugin.configHashManager : plugin.fileHashManager; const b = m && typeof m.getPathHash === "function" ? m.getPathHash(path) : null; return b !== null && b !== undefined ? { baseHash: b } : { baseHashMissing: true }; }, buildDeleteBaselineFields: () => ({}), baselineFieldsFromDeleteRecord: () => ({}), computeRemoteScope: () => "scope", parseScopedState: () => ({ state: { scope: "scope", revisions: {}, pendingDeletes: {} }, scopeChanged: false }), serializeScopedState: (state) => JSON.stringify(state) };
+    if (id.includes("conflict_store")) return { storeSyncConflict: async () => false, normalizeConflict: () => null, conflictKindToSyncType: () => "note", conflictReasonLabel: () => "", conflictKindLabel: () => "" };
+          if (id === "obsidian") return { normalizePath: p => p, TFolder: class {}, TFile: class {}, Platform: {} };
       if (id === "./operator_file") return { sweepStalledDownloadSessions: async () => 0 };
       if (id === "./operator_config") return {
         configAllPaths: async () => [...configFiles.keys()],
