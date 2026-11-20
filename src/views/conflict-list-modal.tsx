@@ -126,6 +126,12 @@ const ConflictListView = ({ plugin, modal }: { plugin: FastSync, modal: Conflict
         const skippedNewEdit = results.filter(r => r.reason === "new_edit").map(r => r.path);
         const failed = results.filter(r => !r.ok && r.reason !== "new_edit").length;
         new Notice($("ui.conflict.batch_result", { ok: String(succeeded), failed: String(failed) }), 8000);
+        const missingRemote = results.filter(r => r.reason === "missing_remote").length;
+        if (missingRemote > 0) {
+            // 远端正文未取得：拒绝清空本地，提示先同步刷新
+            // Remote body unavailable: never clear the local copy; ask for a refresh first
+            new Notice($("ui.conflict.remote_unavailable") || "无法取得远端内容，请先同步刷新后再试", 12000);
+        }
         if (skippedNewEdit.length > 0) {
             // 待对齐期间又被编辑的条目一律跳过，提示用户逐条核对
             // Entries edited while pending are always skipped; ask the user to check them one by one

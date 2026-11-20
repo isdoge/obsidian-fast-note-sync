@@ -579,6 +579,7 @@ export default {
   "ui.conflict.delete_conflict_copy": "删除冲突副本",
   "ui.conflict.original_missing": "原文件不存在，可能已被删除",
   "ui.conflict.diff_too_large": "文件过大，无法生成差异，请使用“并排查看”手动比对",
+  "ui.conflict.remote_unavailable": "无法取得远端内容。请先同步刷新后再试。",
   "ui.conflict.action_failed": "处理冲突失败，请重试",
   "ui.conflict.resolved_notice": "冲突已解决",
   "ui.conflict.missing_local": "本地笔记 ${path} 已不存在。请选择服务端版本恢复，或将其从冲突列表移除。",

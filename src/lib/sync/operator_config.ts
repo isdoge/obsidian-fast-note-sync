@@ -1,6 +1,6 @@
 import { normalizePath, App } from "obsidian";
 
-import { hashContent, dump, dumpError, configIsPathExcluded, getSafeCtime, isPathInConfigSyncDirs, showSyncNotice, isInWhitelist, hashFileAsync, hashArrayBuffer, checkAndNotifyCaseConflict, isLargeBinarySyncRisk, normalizeServerTimestamp } from "../utils/helpers";
+import { hashContent, hashContentAsync, dump, dumpError, configIsPathExcluded, getSafeCtime, isPathInConfigSyncDirs, showSyncNotice, isInWhitelist, hashFileAsync, hashArrayBuffer, checkAndNotifyCaseConflict, isLargeBinarySyncRisk, normalizeServerTimestamp } from "../utils/helpers";
 import { decodeConfigContent, encodeConfigContent } from "../utils/config_codec";
 import { SyncLogManager } from "./sync_log_manager";
 import { advanceLiveSyncTime } from "./sync_state";
@@ -173,6 +173,12 @@ export const configModify = async function (path: string, plugin: FastSync, even
     if (!isPathInConfigSyncDirs(path, plugin)) return
     if (eventEnter && plugin.ignoredConfigFiles.has(path)) return
     if (configIsPathExcluded(path, plugin)) return
+    // 冲突冻结的配置不响应实时写（已解决的提交除外）
+    // A frozen conflicted setting ignores live writes (resolved submits excepted)
+    if (plugin.syncState?.conflictedPaths?.has(path) && !options?.isConflictResolved) {
+        dump(`Config modify paused, unresolved conflict: ${path}`)
+        return
+    }
 
     // 如果是文件系统事件（无 content），拦截 LocalStorage 虚拟路径
     if (!content && path.startsWith(plugin.localStorageManager.syncPathPrefix)) return
@@ -266,9 +272,14 @@ export const configModify = async function (path: string, plugin: FastSync, even
         plugin.removeIgnoredConfigFile(path)
         return
     }
-    void plugin.websocket.SendMessage("SettingModify", data)
-
-    plugin.removeIgnoredConfigFile(path)
+    // 返回发送 Promise：冲突解决弹窗等调用方可以等“已写入连接”后再清理备份
+    // Return the send promise so callers such as the conflict resolver can wait for the frame to be
+    // written before cleaning up backups
+    try {
+        await plugin.websocket.SendMessage("SettingModify", data)
+    } finally {
+        plugin.removeIgnoredConfigFile(path)
+    }
 }
 
 export const configDelete = async function (path: string, plugin: FastSync, eventEnter: boolean = false) {
@@ -280,6 +291,11 @@ export const configDelete = async function (path: string, plugin: FastSync, even
     // --- 新增：删除拦截 ---
     if (plugin.lastSyncPathDeleted.has(path)) {
         dump(`Config delete intercepted: ${path}`)
+        return
+    }
+    // 冲突冻结的配置不自动上传删除 / A frozen conflicted setting never auto-uploads a deletion
+    if (plugin.syncState?.conflictedPaths?.has(path)) {
+        dump(`Config delete paused, unresolved conflict: ${path}`)
         return
     }
 
@@ -476,8 +492,22 @@ export const receiveConfigUpload = async function (data: ReceivePathMessage, plu
         plugin.recordSyncCompleted('setting', data.pageIndex)
         return
     }
+    // 虚拟配置（`_localStorage/`）同样要响应上传：服务端需要的是当前 localStorage 值，
+    // 直接按虚拟路径条件提交，不能像以前那样一律丢弃
+    // Virtual settings (`_localStorage/`) answer uploads too: submit the current localStorage value
+    // for the virtual path instead of dropping the request as before
     if (isVirtual) {
-        plugin.recordSyncCompleted('setting', data.pageIndex)
+        // 走普通上传链路（SettingModify + Ack 归账）；值已不存在时才直接完成该页条目
+        // Go through the normal upload path (SettingModify settled by its Ack); only complete the
+        // page item directly when the value is already gone
+        const key = plugin.localStorageManager.pathToKey(data.path) || ""
+        const currentVal = plugin.localStorageManager.getItemValue(key)
+        if (currentVal === null) {
+            plugin.recordSyncCompleted('setting', data.pageIndex)
+            return
+        }
+        if (data.pageIndex !== undefined) plugin.syncState.pendingConfigPushPageIndex.set(data.path, data.pageIndex)
+        await configModify(data.path, plugin, false, currentVal, true)
         return
     }
 
@@ -565,6 +595,34 @@ export const receiveConfigSyncMtime = async function (data: ReceiveMtimeMessage,
         return
     }
     if (plugin.ignoredConfigFiles.has(data.path)) {
+        plugin.recordSyncCompleted('setting', data.pageIndex)
+        return
+    }
+
+    // 虚拟配置没有磁盘文件：核对当前 localStorage 值的哈希等于消息哈希后直接确认基线
+    // Virtual settings have no disk file: confirm the baseline once the current localStorage value
+    // hashes to the message hash
+    if (data.path.startsWith(plugin.localStorageManager.syncPathPrefix)) {
+        try {
+            const key = plugin.localStorageManager.pathToKey(data.path) || ""
+            const current = plugin.localStorageManager.getItemValue(key)
+            const msgHash = typeof data.contentHash === "string" && data.contentHash !== "" ? data.contentHash : ""
+            const revision = typeof data.revision === "string" && data.revision !== "" ? data.revision : ""
+            if (current !== null && msgHash !== "" && revision !== ""
+                && await hashContentAsync(current) === msgHash && plugin.configHashManager?.setConfirmedBaseline) {
+                plugin.configHashManager.setConfirmedBaseline(
+                    data.path, msgHash, revision,
+                    normalizeServerTimestamp(data.mtime), current.length,
+                )
+            }
+            advanceLiveSyncTime(plugin, "lastConfigSyncTime", data.lastTime)
+        } catch (e) {
+            dumpError("[updateConfigFileTime] virtual config error:", e)
+            if (!checkAndNotifyCaseConflict(e, data.path, plugin, 'ConfigMtime')) {
+                SyncLogManager.getInstance().addLog('receive', 'ConfigMtime', e instanceof Error ? e.message : String(e), 'error', data.path);
+            }
+            plugin.configSyncTasks.failed++
+        }
         plugin.recordSyncCompleted('setting', data.pageIndex)
         return
     }

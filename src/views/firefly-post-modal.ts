@@ -466,6 +466,9 @@ export class FireflyPostModal extends Modal {
                     void (async () => {
                         try {
                             const buffer = await picked.arrayBuffer();
+                            // 本地文件/剪贴板来源的文件名可能带路径或控制字符，交给写入函数统一消毒
+                            // Local/clipboard file names may carry paths or control characters; the
+                            // writer sanitizes them
                             const name = await writeImageIntoNoteAssets(this.app, this.file.path, picked.name, buffer);
                             state.imageMode = "local";
                             state.imagePath = `./assets/${name}`;
@@ -667,6 +670,12 @@ export class FireflyPostModal extends Modal {
                 this.render();
                 return;
             }
+            // 触发前记下当前配置的旧状态与时间戳：轮询据此判定“本轮是否真的跑完”，
+            // 而不是把上一次成功/失败的旧状态当成本轮回执
+            // Capture the config's previous status and timestamps before triggering, so polling can
+            // tell whether this round really finished instead of reading the last round's receipt
+            const target = status.data[0];
+            const previous = { status: target?.lastStatus ?? 0, updatedAt: target?.updatedAt ?? "", lastSyncTime: target?.lastSyncTime ?? "" };
             const trigger = await this.plugin.api.triggerGitSync(this.plugin.settings.vault);
             if (!trigger.ok) {
                 notice.hide();
@@ -676,31 +685,57 @@ export class FireflyPostModal extends Modal {
                 return;
             }
             notice.setMessage($("ui.firefly.publish_triggered"));
-            await this.pollStatus(status.data[0]?.id, notice);
+            this.lastReceipt = "";
+            await this.pollStatus(target?.id, previous, notice);
         } finally {
             notice.hide();
         }
     }
 
-    private async pollStatus(configId: number | undefined, notice: { setMessage: (m: string) => void; hide: () => void }): Promise<void> {
+    /**
+     * 轮询发布状态。服务端 lastStatus：0=Idle、1=Running、2=Success、3=Failed、4=Shutdown。
+     * 判定顺序：
+     * - 1（运行中）或时间戳尚未推进 → 继续等待；
+     * - 2（成功）→ 成功回执；
+     * - 3/4（失败/停机）→ 失败原因；
+     * - 仍为触发前的旧状态且时间戳未变 → 不当作本轮回执，继续等或最终提示“等待中”。
+     *
+     * Poll the publish status. Server lastStatus: 0=Idle, 1=Running, 2=Success, 3=Failed,
+     * 4=Shutdown. Order of judgement:
+     * - 1 (running) or timestamps not advanced -> keep waiting;
+     * - 2 (success) -> success receipt;
+     * - 3/4 (failed/shutdown) -> failure reason;
+     * - still the pre-trigger status with unchanged timestamps -> not this round's receipt; keep
+     *   waiting or fall back to "still waiting".
+     */
+    private async pollStatus(
+        configId: number | undefined,
+        previous: { status: number; updatedAt: string; lastSyncTime: string },
+        notice: { setMessage: (m: string) => void; hide: () => void },
+    ): Promise<void> {
         const deadline = Date.now() + 20000;
-        let last: GitSyncPublicStatus | undefined;
         while (Date.now() < deadline) {
             await new Promise((resolve) => window.setTimeout(resolve, 3000));
             const res = await this.plugin.api.getGitSyncStatus(this.plugin.settings.vault);
             if (!res.ok) continue;
             const list = res.data ?? [];
-            last = list.find((item) => item.id === configId) ?? list[0];
+            const last: GitSyncPublicStatus | undefined = list.find((item) => item.id === configId) ?? list[0];
             if (!last) continue;
             const message = String(last.lastMessage ?? "");
-            if (/Saved settings await confirmation/i.test(message)) {
-                this.lastReceipt = $("ui.firefly.publish_settings_pending");
+            const advanced = (last.updatedAt ?? "") !== previous.updatedAt
+                || (last.lastSyncTime ?? "") !== previous.lastSyncTime;
+            if (last.lastStatus === 1 || !advanced) {
+                // 运行中，或状态/时间戳尚未推进：本轮还没跑完，继续等
+                // Running, or status/timestamps not advanced yet: this round has not finished
+                continue;
+            }
+            if (last.lastStatus === 2) {
+                this.lastReceipt = $("ui.firefly.publish_done", { msg: message || "" });
                 notice.setMessage(this.lastReceipt);
                 break;
             }
-            if (last.lastStatus !== 0 && message) {
-                const failed = last.lastStatus < 0 || /failed|error/i.test(message);
-                this.lastReceipt = $(failed ? "ui.firefly.publish_deploy_failed" : "ui.firefly.publish_done", { msg: message });
+            if (last.lastStatus === 3 || last.lastStatus === 4) {
+                this.lastReceipt = $("ui.firefly.publish_deploy_failed", { msg: message || $("ui.firefly.publish_waiting") });
                 notice.setMessage(this.lastReceipt);
                 break;
             }
@@ -967,6 +1002,8 @@ export async function triggerFireflyPublish(plugin: FastSync): Promise<void> {
             showSyncNotice($("ui.firefly.publish_no_config"), 8000);
             return;
         }
+        const target = status.data[0];
+        const previous = { updatedAt: target?.updatedAt ?? "", lastSyncTime: target?.lastSyncTime ?? "" };
         const trigger = await plugin.api.triggerGitSync(plugin.settings.vault);
         if (!trigger.ok) {
             showSyncNotice($("ui.firefly.publish_failed", { msg: trigger.message || `HTTP ${trigger.status}` }), 8000);
@@ -974,7 +1011,7 @@ export async function triggerFireflyPublish(plugin: FastSync): Promise<void> {
         }
         notice.setMessage($("ui.firefly.publish_triggered"));
 
-        const configId = status.data[0]?.id;
+        const configId = target?.id;
         const deadline = Date.now() + 20000;
         while (Date.now() < deadline) {
             await new Promise((resolve) => window.setTimeout(resolve, 3000));
@@ -984,13 +1021,18 @@ export async function triggerFireflyPublish(plugin: FastSync): Promise<void> {
             const item = list.find((entry) => entry.id === configId) ?? list[0];
             if (!item) continue;
             const message = String(item.lastMessage ?? "");
-            if (/Saved settings await confirmation/i.test(message)) {
-                showSyncNotice($("ui.firefly.publish_settings_pending"), 12000);
+            // 与弹窗内轮询同一套判定：1=运行中 / 时间戳未推进 → 继续等；2=成功；3/4=失败
+            // Same judgement as the modal's polling: 1=running / timestamps unchanged -> wait;
+            // 2=success; 3/4=failed
+            const advanced = (item.updatedAt ?? "") !== previous.updatedAt
+                || (item.lastSyncTime ?? "") !== previous.lastSyncTime;
+            if (item.lastStatus === 1 || !advanced) continue;
+            if (item.lastStatus === 2) {
+                showSyncNotice($("ui.firefly.publish_done", { msg: message || "" }), 12000);
                 return;
             }
-            if (item.lastStatus !== 0 && message) {
-                const failed = item.lastStatus < 0 || /failed|error/i.test(message);
-                showSyncNotice($(failed ? "ui.firefly.publish_deploy_failed" : "ui.firefly.publish_done", { msg: message }), 12000);
+            if (item.lastStatus === 3 || item.lastStatus === 4) {
+                showSyncNotice($("ui.firefly.publish_deploy_failed", { msg: message || $("ui.firefly.publish_waiting") }), 12000);
                 return;
             }
         }

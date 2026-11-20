@@ -276,6 +276,28 @@ async function stashUnalignedNote(
 }
 
 /**
+ * 只读探测远端同名笔记（旧协议兼容模式的首次接入防覆盖）。
+ * 使用既有只读接口，绝不走会改状态的 check/sync 请求；拿不到结论时返回 null，
+ * 调用方按“远端不可知”处理（不拦截上传，避免把正常新建笔记永久卡住）。
+ * 返回值：null = 查询失败/接口不可用；{ path, contentHash } = 远端存活笔记（已排除回收站）。
+ *
+ * Read-only probe of a same-path remote note (legacy-mode first-attach guard). Uses the existing
+ * read-only endpoint only — never a check/sync request that could mutate state. Returns null when
+ * the verdict is unavailable; the caller then treats the remote as unknown and does not block the
+ * upload (blocking would permanently strand a legitimate new note).
+ */
+async function probeRemoteNoteState(plugin: FastSync, path: string): Promise<{ path: string; contentHash: string } | null> {
+  const api = plugin.api as { getRetryQueueState?: (kind: "note" | "file", path: string) => Promise<{ path: string; contentHash: string } | null> } | null | undefined
+  if (!api || typeof api.getRetryQueueState !== "function") return null
+  try {
+    return await api.getRetryQueueState("note", path)
+  } catch (error) {
+    dump(`[NoteUpload] Remote probe unavailable for ${path}; uploading with baseHashMissing`, error)
+    return null
+  }
+}
+
+/**
  * 笔记修改事件处理
  */
 export const noteModify = async function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false, options?: { isConflictResolved?: boolean; baseRevision?: string }) {
@@ -287,7 +309,10 @@ export const noteModify = async function (file: TAbstractFile, plugin: FastSync,
   // 冲突未解决的路径暂停上传，否则本端旧稿会覆盖其他端的新内容（#276）；解决冲突时由冲突合并窗口自行推送
   // Uploads of an unresolved conflict are paused, or this device's stale copy overwrites newer content
   // from other devices (#276); the conflict resolve modal pushes the merged result itself
-  if (plugin.syncState.conflictedPaths.has(file.path)) {
+  // 已解决（isConflictResolved）的提交是用户明确拍板的结果，不能因路径仍在冻结集合里被跳过
+  // A resolved submit is the user's explicit decision and must not be skipped just because the
+  // path is still in the frozen set
+  if (plugin.syncState?.conflictedPaths?.has(file.path) && !options?.isConflictResolved) {
     dump(`Note modify paused, unresolved conflict: ${file.path}`)
     return
   }
@@ -366,6 +391,12 @@ export const noteDelete = async function (file: TAbstractFile, plugin: FastSync,
   // --- 新增：删除拦截 ---
   if (plugin.lastSyncPathDeleted.has(file.path)) {
     dump(`Note delete intercepted: ${file.path}`)
+    return
+  }
+  // 冲突冻结的路径不自动上传删除，交给冲突解决窗口决定
+  // A frozen conflicted path never auto-uploads a deletion; the resolver decides
+  if (plugin.syncState?.conflictedPaths?.has(file.path)) {
+    dump(`Note delete paused, unresolved conflict: ${file.path}`)
     return
   }
 
@@ -738,7 +769,7 @@ export const receiveNoteUpload = async function (data: ReceivePathMessage, plugi
   }
   // 冲突未解决：不响应服务端的上传请求，避免旧稿覆盖服务端（#276）
   // Unresolved conflict: do not answer the server's upload request, so the stale copy never overwrites the server (#276)
-  if (plugin.syncState.conflictedPaths.has(file.path)) {
+  if (plugin.syncState?.conflictedPaths?.has(file.path)) {
     SyncLogManager.getInstance().addLog('send', 'NoteModifyConflict', `冲突未解决，暂停上传: ${file.path}`, 'cancelled', data.path)
     plugin.recordSyncCompleted('note', data.pageIndex)
     return
@@ -770,23 +801,54 @@ export const receiveNoteUpload = async function (data: ReceivePathMessage, plugi
     plugin.recordSyncCompleted('note', data.pageIndex)
     return
   }
-  // 阶段 B：空占位笔记的探测结论会在前面处理；其余“本地有内容、无可信基线”的路径不自动上传，
-  // 否则会把远端同名内容覆盖掉（需用户在待对齐面板决定）
-  // Stage B: empty-placeholder probes are handled above; any other local content without a
-  // trusted baseline is not auto-uploaded, or it would overwrite the same-named remote note
+  // 阶段 B：空占位笔记的探测结论会在前面处理。
+  // 服务端已明确发 NoteSyncNeedPush（code 200）要求上传，说明该路径在服务端侧不需要冲突拦截：
+  // - 基线模式下服务端在 NoteSync 阶段已把“远端存在不同内容且无基线”的路径改走 SyncConflict，
+  //   走到这里的只可能是允许上传的新建/恢复；因此这里绝不拦截，直接以“无基线”字段上传。
+  //   否则离线新建的笔记永远传不上去（stash 后本地被冻结，NeedPush 每轮重来）。
+  // - 旧协议兼容模式下保留“首次接入防覆盖”的最小保护：仅当本机从未成功同步过
+  //   （lastNoteSyncTime === 0）、无任何可信基线且本地有内容时，先只读探测远端是否真有同名
+  //   存活笔记；只有远端存在且内容哈希不同才转待对齐，远端不存在或常规增量一律正常上传。
+  //
+  // Stage B: empty-placeholder probes are handled above.
+  // A server NoteSyncNeedPush (code 200) means the server itself decided this path may upload:
+  // - Baseline mode: NoteSync already routed every "remote differs, no baseline" path to
+  //   SyncConflict, so reaching here means a genuine create/restore — never intercept, upload
+  //   with explicit "no baseline" fields. Otherwise notes created offline could never be uploaded
+  //   (stash freezes the path locally and every round repeats the NeedPush).
+  // - Legacy compatibility mode keeps the minimal first-attach guard: only when this device never
+  //   synced successfully (lastNoteSyncTime === 0), no trusted baseline exists and local content is
+  //   non-empty, do a read-only probe for a live same-path remote note; only a real remote note
+  //   with a different hash is moved to pending alignment. Absent remotely, or a normal
+  //   incremental round, uploads as usual.
+  const baselineMode = plugin.isSyncBaselineModeEnabled?.() === true
   const verifiedBaseForUpload = typeof plugin.fileHashManager.getVerifiedPathHash === "function"
     ? plugin.fileHashManager.getVerifiedPathHash(file.path, contentHash)
     : baseHash
-  if (verifiedBaseForUpload === null && content.length > 0) {
-    await stashUnalignedNote(plugin, file, content)
-    plugin.removeIgnoredFile(file.path)
-    plugin.recordSyncCompleted('note', data.pageIndex)
-    return
+  if (!baselineMode && verifiedBaseForUpload === null && content.length > 0
+    && Number(plugin.localStorageManager.getMetadata("lastNoteSyncTime")) === 0) {
+    const remote = await probeRemoteNoteState(plugin, file.path)
+    if (remote && remote.contentHash !== "" && remote.contentHash !== contentHash) {
+      await stashUnalignedNote(plugin, file, content)
+      plugin.removeIgnoredFile(file.path)
+      plugin.recordSyncCompleted('note', data.pageIndex)
+      return
+    }
   }
 
   if (content.length === 0) {
     dump(`Empty note upload: ${data.path}`);
   }
+
+  // 无基线时显式携带 baseHashMissing，服务端据此核验，不把本地内容冒充成服务端基线
+  // With no baseline, explicitly carry baseHashMissing so the server verifies instead of
+  // treating the local bytes as a server baseline.
+  const verifiedBase = typeof plugin.fileHashManager.getVerifiedPathHash === "function"
+    ? plugin.fileHashManager.getVerifiedPathHash(file.path, contentHash)
+    : baseHash
+  const noBaselineFields = verifiedBase === null
+    ? { baseHash: "", baseHashMissing: true, baseRevision: "" }
+    : {}
 
   const sendData = {
     vault: plugin.settings.vault,
@@ -797,24 +859,12 @@ export const receiveNoteUpload = async function (data: ReceivePathMessage, plugi
     content: content,
     contentHash: contentHash,
     ...buildBaselineFields(plugin, "note", file.path, contentHash),
+    ...noBaselineFields,
   }
   // 将 hash 写入 pending map，等待 NoteModifyAck 确认后再写 hashManager
   // 若此路径已有旧 pending（来自中断的 noteModify），覆盖为最新 hash
   // Store hash in pending map; hashManager is written only after NoteModifyAck arrives.
   // Overwrites any stale pending entry left by a previously interrupted noteModify.
-  // 无可信基线的同名差异一律不自动上传，否则会反过来覆盖远端内容
-  // Never auto-upload a same-path difference without a trusted baseline: it would overwrite
-  // the remote copy instead. Queue it for alignment.
-  const verifiedBase = typeof plugin.fileHashManager.getVerifiedPathHash === "function"
-    ? plugin.fileHashManager.getVerifiedPathHash(file.path, contentHash)
-    : baseHash
-  if (verifiedBase === null) {
-    const unaligned = await stashUnalignedNote(plugin, file, content)
-    if (unaligned) {
-      plugin.recordSyncCompleted('note', data.pageIndex)
-      return
-    }
-  }
   plugin.pendingNoteModifies.set(file.path, contentHash)
   plugin.localStorageManager.savePending('pendingNoteModifies', plugin.pendingNoteModifies)
   if (!await plugin.concurrencyLimiter.waitForSlot(file.path)) {

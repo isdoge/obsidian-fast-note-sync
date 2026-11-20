@@ -11,7 +11,7 @@ import { WebSocketClient } from "./websocket_client";
 import { CLIENT_TYPE } from "../utils/types";
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
-import { conflictKindToSyncType, normalizeConflict, storeSyncConflict } from "./conflict_store";
+import { conflictKindToSyncType, freezeConflictPath, normalizeConflict, storeSyncConflict } from "./conflict_store";
 
 
 // 冲突相关错误码
@@ -1052,6 +1052,13 @@ export class WebSocketManager {
          "serverContent length:", serverContent ? serverContent.length : "undefined/null",
          "serverHash:", serverHash, 
          "strategy:", this.plugin.settings.offlineSyncStrategy);
+
+    // 旧协议载荷（未走统一持久化）同样要冻结：清掉在途上传/回执定时器/待确认删除，
+    // 否则 60s 后 recoverUpload 会把冲突附件当作回执丢失自动重传，反复撞 530
+    // Legacy payloads (not persisted through the unified store) freeze the path too: clear the
+    // in-flight upload, ack timers and pending delete acks so recoverUpload cannot retry a
+    // conflicting attachment after 60s and keep hitting 530
+    if (path !== "") freezeConflictPath(this.plugin, path);
 
     if (this.plugin.settings.offlineSyncStrategy === "manualMerge" &&
         path !== "" && serverContent !== "" && serverHash !== "") {

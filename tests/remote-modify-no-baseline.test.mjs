@@ -71,7 +71,7 @@ const conflictAlign = loadModule("src/lib/sync/conflict_align.ts", (id) => {
   throw new Error(`Unexpected require in conflict_align: ${id}`);
 });
 
-function makePlugin({ localContent = "local body", baseline = null, verified = baseline, pending = null, files = new Map() } = {}) {
+function makePlugin({ localContent = "local body", baseline = null, verified = baseline, pending = null, files = new Map(), baselineMode = false, lastNoteSyncTime = 0, remoteState = null } = {}) {
   const written = [];
   const modified = [];
   const created = [];
@@ -119,9 +119,12 @@ function makePlugin({ localContent = "local body", baseline = null, verified = b
     lastSyncMtime: new Map(), lastSyncPathDeleted: new Set(),
     pendingNoteModifies: new Map(pending ?? []), pendingNoteDeleteAcks: new Set(),
     localStorageManager: {
-      getMetadata: () => 0, setMetadata: noop, savePending: noop,
+      getMetadata: (k) => (k === "lastNoteSyncTime" ? lastNoteSyncTime : 0), setMetadata: noop, savePending: noop,
       setConflictedPaths: (s) => { plugin.savedConflicts = Array.from(s); },
+      syncPathPrefix: "_localStorage/", pathToKey: (p) => p, getItemValue: () => null,
     },
+    isSyncBaselineModeEnabled: () => baselineMode,
+    api: { getRetryQueueState: async () => remoteState },
     concurrencyLimiter: { waitForSlot: async () => true, releaseSlot: noop },
     statusBarManager: { updateConflictBadge: noop },
     isIgnoredFile: () => false, addIgnoredFile: noop, removeIgnoredFile: noop,
@@ -276,18 +279,66 @@ const remoteMessage = (content, hash = `h:${content}`) => ({
   }
 }
 
-// 7. A server upload request (NeedPush) for local content without a trusted baseline is not
-// answered with an upload: it is queued for alignment instead, so the remote note survives.
+// 7. Legacy mode, first attach (never synced) and a live same-path remote note with a DIFFERENT
+// hash: the NeedPush is not answered with an upload, the path is queued for alignment so the
+// remote note survives.
 {
-  const { plugin, sent, written } = makePlugin({ localContent: "local body", baseline: null, verified: null });
+  const { plugin, sent, written } = makePlugin({
+    localContent: "local body", baseline: null, verified: null,
+    remoteState: { path: "notes/target.md", contentHash: "h:remote body" },
+  });
   await ops.receiveNoteUpload({ path: "notes/target.md", pageIndex: 0 }, plugin);
-  assert.deepEqual(sent, [], "no upload without a trusted baseline");
+  assert.deepEqual(sent, [], "legacy first attach: no upload when the remote differs");
   assert.equal(plugin.syncState.conflictedPaths.has("notes/target.md"), true, "queued for alignment");
   assert.equal(plugin.syncState.newUnalignedPathsThisRound.has("notes/target.md"), true);
   assert.equal(written.some(([p]) => p.endsWith(".remote.md")), false, "NeedPush carries no body, so no remote copy is written");
   const meta = JSON.parse(written.find(([p]) => p.endsWith(".meta.json"))[1]);
   assert.equal(meta.baseMissing, true);
   assert.equal(meta.reason, "unaligned_no_baseline");
+}
+
+// 8. P0-02: an offline-created note (never synced, no baseline) must upload when the server asks
+// for it. Baseline mode: NoteSync already routed real remote differences to SyncConflict, so a
+// 200 NoteSyncNeedPush is a genuine create — upload with explicit no-baseline fields.
+{
+  const { plugin, sent } = makePlugin({ localContent: "offline body", baseline: null, verified: null, baselineMode: true });
+  await ops.receiveNoteUpload({ path: "notes/target.md", pageIndex: 2 }, plugin);
+  assert.deepEqual(sent, [["NoteModify", "notes/target.md"]], "baseline mode uploads the offline-created note");
+  const upload = sent.length && sent[0][0] === "NoteModify";
+  assert.ok(upload, "the upload is a NoteModify");
+}
+
+// 9. Legacy mode, first attach but the server has NO such note: this is a genuine new note and
+// must upload rather than be stranded in pending alignment.
+{
+  const { plugin, sent } = makePlugin({
+    localContent: "new note", baseline: null, verified: null, remoteState: null,
+  });
+  await ops.receiveNoteUpload({ path: "notes/target.md", pageIndex: 0 }, plugin);
+  assert.deepEqual(sent, [["NoteModify", "notes/target.md"]], "absent remote: legacy mode uploads the new note");
+  assert.equal(plugin.syncState.conflictedPaths.has("notes/target.md"), false, "absent remote is not a conflict");
+}
+
+// 10. Legacy mode, normal incremental round (already synced once): an upload request for a note
+// without a stored baseline is a normal create/restore and must upload.
+{
+  const { plugin, sent } = makePlugin({
+    localContent: "restored note", baseline: null, verified: null, lastNoteSyncTime: 1700000000000,
+    remoteState: { path: "notes/target.md", contentHash: "h:something else" },
+  });
+  await ops.receiveNoteUpload({ path: "notes/target.md", pageIndex: 0 }, plugin);
+  assert.deepEqual(sent, [["NoteModify", "notes/target.md"]], "normal incremental rounds never block the upload");
+}
+
+// 11. Legacy mode, first attach, remote exists but content is identical: no conflict, upload is
+// harmless and allowed.
+{
+  const { plugin, sent } = makePlugin({
+    localContent: "same body", baseline: null, verified: null,
+    remoteState: { path: "notes/target.md", contentHash: "h:same body" },
+  });
+  await ops.receiveNoteUpload({ path: "notes/target.md", pageIndex: 0 }, plugin);
+  assert.deepEqual(sent, [["NoteModify", "notes/target.md"]], "identical remote content does not block the upload");
 }
 
 console.log("remote-modify-no-baseline.test.mjs: all scenarios passed");

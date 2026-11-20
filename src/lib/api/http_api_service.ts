@@ -543,6 +543,35 @@ export class HttpApiService {
     }
 
     /**
+     * 只读拉取一条远端笔记的正文与内容哈希（冲突解决时远端正文未内联的补取通道）。
+     * 服务端不存在该笔记时返回 null；任何失败抛出，调用方必须据此拒绝清空本地内容。
+     *
+     * Read-only fetch of one remote note's body and content hash (used when a conflict's remote
+     * body was not inlined). Returns null when the server has no such note; failures throw so the
+     * caller refuses to clear the local copy.
+     */
+    async getNoteContent(path: string): Promise<{ content: string; contentHash: string } | null> {
+        const controller = new AbortController();
+        const timer = window.setTimeout(() => controller.abort(), 10000);
+        try {
+            const params = new URLSearchParams({ vault: this.plugin.settings.vault, path,
+                pathHash: hashContent(path), isRecycle: "false" });
+            const { status, json } = await this.request(`/api/note?${params}`, { method: "GET", signal: controller.signal });
+            const res = json as ApiResponse<{ path?: string; content?: string; contentHash?: string; isRecycle?: boolean }> & { details?: unknown };
+            if (status === 200 && (res?.code === 430 || res?.code === 455
+                || (res?.code === 0 && typeof res.details === "string" && /record not found/i.test(res.details)))) return null;
+            if (status !== 200 || !this.isSuccess(json) || !res.data || res.data.path !== path
+                || res.data.isRecycle === true || typeof res.data.content !== "string"
+                || typeof res.data.contentHash !== "string") {
+                throw new Error("Remote note body unavailable");
+            }
+            return { content: res.data.content, contentHash: res.data.contentHash };
+        } finally {
+            window.clearTimeout(timer);
+        }
+    }
+
+    /**
      * 获取笔记列表（支持回收站模式）
      */
     async getNoteList(page = 1, pageSize = 20, isRecycle = false, keyword = "", signal?: AbortSignal): Promise<NoteListResponse> {

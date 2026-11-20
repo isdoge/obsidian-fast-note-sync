@@ -43,6 +43,7 @@ export interface SyncTaskStats {
   needModify: number;   // 需要修改 / Need to modify
   needSyncMtime: number; // 需要同步时间戳 / Need to sync mtime
   needDelete: number;   // 需要删除 / Need to delete
+  needConflict: number; // 本轮已持久化的基线冲突数（随分页下发，必须计入下载期望，否则纯冲突轮次不会发首拉 ACK） / Persisted baseline conflicts this round (delivered as pages; must count toward the download expectation or a conflict-only round never sends the initial ACK)
   completed: number;    // 已处理数量（含成功与失败，驱动完成判定/翻页 ACK，语义不变） / Processed count (success + failure; drives completion detection / page ACK, semantics unchanged)
   failed: number;       // 其中处理失败的数量，仅用于统计展示，不参与完成判定 / Subset that failed; stats-only, does not affect completion detection
 }
@@ -318,19 +319,19 @@ export class SyncState {
     });
   }
 
-  private _noteSyncTasks = this.createStatsProxy("note", { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, completed: 0, failed: 0 });
+  private _noteSyncTasks = this.createStatsProxy("note", { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, needConflict: 0, completed: 0, failed: 0 });
   get noteSyncTasks() { return this._noteSyncTasks; }
   set noteSyncTasks(v: SyncTaskStats) { this._noteSyncTasks = this.createStatsProxy("note", v); }
 
-  private _fileSyncTasks = this.createStatsProxy("file", { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, completed: 0, failed: 0 });
+  private _fileSyncTasks = this.createStatsProxy("file", { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, needConflict: 0, completed: 0, failed: 0 });
   get fileSyncTasks() { return this._fileSyncTasks; }
   set fileSyncTasks(v: SyncTaskStats) { this._fileSyncTasks = this.createStatsProxy("file", v); }
 
-  private _configSyncTasks = this.createStatsProxy("setting", { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, completed: 0, failed: 0 });
+  private _configSyncTasks = this.createStatsProxy("setting", { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, needConflict: 0, completed: 0, failed: 0 });
   get configSyncTasks() { return this._configSyncTasks; }
   set configSyncTasks(v: SyncTaskStats) { this._configSyncTasks = this.createStatsProxy("setting", v); }
 
-  private _folderSyncTasks = this.createStatsProxy("folder", { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, completed: 0, failed: 0 });
+  private _folderSyncTasks = this.createStatsProxy("folder", { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, needConflict: 0, completed: 0, failed: 0 });
   get folderSyncTasks() { return this._folderSyncTasks; }
   set folderSyncTasks(v: SyncTaskStats) { this._folderSyncTasks = this.createStatsProxy("folder", v); }
 
@@ -434,10 +435,10 @@ export class SyncState {
       window.clearInterval(this.progressCheckIntervalId);
       this.progressCheckIntervalId = null;
     }
-    this.noteSyncTasks = { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, completed: 0, failed: 0 };
-    this.fileSyncTasks = { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, completed: 0, failed: 0 };
-    this.configSyncTasks = { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, completed: 0, failed: 0 };
-    this.folderSyncTasks = { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, completed: 0, failed: 0 };
+    this.noteSyncTasks = { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, needConflict: 0, completed: 0, failed: 0 };
+    this.fileSyncTasks = { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, needConflict: 0, completed: 0, failed: 0 };
+    this.configSyncTasks = { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, needConflict: 0, completed: 0, failed: 0 };
+    this.folderSyncTasks = { needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, needConflict: 0, completed: 0, failed: 0 };
     this.lastStatusBarPercentage = 0;
     this.noteSyncEnd = false;
     this.fileSyncEnd = false;
@@ -460,7 +461,7 @@ export class SyncState {
    * 计算总任务数 / Calculate total task count
    */
   getTotalTasks(): number {
-    const sum = (t: SyncTaskStats) => t.needUpload + t.needModify + t.needSyncMtime + t.needDelete;
+    const sum = (t: SyncTaskStats) => t.needUpload + t.needModify + t.needSyncMtime + t.needDelete + (t.needConflict || 0);
     return sum(this.noteSyncTasks) + sum(this.fileSyncTasks) + sum(this.configSyncTasks) + sum(this.folderSyncTasks);
   }
 

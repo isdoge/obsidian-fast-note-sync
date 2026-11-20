@@ -812,6 +812,32 @@ export class MenuManager {
     }
   }
 
+  /**
+   * 判定一个配置路径的本地内容是否为二进制（含 NUL 或严格 UTF-8 解码失败）。
+   * 虚拟配置（`_localStorage/`）始终是字符串，不算二进制；磁盘项用 readBinary 判定，
+   * 与配置通道的编码规则一致。读取失败按文本处理，交给差异编辑器。
+   *
+   * Whether a setting path's local content is binary (contains NUL or fails strict UTF-8). Virtual
+   * settings (`_localStorage/`) are always strings; disk items are judged from readBinary, matching
+   * the config-channel encoding rule. A read failure is treated as text for the diff editor.
+   */
+  private async isBinarySettingFile(path: string): Promise<boolean> {
+    if (path.startsWith("_localStorage/")) return false;
+    try {
+      const adapter = this.plugin.app.vault.adapter;
+      const normalized = normalizePath(path);
+      if (!(await adapter.exists(normalized))) return false;
+      const bytes = new Uint8Array(await adapter.readBinary(normalized));
+      for (let i = 0; i < bytes.length; i++) {
+        if (bytes[i] === 0) return true;
+      }
+      new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
   removeConflictedPath(path: string): void {
     const normalizedPath = normalizePath(path);
     this.plugin.syncState.conflictedPaths.delete(normalizedPath);
@@ -844,10 +870,19 @@ export class MenuManager {
         || ((this.plugin.app.vault.configDir && normalizedPath.startsWith(configPrefix)) || normalizedPath.startsWith("_localStorage/")
           ? "setting"
           : (normalizedPath.endsWith(".md") ? "note" : "file"));
+      // 二进制配置（fns-bin-v1 信封 / 磁盘非 UTF-8 或含 NUL）绝不能进文本三栏编辑器：
+      // 元数据标记为二进制，或本地文件读出来不是合法 UTF-8，一律改走三选一选择框。
+      // Binary settings (fns-bin-v1 envelope / non-UTF-8 or NUL-bearing disk file) must never enter
+      // the text diff editor: when the metadata marks it binary, or the local file is not valid
+      // UTF-8, route to the three-way choice modal instead.
+      let binarySetting = false;
+      if (conflictKind === "setting") {
+        binarySetting = unified?.isBinary === true || await this.isBinarySettingFile(normalizedPath);
+      }
       const supportsDiff = typeof conflictResolveMod.conflictSupportsDiffEditor === "function"
         ? conflictResolveMod.conflictSupportsDiffEditor(conflictKind)
         : (conflictKind === "note" || conflictKind === "setting");
-      if (!supportsDiff || (!file && conflictKind !== "setting" && unified)) {
+      if (binarySetting || !supportsDiff || (!file && conflictKind !== "setting" && unified)) {
         const { ConflictChoiceModal } = await import("../../views/conflict-choice-modal");
         new ConflictChoiceModal(this.plugin.app, this.plugin, normalizedPath).open();
         return;

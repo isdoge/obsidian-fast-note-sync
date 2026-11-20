@@ -95,6 +95,8 @@ const store = loadModule("src/lib/sync/conflict_store.ts", (id) => {
   if (id === "../utils/helpers") return helpers;
   if (id === "../utils/types") return {};
   if (id === "./sync_log_manager") return { SyncLogManager: { getInstance: () => ({ addLog: noop }) } };
+  if (id === "../utils/config_codec") return { decodeConfigContent: (s) => ({ kind: "text", text: s }) };
+  if (id === "./operator_file") return { clearUploadTrackingForConflict: noop };
   if (id === "./operator_note") return operatorNoteStub;
   if (id === "../../i18n/lang") return { $: (k) => k };
   if (id === "../../main") return {};

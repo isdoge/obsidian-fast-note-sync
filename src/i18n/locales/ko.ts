@@ -579,6 +579,7 @@ export default {
   "ui.conflict.delete_conflict_copy": "동결 충돌 사본 삭제",
   "ui.conflict.original_missing": "원본 파일이 존재하지 않거나 삭제되었을 수 있습니다",
   "ui.conflict.diff_too_large": "파일이 너무 커서 차이를 생성할 수 없습니다. '나란히 보기'를 사용하여 수동으로 비교하세요",
+  "ui.conflict.remote_unavailable": "원격 내용을 가져올 수 없습니다. 먼저 동기화로 새로 고친 뒤 다시 시도해 주세요.",
   "ui.conflict.action_failed": "충돌 해결 실패, 다시 시도하세요",
   "ui.conflict.resolved_notice": "충돌이 해결되었습니다",
   "ui.conflict.missing_local": "로컬 노트 ${path}가 더 이상 존재하지 않습니다. 서버 버전을 복원하거나 충돌 목록에서 제거하세요.",

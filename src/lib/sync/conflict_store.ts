@@ -1,9 +1,11 @@
 import { normalizePath } from "obsidian";
 
 import { $ } from "../../i18n/lang";
-import { dump, dumpError } from "../utils/helpers";
+import { dump, dumpError, hashContentAsync, hashFileAsync } from "../utils/helpers";
+import { decodeConfigContent } from "../utils/config_codec";
 import type { SyncConflictPayload } from "../utils/types";
 import { SyncLogManager } from "./sync_log_manager";
+import { clearUploadTrackingForConflict } from "./operator_file";
 import { conflictBackupPaths, readConflictMeta, writeConflictMeta, ConflictBackupMeta } from "./operator_note";
 import type FastSync from "../../main";
 
@@ -43,6 +45,8 @@ export interface UnifiedConflictMeta extends ConflictBackupMeta {
   baseHash?: string;
   /** 是否有真实远端内容写入 remote 备份 / Whether a real remote body was stashed */
   hasServerContent?: boolean;
+  /** 远端配置正文是否为二进制（fns-bin-v1 信封，写进 .remote 的是原始字节） / Whether the remote setting body was binary (fns-bin-v1 envelope; .remote holds raw bytes) */
+  isBinary?: boolean;
 }
 
 export type ConflictSyncKind = "note" | "file" | "setting" | "folder";
@@ -92,6 +96,57 @@ export function conflictKindToSyncType(kind: string): ConflictSyncKind {
   return "note";
 }
 
+/**
+ * 计算一条冲突在检测时的本地内容哈希；本地不存在或读取失败时返回 null。
+ * 配置（含 `_localStorage/` 虚拟项）按真实存储取值，笔记/附件按原始字节，保证与解决侧的复核口径一致。
+ * Compute the local content hash at detection time; null when the local copy is missing or
+ * unreadable. Settings (including `_localStorage/` virtual items) read their real store, notes and
+ * attachments hash raw bytes, so the resolver's re-check uses the same measure.
+ */
+async function detectLocalHash(plugin: FastSync, path: string, kind: ConflictKind): Promise<string | null> {
+  try {
+    if (kind === CONFLICT_KIND_SETTING) {
+      if (path.startsWith(plugin.localStorageManager.syncPathPrefix)) {
+        const key = plugin.localStorageManager.pathToKey(path) || "";
+        const value = plugin.localStorageManager.getItemValue(key);
+        return value === null ? null : await hashContentAsync(value);
+      }
+      const exists = await plugin.app.vault.adapter.exists(normalizePath(path));
+      if (!exists) return null;
+      return await hashFileAsync(plugin.app, normalizePath(path));
+    }
+    if (kind === CONFLICT_KIND_NOTE) {
+      const file = plugin.app.vault.getFileByPath(normalizePath(path));
+      if (!file) return null;
+      return await hashContentAsync(await plugin.app.vault.read(file));
+    }
+    if (kind === CONFLICT_KIND_FILE) {
+      const exists = await plugin.app.vault.adapter.exists(normalizePath(path));
+      if (!exists) return null;
+      return await hashFileAsync(plugin.app, normalizePath(path));
+    }
+  } catch (error) {
+    dump(`[Conflict] Unable to hash local copy at detection: ${path}`, error);
+  }
+  return null;
+}
+
+/**
+ * 冻结一条冲突路径的全部在途上传状态：
+ * - 笔记/配置的待确认 hash、待确认删除集合；
+ * - 附件的分片上传与其 60s 回执超时定时器（否则 recoverUpload 会自动重传冲突附件）；
+ * - 并发名额与页归属（避免占着名额且页码永远等不到回执）。
+ * 只清理“在途”，不动 hashManager 的已确认基线。
+ *
+ * Freeze every in-flight upload state for a conflicted path: pending note/config hashes, pending
+ * delete acks, the attachment chunk upload and its 60s ack timeout (otherwise recoverUpload
+ * retries the conflicting attachment), the concurrency slot and the page attribution. Only
+ * in-flight state is cleared; confirmed baselines in the hash managers stay untouched.
+ */
+export function freezeConflictPath(plugin: FastSync, path: string): void {
+  pauseUploadsForPath(plugin, path);
+}
+
 function pauseUploadsForPath(plugin: FastSync, path: string): void {
   if (plugin.pendingNoteModifies?.delete(path)) {
     plugin.localStorageManager.savePending("pendingNoteModifies", plugin.pendingNoteModifies);
@@ -102,6 +157,18 @@ function pauseUploadsForPath(plugin: FastSync, path: string): void {
   if (plugin.pendingConfigModifies?.delete(path)) {
     plugin.localStorageManager.savePending("pendingConfigModifies", plugin.pendingConfigModifies);
   }
+  plugin.pendingNoteDeleteAcks?.delete(path);
+  plugin.pendingFileDeleteAcks?.delete(path);
+  plugin.pendingConfigDeleteAcks?.delete(path);
+  plugin.syncState.pendingNotePushPageIndex?.delete(path);
+  plugin.syncState.pendingFilePushPageIndex?.delete(path);
+  plugin.syncState.pendingConfigPushPageIndex?.delete(path);
+  try {
+    clearUploadTrackingForConflict(path);
+  } catch (error) {
+    dump(`[Conflict] Unable to clear attachment upload tracking for ${path}`, error);
+  }
+  plugin.concurrencyLimiter?.releaseSlot?.(path);
 }
 
 /**
@@ -126,12 +193,43 @@ export async function storeSyncConflict(plugin: FastSync, raw: unknown): Promise
     const { dir, baseBackupPath, remoteBackupPath } = conflictBackupPaths(plugin, path);
     if (!(await adapter.exists(dir))) await adapter.mkdir(dir);
 
-    // 只有“有真实远端内容”时才写 remote 备份；墓碑不写空正文冒充版本
-    // Stash a remote body only when one really exists; a tombstone is never faked as empty content
-    const hasServerContent = !conflict.serverDeleted && (kind === CONFLICT_KIND_NOTE || kind === CONFLICT_KIND_SETTING);
-    if (hasServerContent) {
-      await adapter.write(remoteBackupPath, conflict.serverContent);
-    } else if (await adapter.exists(remoteBackupPath)) {
+    // 只有“有真实远端内容”时才写 remote 备份；墓碑不写空正文冒充版本。
+    // 远端非空但正文未内联（serverContent === ""，serverHash 却指向真实内容）时同样不写空
+    // .remote，并记 hasServerContent=false，解决侧改为按需从服务端拉取后再落盘。
+    // 配置通道的二进制以 fns-bin-v1 信封传输，这里解包后写原始字节并标记 isBinary。
+    //
+    // Stash a remote body only when one really exists; a tombstone is never faked as empty
+    // content. A non-empty remote whose body was not inlined (serverContent === "" while
+    // serverHash names real content) also gets no empty .remote, with hasServerContent=false, so
+    // the resolver fetches it from the server instead. Binary settings travel in fns-bin-v1
+    // envelopes: unwrap, write the raw bytes and mark isBinary.
+    const serverHashText = conflict.serverHash || "";
+    const hashNamesContent = serverHashText !== "" && serverHashText !== "0";
+    const bodyInlined = conflict.serverContent !== "";
+    let hasServerContent = false;
+    let isBinary = false;
+    if (!conflict.serverDeleted && (kind === CONFLICT_KIND_NOTE || kind === CONFLICT_KIND_SETTING)) {
+      if (bodyInlined) {
+        if (kind === CONFLICT_KIND_SETTING) {
+          const decoded = decodeConfigContent(conflict.serverContent);
+          if (decoded.kind === "binary") {
+            await adapter.writeBinary(remoteBackupPath, decoded.bytes);
+            isBinary = true;
+          } else {
+            await adapter.write(remoteBackupPath, decoded.text);
+          }
+        } else {
+          await adapter.write(remoteBackupPath, conflict.serverContent);
+        }
+        hasServerContent = true;
+      } else if (!hashNamesContent) {
+        // 空文本是合法的远端版本（哈希 "0"）：写一个空文件，绝不当成“没有内容”
+        // An empty body is a legal remote version (hash "0"): write an empty file, never "absent"
+        await adapter.write(remoteBackupPath, "");
+        hasServerContent = true;
+      }
+    }
+    if (!hasServerContent && await adapter.exists(remoteBackupPath)) {
       await adapter.remove(remoteBackupPath);
     }
 
@@ -144,7 +242,12 @@ export async function storeSyncConflict(plugin: FastSync, raw: unknown): Promise
       await adapter.remove(baseBackupPath);
     }
 
+    // 检测时的本地哈希：配置要按磁盘原始字节算（虚拟配置按字符串），笔记/附件按当前内容算。
+    // 解决动作据此复核“检测后是否又改过”，避免把旧决策套到新内容上。
+    // Local hash at detection: settings hash raw on-disk bytes (virtual settings hash the string),
+    // notes/attachments hash the current content. Resolvers re-check it before applying a decision.
     const previous = await readConflictMeta(plugin, path);
+    const localHashAtDetection = await detectLocalHash(plugin, path, kind);
     const meta: UnifiedConflictMeta = {
       reason: conflict.reason || (conflict.baseMissing ? CONFLICT_REASON_NO_BASELINE : CONFLICT_REASON_BOTH_MODIFIED),
       kind,
@@ -155,7 +258,10 @@ export async function storeSyncConflict(plugin: FastSync, raw: unknown): Promise
       serverDeleted: conflict.serverDeleted,
       baseHash: conflict.baseHash,
       hasServerContent,
-      ...(previous?.localHashAtDetection ? { localHashAtDetection: previous.localHashAtDetection } : {}),
+      ...(isBinary ? { isBinary: true } : {}),
+      ...(localHashAtDetection !== null
+        ? { localHashAtDetection }
+        : (previous?.localHashAtDetection ? { localHashAtDetection: previous.localHashAtDetection } : {})),
     };
     await writeConflictMeta(plugin, path, meta);
   } catch (error) {

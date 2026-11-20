@@ -42,6 +42,10 @@ export class ConflictChoiceModal extends Modal {
         new Notice($("ui.conflict.resolved_notice") || "冲突已解决");
       } else if (result.reason === "new_edit") {
         new Notice($("ui.conflict.batch_skipped_new_edit", { count: "1", paths: this.path }) || "条目在待处理期间已被编辑，请重新打开核对");
+      } else if (result.reason === "missing_remote") {
+        // 远端正文拿不到时绝不写入空串，提示先同步刷新
+        // Never write an empty body when the remote is unavailable; ask for a refresh first
+        new Notice($("ui.conflict.remote_unavailable") || "无法取得远端内容，请先同步刷新后再试");
       } else {
         new Notice($("ui.conflict.action_failed") || "处理冲突失败，请重试");
       }

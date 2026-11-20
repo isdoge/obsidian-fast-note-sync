@@ -16,6 +16,12 @@ export const folderModify = async function (folder: TFolder, plugin: FastSync, e
     if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
     if (eventEnter && plugin.isIgnoredFile(folder.path)) return
     if (isFolderSyncPathExcluded(folder.path, plugin)) return
+    // 冲突冻结的目录不响应实时写（已解决的提交除外）
+    // A frozen conflicted folder ignores live writes (resolved submits excepted)
+    if (plugin.syncState?.conflictedPaths?.has(folder.path) && !options?.isConflictResolved) {
+        dump(`Folder modify paused, unresolved conflict: ${folder.path}`)
+        return
+    }
 
     await plugin.lockManager.withLock(folder.path, async () => {
         plugin.addIgnoredFile(folder.path)
@@ -50,6 +56,11 @@ export const folderDelete = async function (folder: TFolder, plugin: FastSync, e
     // --- 新增：删除拦截 ---
     if (plugin.lastSyncPathDeleted.has(folder.path)) {
         dump(`Folder delete intercepted: ${folder.path}`)
+        return
+    }
+    // 冲突冻结的目录不自动上传删除 / A frozen conflicted folder never auto-uploads a deletion
+    if (plugin.syncState?.conflictedPaths?.has(folder.path)) {
+        dump(`Folder delete paused, unresolved conflict: ${folder.path}`)
         return
     }
 

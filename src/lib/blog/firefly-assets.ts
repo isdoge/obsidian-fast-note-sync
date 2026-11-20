@@ -89,13 +89,88 @@ export function listLocalAssetImages(app: App, notePath: string): TFile[] {
     return folder.children.filter((child): child is TFile => child instanceof TFile && isImageFile(child));
 }
 
-/** 把图片复制进笔记同目录 `./assets/`，返回目标文件名（重名时沿用已有文件） */
+/**
+ * 把来源文件名消毒成安全的资源文件名：去掉路径分隔符与控制字符，仅保留最后一段，
+ * 丢弃以 `.` 开头的隐藏前缀，空名回退为 `image`。剪贴板/外部来源的文件名不可信。
+ *
+ * Sanitize a source file name into a safe asset name: strip path separators and control
+ * characters, keep only the last segment, drop a leading dot, and fall back to `image` when empty.
+ * Clipboard/external file names are untrusted.
+ */
+export function sanitizeAssetFileName(fileName: string): string {
+    const base = String(fileName ?? "").split(/[/\\]/).pop() ?? "";
+    // 控制字符与隐藏点前缀都不适合作为资源名（按码点过滤，避免正则里的控制字符）
+    // Control characters and a hidden dot prefix are not asset names (filtered by code point so
+    // the source carries no control characters)
+    const withoutControl = Array.from(base)
+      .filter((ch) => { const code = ch.charCodeAt(0); return code >= 0x20 && code !== 0x7f; })
+      .join("");
+    const cleaned = withoutControl.replace(/^\.+/, "").trim();
+    if (cleaned === "" || cleaned === "." || cleaned === "..") return "image";
+    return cleaned;
+}
+
+/**
+ * 判断两个资源文件是否逐字节相同（用于同名不同内容的消歧）。
+ * 比较大小后按二进制读取比较；任一读取失败按不同处理，宁可多留一份也不覆盖。
+ *
+ * Whether two asset files are byte-identical (used to disambiguate same-name, different-content
+ * files). Compares size then binary content; a read failure counts as different — keep an extra
+ * copy rather than overwrite.
+ */
+async function isSameAssetContent(app: App, a: TFile, b: TFile): Promise<boolean> {
+    if (a.stat?.size !== undefined && b.stat?.size !== undefined && a.stat.size !== b.stat.size) return false;
+    try {
+        const [left, right] = await Promise.all([app.vault.readBinary(a), app.vault.readBinary(b)]);
+        const l = new Uint8Array(left);
+        const r = new Uint8Array(right);
+        if (l.length !== r.length) return false;
+        for (let i = 0; i < l.length; i++) {
+            if (l[i] !== r[i]) return false;
+        }
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/** 为一个期望文件名挑选不冲突的资源名：`a.png` → `a-1.png`、`a-2.png` … */
+function pickAvailableAssetName(app: App, dir: string, fileName: string): string {
+    const dot = fileName.lastIndexOf(".");
+    const stem = dot > 0 ? fileName.slice(0, dot) : fileName;
+    const ext = dot > 0 ? fileName.slice(dot) : "";
+    let candidate = fileName;
+    let counter = 1;
+    while (app.vault.getAbstractFileByPath(joinVaultPath(dir, candidate)) instanceof TFile) {
+        candidate = `${stem}-${counter}${ext}`;
+        counter++;
+    }
+    return candidate;
+}
+
+/**
+ * 把图片复制进笔记同目录 `./assets/`，返回目标文件名。
+ * 目标已存在时：内容逐字节相同则直接复用；内容不同（同名不同内容）则改名 `name-N.ext`
+ * 另存，绝不静默沿用已有文件，避免把不同图片当成同一张。
+ *
+ * Copy an image into the note's `./assets/` and return the target name. When the target already
+ * exists: reuse it only if the bytes are identical; otherwise save under `name-N.ext` so a
+ * same-name-but-different image is never silently treated as the same asset.
+ */
 export async function copyImageIntoNoteAssets(app: App, notePath: string, source: TFile): Promise<string> {
     const dir = assetsDirForNote(notePath);
     const targetPath = joinVaultPath(dir, source.name);
     if (source.path === targetPath) return source.name;
     const existing = app.vault.getAbstractFileByPath(targetPath);
-    if (existing instanceof TFile) return source.name;
+    if (existing instanceof TFile) {
+        if (await isSameAssetContent(app, existing, source)) return source.name;
+        const altName = pickAvailableAssetName(app, dir, source.name);
+        if (!(app.vault.getAbstractFileByPath(dir) instanceof TFolder)) {
+            await app.vault.createFolder(dir);
+        }
+        await app.vault.copy(source, joinVaultPath(dir, altName));
+        return altName;
+    }
     if (!(app.vault.getAbstractFileByPath(dir) instanceof TFolder)) {
         await app.vault.createFolder(dir);
     }
@@ -103,24 +178,22 @@ export async function copyImageIntoNoteAssets(app: App, notePath: string, source
     return source.name;
 }
 
-/** 把本地（库外）图片写入笔记同目录 `./assets/`，返回目标文件名 */
+/**
+ * 把本地（库外 / 剪贴板）图片写入笔记同目录 `./assets/`，返回目标文件名。
+ * 文件名先消毒（剪贴板来源不可信，可能含路径分隔符/控制字符/隐藏前缀），重名自动追加 `-N`。
+ *
+ * Write an external (device / clipboard) image into the note's `./assets/` and return the target
+ * name. The name is sanitized first (clipboard sources are untrusted: path separators, control
+ * characters, hidden dot-prefixes) and collisions get a `-N` suffix.
+ */
 export async function writeImageIntoNoteAssets(app: App, notePath: string, fileName: string, data: ArrayBuffer): Promise<string> {
     const dir = assetsDirForNote(notePath);
     if (!(app.vault.getAbstractFileByPath(dir) instanceof TFolder)) {
         await app.vault.createFolder(dir);
     }
-    let targetName = fileName;
-    let targetPath = joinVaultPath(dir, targetName);
-    let counter = 1;
-    while (app.vault.getAbstractFileByPath(targetPath) instanceof TFile) {
-        const dot = fileName.lastIndexOf(".");
-        const stem = dot > 0 ? fileName.slice(0, dot) : fileName;
-        const ext = dot > 0 ? fileName.slice(dot) : "";
-        targetName = `${stem}-${counter}${ext}`;
-        targetPath = joinVaultPath(dir, targetName);
-        counter++;
-    }
-    await app.vault.createBinary(targetPath, data);
+    const safeName = sanitizeAssetFileName(fileName);
+    const targetName = pickAvailableAssetName(app, dir, safeName);
+    await app.vault.createBinary(joinVaultPath(dir, targetName), data);
     return targetName;
 }
 

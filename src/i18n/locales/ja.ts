@@ -579,6 +579,7 @@ export default {
   "ui.conflict.delete_conflict_copy": "競合コピーを削除",
   "ui.conflict.original_missing": "元のファイルが存在しません。削除された可能性があります",
   "ui.conflict.diff_too_large": "ファイルが大きすぎるため、差分を生成できません。「並べて表示」を使用して手動で比較してください",
+  "ui.conflict.remote_unavailable": "リモートの内容を取得できません。先に同期して更新してから再試行してください。",
   "ui.conflict.action_failed": "競合の処理に失敗しました。再試行してください",
   "ui.conflict.resolved_notice": "競合は解決済みです",
   "ui.conflict.missing_local": "ローカルノート ${path} は存在しません。サーバーバージョンを復元するか、競合一覧から削除してください。",

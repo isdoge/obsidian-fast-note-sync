@@ -398,6 +398,23 @@ export const clearAllTempChunks = async (plugin: FastSync) => {
   }
 }
 
+/**
+ * 冲突（530 / SyncConflict）冻结某条附件时，取消其分片上传并清掉 60s 回执超时定时器：
+ * 否则 recoverUpload 到期会把冲突附件当“回执丢失”自动重传，反复撞 530。
+ * Cancel an attachment's chunk upload and its 60s ack timeout when a conflict (530 / SyncConflict)
+ * freezes the path; otherwise recoverUpload would treat it as a lost ack and retry the conflicting
+ * upload on its own.
+ */
+export const clearUploadTrackingForConflict = (path: string): void => {
+  const active = activeUploadsMap.get(path)
+  if (active) active.cancelled = true
+  clearUploadTracking(path)
+  uploadRetries.delete(path)
+  uploadContexts.delete(path)
+  sentUploadContent.delete(path)
+  ambiguousUploadAcks.delete(path)
+}
+
 export const clearUploadQueue = () => {
   for (const timer of uploadAckTimers.values()) window.clearTimeout(timer)
   for (const state of activeUploadsMap.values()) state.cancelled = true
@@ -441,6 +458,12 @@ export const fileModify = async function (file: TAbstractFile, plugin: FastSync,
   if (file.path.endsWith(".md")) return
   if (eventEnter && plugin.isIgnoredFile(file.path)) return
   if (isPathExcluded(file.path, plugin)) return
+  // 冲突冻结的附件不响应实时写（已解决的提交除外）
+  // A frozen conflicted attachment ignores live writes (resolved submits excepted)
+  if (plugin.syncState?.conflictedPaths?.has(file.path) && !options?.isConflictResolved) {
+    dump(`File modify paused, unresolved conflict: ${file.path}`)
+    return
+  }
 
   if (isLargeBinarySyncRisk(file.stat.size, plugin)) {
     dump(`Skip file modify for large attachment (${describeBinarySyncLimit(plugin)} limit): ${file.path}`, file.stat.size)
@@ -543,6 +566,11 @@ export const fileDelete = async function (file: TAbstractFile, plugin: FastSync,
   // --- 新增：删除拦截 ---
   if (plugin.lastSyncPathDeleted.has(file.path)) {
     dump(`File delete intercepted: ${file.path}`)
+    return
+  }
+  // 冲突冻结的附件不自动上传删除 / A frozen conflicted attachment never auto-uploads a deletion
+  if (plugin.syncState?.conflictedPaths?.has(file.path)) {
+    dump(`File delete paused, unresolved conflict: ${file.path}`)
     return
   }
 

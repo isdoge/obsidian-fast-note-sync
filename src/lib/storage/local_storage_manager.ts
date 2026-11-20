@@ -565,9 +565,13 @@ export class LocalStorageManager {
     /**
      * 获取所有同步项的虚拟配置信息
      */
-    async getStorageConfigs(): Promise<{ path: string; pathHash: string; contentHash: string; mtime: number; ctime: number; size: number; isLocalStorage: boolean }[]> {
+    async getStorageConfigs(): Promise<{ path: string; pathHash: string; contentHash: string; mtime: number; ctime: number; size: number; isLocalStorage: boolean; baseHash?: string; baseHashMissing?: boolean; baseRevision?: string }[]> {
         const keys = this.getKeys();
         const configs = [];
+        // 基线模式：虚拟配置同样需要携带服务端确认的基线字段（尚无 revision 的旧项也不能被增量过滤漏掉）
+        // Baseline mode: virtual settings also carry their server-confirmed baseline fields, and
+        // items without a revision yet must not be dropped by the incremental filter
+        const baselineMode = this.plugin.isSyncBaselineModeEnabled?.() === true;
 
         for (const key of keys) {
             const value = this.getItemValue(key);
@@ -585,6 +589,7 @@ export class LocalStorageManager {
                 this.saveState();
             }
 
+            const baselineFields = baselineMode ? this.baselineFieldsFor(path, contentHash) : {};
             configs.push({
                 path: path,
                 pathHash: hashContent(path),
@@ -592,11 +597,27 @@ export class LocalStorageManager {
                 mtime: mtime,
                 ctime: mtime,
                 size: value.length,
-                isLocalStorage: true
+                isLocalStorage: true,
+                ...baselineFields,
             });
         }
 
         return configs;
+    }
+
+    /**
+     * 虚拟配置的基线字段：与服务端确认过的 {hash, revision} 一致时直接携带；
+     * 否则显式 baseHashMissing，绝不把当前值冒充成服务端基线。
+     * Baseline fields for a virtual setting: carry the server-confirmed {hash, revision} when it
+     * matches; otherwise say baseHashMissing explicitly and never pass the current value off as one.
+     */
+    private baselineFieldsFor(path: string, contentHash: string): { baseHash?: string; baseHashMissing?: boolean; baseRevision?: string } {
+        const manager = this.plugin.configHashManager;
+        const confirmed = manager?.getConfirmedBaseline?.(path, contentHash);
+        if (confirmed && confirmed.hash === contentHash && confirmed.revision !== "") {
+            return { baseHash: confirmed.hash, baseHashMissing: false, baseRevision: confirmed.revision };
+        }
+        return { baseHashMissing: true };
     }
 
     /**

@@ -375,17 +375,21 @@ export class ConflictResolveModal extends Modal {
             await this.app.vault.adapter.write(normalizePath(this.targetPath), finalContent);
           }
           this.plugin.menuManager.removeConflictedPath(this.targetPath);
-          try {
-            await removeConflictBackups(this.plugin, this.targetPath);
-          } catch (e) {
-            console.error("Failed to clean up conflict-notes files on resolve:", e);
-          }
+          // 先受控提交，提交成功后才清理冲突备份：清理在前会让提交失败时既丢了远端版本，
+          // 又失去了冲突标记（无法再次打开解决窗口）
+          // Submit first, clean up backups only after it succeeds: cleaning first loses both the
+          // stashed remote version and the conflict marker when the submit fails
           await this.plugin.lockManager.withLock(this.targetPath, async () => {
             await configModify(this.targetPath, this.plugin, false,
               this.targetPath.startsWith(this.plugin.localStorageManager.syncPathPrefix) ? finalContent : undefined,
               true,
               { isConflictResolved: true, baseRevision: this.serverRevision });
           }, { maxRetries: 2, retryInterval: 50 });
+          try {
+            await removeConflictBackups(this.plugin, this.targetPath);
+          } catch (e) {
+            console.error("Failed to clean up conflict-notes files on resolve:", e);
+          }
           this.close();
           return;
         }
@@ -412,6 +416,15 @@ export class ConflictResolveModal extends Modal {
         // Remove path from suppressed collection // 解除路径抑制
         this.plugin.menuManager.removeConflictedPath(this.targetPath);
 
+        if (!await this.plugin.concurrencyLimiter.waitForSlot(this.targetPath)) {
+          this.close();
+          return;
+        }
+        // 先受控提交（等消息写入连接），再清理备份：提交失败时保留冲突备份与元数据，便于重新打开解决窗口
+        // Submit under control (wait until the frame is written), then clean up backups: a failed
+        // submit keeps the backups and metadata so the resolver can be reopened
+        await this.plugin.websocket.SendMessage("NoteModify", data);
+
         // 清理本地 conflict-notes 中的备份文件（含阶段 B 的元数据与本地侧备份）
         // Clean up conflict-notes backups, including the stage-B metadata and local-side copy
         try {
@@ -419,12 +432,6 @@ export class ConflictResolveModal extends Modal {
         } catch (e) {
           console.error("Failed to clean up conflict-notes files on resolve:", e);
         }
-
-        if (!await this.plugin.concurrencyLimiter.waitForSlot(this.targetPath)) {
-          this.close();
-          return;
-        }
-        void this.plugin.websocket.SendMessage("NoteModify", data);
 
         this.close();
       } catch (err) {

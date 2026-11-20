@@ -579,6 +579,7 @@ export default {
   "ui.conflict.delete_conflict_copy": "Delete Conflict Copy",
   "ui.conflict.original_missing": "Original file does not exist; it may have been deleted",
   "ui.conflict.diff_too_large": "File is too large to generate a diff. Please use 'View Side by Side' for manual comparison",
+  "ui.conflict.remote_unavailable": "Could not fetch the remote version. Sync again to refresh it, then retry.",
   "ui.conflict.action_failed": "Failed to resolve conflict. Please try again",
   "ui.conflict.resolved_notice": "Conflict resolved",
   "ui.conflict.missing_local": "Local note ${path} no longer exists. Choose a server version to restore it, or remove it from the conflict list.",

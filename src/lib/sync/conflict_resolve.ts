@@ -4,7 +4,7 @@ import { dump, dumpError, hashContent, hashContentAsync, hashFileAsync } from ".
 import { CONFLICT_KIND_FOLDER, CONFLICT_KIND_NOTE, CONFLICT_KIND_SETTING, readUnifiedConflictMeta, clearConflictState } from "./conflict_store";
 import { conflictBackupPaths, noteDeleteByPath, noteModify } from "./operator_note";
 import { fileDeleteByPath, fileModify } from "./operator_file";
-import { folderModify } from "./operator_folder";
+import { folderDeleteByPath, folderModify } from "./operator_folder";
 import { configModify } from "./operator_config";
 import type FastSync from "../../main";
 
@@ -51,26 +51,67 @@ async function confirmBaseline(plugin: FastSync, kind: string, path: string, has
   }
 }
 
+/**
+ * 取远端版本正文：优先读冲突检测时落盘的 .remote 备份；未内联正文（hasServerContent=false）
+ * 时通过只读 HTTP 接口拉取远端内容，并校验哈希等于检测时的 serverHash 才返回。
+ * 拿不到（接口不可用 / 哈希不符 / 远端已不存在）返回 null，调用方必须拒绝清空本地，提示先同步刷新。
+ *
+ * Fetch the remote body: prefer the .remote backup written at detection; when the body was not
+ * inlined (hasServerContent=false), pull it through the read-only HTTP endpoint and accept it only
+ * when its hash matches the serverHash recorded at detection. Returns null when unavailable
+ * (endpoint down / hash mismatch / remote gone); callers must then refuse to clear the local copy
+ * and ask the user to sync first.
+ */
+async function loadRemoteNoteBody(
+  plugin: FastSync,
+  path: string,
+  meta: NonNullable<Awaited<ReturnType<typeof readUnifiedConflictMeta>>>,
+): Promise<{ body: string; hash: string } | null> {
+  const { remoteBackupPath } = conflictBackupPaths(plugin, path);
+  const adapter = plugin.app.vault.adapter;
+  if (meta.hasServerContent !== false && await adapter.exists(remoteBackupPath)) {
+    const body = await adapter.read(remoteBackupPath);
+    return { body, hash: meta.serverHash || await hashContentAsync(body) };
+  }
+  const api = plugin.api as { getNoteContent?: (path: string) => Promise<{ content: string; contentHash: string } | null> } | null | undefined;
+  if (!api || typeof api.getNoteContent !== "function") return null;
+  try {
+    const remote = await api.getNoteContent(path);
+    if (!remote) return null;
+    if (meta.serverHash && remote.contentHash !== meta.serverHash) {
+      dump(`[Conflict] Remote body changed since detection (${path}): expected ${meta.serverHash}, got ${remote.contentHash}`);
+      return null;
+    }
+    return { body: remote.content, hash: remote.contentHash };
+  } catch (error) {
+    dump(`[Conflict] Unable to fetch remote body for ${path}`, error);
+    return null;
+  }
+}
+
 async function resolveNote(plugin: FastSync, path: string, mode: ConflictResolveMode, meta: NonNullable<Awaited<ReturnType<typeof readUnifiedConflictMeta>>>): Promise<ConflictResolveResult> {
-  const { remoteBackupPath, localBackupPath } = conflictBackupPaths(plugin, path);
+  const { localBackupPath } = conflictBackupPaths(plugin, path);
   const adapter = plugin.app.vault.adapter;
   const file = plugin.app.vault.getFileByPath(normalizePath(path));
-  const hasRemote = await adapter.exists(remoteBackupPath);
 
   if (!file) {
     if (mode === "remote") {
-      if (!hasRemote) return { path, ok: false, reason: "missing_remote" };
-      const remote = await adapter.read(remoteBackupPath);
-      await plugin.app.vault.create(normalizePath(path), remote);
+      const remote = await loadRemoteNoteBody(plugin, path, meta);
+      if (!remote) return { path, ok: false, reason: "missing_remote" };
+      await plugin.app.vault.create(normalizePath(path), remote.body);
       const created = plugin.app.vault.getFileByPath(normalizePath(path));
-      if (meta.serverRevision) await confirmBaseline(plugin, CONFLICT_KIND_NOTE, path, meta.serverHash || await hashContentAsync(remote), meta.serverRevision, created?.stat?.mtime || 0, created?.stat?.size || 0);
+      if (meta.serverRevision) await confirmBaseline(plugin, CONFLICT_KIND_NOTE, path, meta.serverHash || remote.hash, meta.serverRevision, created?.stat?.mtime || 0, created?.stat?.size || 0);
       clearConflictState(plugin, path);
       return { path, ok: true };
     }
-    // 本地已删除：以本地为准 = 条件删除远端（携带 tombstone revision）
+    // 本地已删除：以本地为准 = 条件删除远端。基线必须用用户刚刚确认的远端状态
+    // （serverHash/serverRevision），服务端据此原子核对后删除；沿用旧 baseHash 会 530 死循环。
+    // Local deleted, keep local => conditionally delete the remote. The baseline must be the remote
+    // state the user just confirmed (serverHash/serverRevision) so the server can atomically verify
+    // and delete; reusing the stale baseHash loops on 530 forever.
     await noteDeleteByPath(path, plugin, undefined, {
-      hash: meta.baseHash || "",
-      hashMissing: !meta.baseHash,
+      hash: meta.serverHash || "",
+      hashMissing: !meta.serverHash,
       revision: meta.serverRevision || "",
     });
     clearConflictState(plugin, path);
@@ -94,21 +135,23 @@ async function resolveNote(plugin: FastSync, path: string, mode: ConflictResolve
       clearConflictState(plugin, path, { keepBackup: true });
       return { path, ok: true };
     }
-    if (!hasRemote) return { path, ok: false, reason: "missing_remote" };
-    const remote = await adapter.read(remoteBackupPath);
-    await plugin.app.vault.modify(file, remote);
+    const remote = await loadRemoteNoteBody(plugin, path, meta);
+    // 远端正文拿不到时绝不把空串写进用户笔记：拒绝并提示先同步刷新
+    // Never write an empty body into the user's note when the remote is unavailable
+    if (!remote) return { path, ok: false, reason: "missing_remote" };
+    await plugin.app.vault.modify(file, remote.body);
     const written = plugin.app.vault.getFileByPath(normalizePath(path)) ?? file;
-    await confirmBaseline(plugin, CONFLICT_KIND_NOTE, path, meta.serverHash || await hashContentAsync(remote), meta.serverRevision || "", written.stat?.mtime || 0, written.stat?.size || 0);
+    await confirmBaseline(plugin, CONFLICT_KIND_NOTE, path, meta.serverHash || remote.hash, meta.serverRevision || "", written.stat?.mtime || 0, written.stat?.size || 0);
     plugin.lastSyncMtime.set(path, written.stat?.mtime || 0);
     clearConflictState(plugin, path, { keepBackup: true });
     return { path, ok: true };
   }
 
   if (mode === "both") {
-    if (hasRemote) {
-      const remote = await adapter.read(remoteBackupPath);
+    const remote = await loadRemoteNoteBody(plugin, path, meta);
+    if (remote) {
       const copyPath = await pickVisibleCopyPath(plugin, path, ".remote");
-      await plugin.app.vault.create(normalizePath(copyPath), remote);
+      await plugin.app.vault.create(normalizePath(copyPath), remote.body);
     }
   }
 
@@ -122,26 +165,100 @@ async function resolveNote(plugin: FastSync, path: string, mode: ConflictResolve
   return { path, ok: true };
 }
 
+/** 配置通道远端正文的本地形态：虚拟项是字符串，磁盘项是原始字节（二进制安全） */
+type SettingRemoteBody = { kind: "virtual"; text: string; hash: string } | { kind: "binary"; bytes: ArrayBuffer; hash: string } | { kind: "text"; text: string; hash: string };
+
+/**
+ * 读取配置通道的远端版本，二进制逐字节保留。
+ * 未内联正文（hasServerContent=false）或 .remote 缺失时返回 null，调用方不得清空本地配置。
+ *
+ * Read the remote setting body keeping binary bytes intact. Returns null when the body was not
+ * inlined (hasServerContent=false) or the .remote copy is missing; callers must then refuse to
+ * clear the local setting.
+ */
+async function loadRemoteSettingBody(plugin: FastSync, path: string, meta: NonNullable<Awaited<ReturnType<typeof readUnifiedConflictMeta>>>): Promise<SettingRemoteBody | null> {
+  const { remoteBackupPath } = conflictBackupPaths(plugin, path);
+  const adapter = plugin.app.vault.adapter;
+  if (meta.hasServerContent === false) return null;
+  if (!(await adapter.exists(remoteBackupPath))) return null;
+  const isVirtual = path.startsWith(plugin.localStorageManager.syncPathPrefix);
+  if (isVirtual) {
+    const text = await adapter.read(remoteBackupPath);
+    return { kind: "virtual", text, hash: meta.serverHash || await hashContentAsync(text) };
+  }
+  if (meta.isBinary) {
+    const bytes = await adapter.readBinary(remoteBackupPath);
+    return { kind: "binary", bytes, hash: meta.serverHash || await hashFileAsync(plugin.app, remoteBackupPath) };
+  }
+  const text = await adapter.read(remoteBackupPath);
+  return { kind: "text", text, hash: meta.serverHash || await hashContentAsync(text) };
+}
+
+/** 把远端配置正文写回本地（虚拟项走 localStorage，磁盘项按二进制/文本分别写） */
+async function applyRemoteSettingBody(plugin: FastSync, path: string, body: SettingRemoteBody): Promise<{ mtime: number; size: number }> {
+  const adapter = plugin.app.vault.adapter;
+  const fullPath = normalizePath(path);
+  if (body.kind === "virtual") {
+    void plugin.localStorageManager.handleReceivedUpdate?.(path, body.text);
+    return { mtime: Date.now(), size: body.text.length };
+  }
+  if (body.kind === "binary") {
+    await adapter.writeBinary(fullPath, body.bytes);
+    const stat = await adapter.stat(fullPath).catch(() => null);
+    return { mtime: stat?.mtime || Date.now(), size: body.bytes.byteLength };
+  }
+  await adapter.write(fullPath, body.text);
+  const stat = await adapter.stat(fullPath).catch(() => null);
+  return { mtime: stat?.mtime || Date.now(), size: body.text.length };
+}
+
+/** 本地配置在解决侧的复核哈希（虚拟项按字符串，磁盘项按原始字节） */
+async function localSettingHash(plugin: FastSync, path: string): Promise<string | null> {
+  const adapter = plugin.app.vault.adapter;
+  if (path.startsWith(plugin.localStorageManager.syncPathPrefix)) {
+    const value = plugin.localStorageManager.getItemValue(plugin.localStorageManager.pathToKey(path) || "");
+    return value === null ? null : await hashContentAsync(value);
+  }
+  const fullPath = normalizePath(path);
+  if (!(await adapter.exists(fullPath))) return null;
+  return await hashFileAsync(plugin.app, fullPath);
+}
+
 async function resolveSetting(plugin: FastSync, path: string, mode: ConflictResolveMode, meta: NonNullable<Awaited<ReturnType<typeof readUnifiedConflictMeta>>>): Promise<ConflictResolveResult> {
   const adapter = plugin.app.vault.adapter;
-  const { remoteBackupPath, localBackupPath } = conflictBackupPaths(plugin, path);
+  const { localBackupPath } = conflictBackupPaths(plugin, path);
   const isVirtual = path.startsWith(plugin.localStorageManager.syncPathPrefix);
   const fullPath = normalizePath(path);
   const exists = isVirtual
     ? plugin.localStorageManager.getItemValue(plugin.localStorageManager.pathToKey(path) || "") !== null
     : await adapter.exists(fullPath);
 
+  // 检测后本地又被改过：拒绝把旧决策套到新内容上（与笔记一致）
+  // Local copy edited after detection: never apply an old decision to new content
+  if (exists && meta.localHashAtDetection) {
+    const currentHash = await localSettingHash(plugin, path);
+    if (currentHash !== null && currentHash !== meta.localHashAtDetection) return { path, ok: false, reason: "new_edit" };
+  }
+
   if (!exists) {
     if (mode === "remote") {
-      if (!(await adapter.exists(remoteBackupPath))) return { path, ok: false, reason: "missing_remote" };
-      const remote = await adapter.read(remoteBackupPath);
-      if (isVirtual) void plugin.localStorageManager.handleReceivedUpdate?.(path, remote);
-      else await adapter.write(fullPath, remote);
-      await confirmBaseline(plugin, CONFLICT_KIND_SETTING, path, meta.serverHash || await hashContentAsync(remote), meta.serverRevision || "", Date.now(), remote.length);
+      if (meta.serverDeleted) {
+        // 远端已是墓碑：本地本就不存在，直接清状态即可
+        // Remote is already a tombstone and the local copy is gone: just clear the state
+        clearConflictState(plugin, path);
+        return { path, ok: true };
+      }
+      const remote = await loadRemoteSettingBody(plugin, path, meta);
+      if (!remote) return { path, ok: false, reason: "missing_remote" };
+      const applied = await applyRemoteSettingBody(plugin, path, remote);
+      await confirmBaseline(plugin, CONFLICT_KIND_SETTING, path, remote.hash, meta.serverRevision || "", applied.mtime, applied.size);
       clearConflictState(plugin, path);
       return { path, ok: true };
     }
-    // 本地已删除 → 条件删除远端配置
+    // 本地已删除 → 条件删除远端配置。基线用用户确认过的远端状态（serverHash/serverRevision），
+    // 避免沿用旧 baseHash 造成 530 死循环。
+    // Local deleted => conditionally delete the remote using the confirmed remote state, so the
+    // stale baseHash cannot loop on 530.
     if (isVirtual) {
       plugin.configHashManager?.recordPendingDeleteBaseline?.(path);
     }
@@ -150,11 +267,9 @@ async function resolveSetting(plugin: FastSync, path: string, mode: ConflictReso
       vault: plugin.settings.vault,
       path,
       pathHash: hashContent(path),
-      ...(meta.serverRevision ? {
-        baseHash: meta.baseHash || "",
-        baseHashMissing: !meta.baseHash,
-        baseRevision: meta.serverRevision,
-      } : { baseHashMissing: true }),
+      baseHash: meta.serverHash || "",
+      baseHashMissing: !meta.serverHash,
+      ...(meta.serverRevision ? { baseRevision: meta.serverRevision } : {}),
     });
     clearConflictState(plugin, path);
     return { path, ok: true };
@@ -162,31 +277,44 @@ async function resolveSetting(plugin: FastSync, path: string, mode: ConflictReso
 
   if (mode === "remote") {
     if (meta.serverDeleted) {
-      await adapter.write(localBackupPath, isVirtual ? (plugin.localStorageManager.getItemValue(plugin.localStorageManager.pathToKey(path) || "") || "") : await adapter.read(fullPath));
-      if (isVirtual) void plugin.localStorageManager.handleReceivedUpdate?.(path, "");
-      else await adapter.remove(fullPath);
+      if (isVirtual) {
+        await adapter.write(localBackupPath, plugin.localStorageManager.getItemValue(plugin.localStorageManager.pathToKey(path) || "") || "");
+        void plugin.localStorageManager.handleReceivedUpdate?.(path, "");
+      } else {
+        await adapter.writeBinary(localBackupPath, await adapter.readBinary(fullPath));
+        await adapter.remove(fullPath);
+      }
       plugin.configHashManager?.removeFileHash?.(path);
       clearConflictState(plugin, path, { keepBackup: true });
       return { path, ok: true };
     }
-    if (!(await adapter.exists(remoteBackupPath))) return { path, ok: false, reason: "missing_remote" };
-    const remote = await adapter.read(remoteBackupPath);
+    const remote = await loadRemoteSettingBody(plugin, path, meta);
+    // 远端正文拿不到时拒绝清空本地配置，提示先同步刷新
+    // Never clear the local setting when the remote body is unavailable
+    if (!remote) return { path, ok: false, reason: "missing_remote" };
     if (isVirtual) {
-      void plugin.localStorageManager.handleReceivedUpdate?.(path, remote);
+      await adapter.write(localBackupPath, plugin.localStorageManager.getItemValue(plugin.localStorageManager.pathToKey(path) || "") || "");
     } else {
-      await adapter.write(localBackupPath, await adapter.read(fullPath));
-      await adapter.write(fullPath, remote);
+      await adapter.writeBinary(localBackupPath, await adapter.readBinary(fullPath));
     }
-    await confirmBaseline(plugin, CONFLICT_KIND_SETTING, path, meta.serverHash || await hashContentAsync(remote), meta.serverRevision || "", Date.now(), remote.length);
+    const applied = await applyRemoteSettingBody(plugin, path, remote);
+    await confirmBaseline(plugin, CONFLICT_KIND_SETTING, path, remote.hash, meta.serverRevision || "", applied.mtime, applied.size);
     clearConflictState(plugin, path, { keepBackup: true });
     return { path, ok: true };
   }
 
-  if (mode === "both" && await adapter.exists(remoteBackupPath)) {
-    const remote = await adapter.read(remoteBackupPath);
-    const copyPath = await pickVisibleCopyPath(plugin, path, ".remote");
-    if (isVirtual) void plugin.localStorageManager.handleReceivedUpdate?.(copyPath, remote);
-    else await adapter.write(normalizePath(copyPath), remote);
+  if (mode === "both") {
+    const remote = await loadRemoteSettingBody(plugin, path, meta);
+    if (remote) {
+      const copyPath = await pickVisibleCopyPath(plugin, path, ".remote");
+      if (remote.kind === "virtual") {
+        void plugin.localStorageManager.handleReceivedUpdate?.(copyPath, remote.text);
+      } else if (remote.kind === "binary") {
+        await adapter.writeBinary(normalizePath(copyPath), remote.bytes);
+      } else {
+        await adapter.write(normalizePath(copyPath), remote.text);
+      }
+    }
   }
 
   clearConflictState(plugin, path);
@@ -216,9 +344,12 @@ async function resolveFile(plugin: FastSync, path: string, mode: ConflictResolve
       void plugin.websocket.SendMessage("FileRePush", { vault: plugin.settings.vault, path, pathHash: hashContent(path) });
       return { path, ok: true };
     }
+    // 本地已删除、保留本地 => 以用户确认过的远端状态作基线条件删除，避免旧 baseHash 的 530 死循环
+    // Local deleted, keep local => conditionally delete using the confirmed remote state, avoiding
+    // the stale-baseHash 530 loop
     await fileDeleteByPath(path, plugin, undefined, {
-      hash: meta.baseHash || "",
-      hashMissing: !meta.baseHash,
+      hash: meta.serverHash || "",
+      hashMissing: !meta.serverHash,
       revision: meta.serverRevision || "",
     });
     clearConflictState(plugin, path);
@@ -263,16 +394,74 @@ async function resolveFile(plugin: FastSync, path: string, mode: ConflictResolve
 
 async function resolveFolder(plugin: FastSync, folderPath: string, mode: ConflictResolveMode, meta: NonNullable<Awaited<ReturnType<typeof readUnifiedConflictMeta>>>): Promise<ConflictResolveResult> {
   const folder = plugin.app.vault.getAbstractFileByPath(normalizePath(folderPath));
-  if (mode === "remote") {
-    if (folder && meta.serverDeleted) {
-      await plugin.app.fileManager.trashFile(folder);
-      plugin.folderSnapshotManager?.removeFolder?.(folderPath);
+  const snapshot = plugin.folderSnapshotManager;
+  // 本地目录不存在（local_deleted）时两个分支都不能写反：
+  // - 保留本地已删状态（local）=> 条件删除远端目录，并清掉本地快照；
+  // - 采用远端目录（remote）=> 远端未删就本地建回并写入快照；远端已删则只清快照。
+  //
+  // When the local folder is missing (local_deleted) neither branch may be inverted:
+  // - keep the local deletion (local) => conditionally delete the remote folder and drop the snapshot;
+  // - adopt the remote folder (remote) => recreate it locally and record the snapshot when the
+  //   remote still exists; when the remote is a tombstone only the snapshot is dropped.
+  if (!folder) {
+    if (mode === "local") {
+      await folderDeleteByPath(folderPath, plugin, undefined, {
+        hash: meta.serverHash || "",
+        hashMissing: !meta.serverHash,
+        revision: meta.serverRevision || "",
+      });
+      snapshot?.removeFolder?.(folderPath);
+      clearConflictState(plugin, folderPath);
+      return { path: folderPath, ok: true };
     }
-    if (meta.serverRevision) plugin.folderSnapshotManager?.setConfirmedRevision?.(folderPath, meta.serverRevision);
+    if (mode === "remote") {
+      if (meta.serverDeleted) {
+        snapshot?.removeFolder?.(folderPath);
+        clearConflictState(plugin, folderPath);
+        return { path: folderPath, ok: true };
+      }
+      try {
+        await plugin.app.vault.createFolder(normalizePath(folderPath));
+      } catch (error) {
+        dump(`[Conflict] Unable to create folder for resolution: ${folderPath}`, error);
+        return { path: folderPath, ok: false, reason: "error" };
+      }
+      if (meta.serverRevision) {
+        snapshot?.setFolderMtime?.(folderPath, Date.now());
+        snapshot?.setConfirmedRevision?.(folderPath, meta.serverRevision);
+      }
+      clearConflictState(plugin, folderPath);
+      return { path: folderPath, ok: true };
+    }
+    // both：本地已删，没有可保留的本地目录，等同采用远端
+    // both: nothing local survives, so it degenerates to adopting the remote folder
+    if (meta.serverDeleted) {
+      snapshot?.removeFolder?.(folderPath);
+    } else {
+      try {
+        await plugin.app.vault.createFolder(normalizePath(folderPath));
+        if (meta.serverRevision) {
+          snapshot?.setFolderMtime?.(folderPath, Date.now());
+          snapshot?.setConfirmedRevision?.(folderPath, meta.serverRevision);
+        }
+      } catch (error) {
+        dump(`[Conflict] Unable to create folder for resolution: ${folderPath}`, error);
+      }
+    }
     clearConflictState(plugin, folderPath);
     return { path: folderPath, ok: true };
   }
-  let target = folder;
+
+  if (mode === "remote") {
+    if (meta.serverDeleted) {
+      await plugin.app.fileManager.trashFile(folder);
+      snapshot?.removeFolder?.(folderPath);
+    }
+    if (meta.serverRevision) snapshot?.setConfirmedRevision?.(folderPath, meta.serverRevision);
+    clearConflictState(plugin, folderPath);
+    return { path: folderPath, ok: true };
+  }
+  let target: ReturnType<typeof plugin.app.vault.getAbstractFileByPath> = folder;
   if (!target) {
     try {
       await plugin.app.vault.createFolder(normalizePath(folderPath));
