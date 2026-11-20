@@ -58,6 +58,12 @@ export class SyncState {
   public conflictedPaths: Set<string> = new Set();
   /** 本轮同步中新捕获到的需要手动解决的冲突路径集合，用以在同步结束时判定是否弹出冲突列表框 / New conflicted paths detected in this round */
   public newConflictedPathsThisRound: Set<string> = new Set();
+  /**
+   * 本轮因“本地有内容但无任何可信基线”而进入待对齐的路径，用于同步结束时合并提示一次。
+   * Paths queued for alignment this round because local content had no trusted baseline;
+   * used to show one aggregated notice when the round completes.
+   */
+  public newUnalignedPathsThisRound: Set<string> = new Set();
 
   // ─── Chunk size settings from server ─────────────────────────────────────────
   /** 上传分片数量 / Upload chunk size from server */

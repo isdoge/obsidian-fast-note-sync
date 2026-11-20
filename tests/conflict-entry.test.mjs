@@ -54,6 +54,22 @@ vm.runInNewContext(code, {
     }
     if (id === "../../i18n/lang") return { $: key => key };
     if (id === "./status_bar_manager") return { StatusBarManager: class {} };
+    if (id === "../sync/operator_note") {
+      // Stage B: menu_manager reads backup paths/metadata from operator_note
+      return {
+        conflictBackupPaths: (_plugin, p) => ({
+          dir: ".obsidian/plugins/fast-note-sync/conflict-notes",
+          safeName: p.replace(/\.md$/, "").replace(/[/\\]/g, "_"),
+          pathHash: `hash-${p}`,
+          baseBackupPath: `.obsidian/plugins/fast-note-sync/conflict-notes/${p.replace(/\.md$/, "").replace(/[/\\]/g, "_")}_hash-${p}.base.md`,
+          remoteBackupPath: `.obsidian/plugins/fast-note-sync/conflict-notes/${p.replace(/\.md$/, "").replace(/[/\\]/g, "_")}_hash-${p}.remote.md`,
+          metaPath: `.obsidian/plugins/fast-note-sync/conflict-notes/${p.replace(/\.md$/, "").replace(/[/\\]/g, "_")}_hash-${p}.meta.json`,
+          localBackupPath: `.obsidian/plugins/fast-note-sync/conflict-notes/${p.replace(/\.md$/, "").replace(/[/\\]/g, "_")}_hash-${p}.local-backup.md`,
+        }),
+        readConflictMeta: async () => null,
+        CONFLICT_REASON_UNALIGNED: "unaligned_no_baseline",
+      };
+    }
     if (id === "../sync/sync_log_manager") {
       return { SyncLogManager: { getInstance: () => ({ getLogs: () => [] }) } };
     }

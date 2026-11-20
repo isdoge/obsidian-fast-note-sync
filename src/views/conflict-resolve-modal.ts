@@ -1,7 +1,8 @@
 import { App, Modal, setIcon, TFile, Platform, Notice } from "obsidian";
 import type FastSync from "../main";
 import { $ } from "../i18n/lang";
-import { hashContent, hashContentAsync, getPluginDir } from "../lib/utils/helpers";
+import { hashContent, hashContentAsync } from "../lib/utils/helpers";
+import { removeConflictBackups } from "../lib/sync/operator_note";
 
 /**
  * ConflictResolveModal provides a 3-column diff view for manual note conflict resolution.
@@ -24,6 +25,8 @@ export class ConflictResolveModal extends Modal {
   private serverContent: string;
   private baseContent: string;
   private serverHash: string;
+  /** 是否缺少共同祖先基线（区分“真实空 base”与“无基线”）/ Whether the common ancestor is missing */
+  private baseMissing: boolean;
 
   private editorEl: HTMLTextAreaElement;
   private editorContainerEl: HTMLElement;
@@ -38,7 +41,8 @@ export class ConflictResolveModal extends Modal {
     localContent: string,
     serverContent: string,
     baseContent: string,
-    serverHash: string
+    serverHash: string,
+    baseMissing: boolean = false
   ) {
     super(app);
     this.plugin = plugin;
@@ -47,6 +51,7 @@ export class ConflictResolveModal extends Modal {
     this.serverContent = serverContent;
     this.baseContent = baseContent;
     this.serverHash = serverHash;
+    this.baseMissing = baseMissing;
   }
 
   onOpen() {
@@ -65,10 +70,20 @@ export class ConflictResolveModal extends Modal {
     const container = contentEl.createDiv({ cls: "conflict-resolve-container" });
 
     // Render description bar // 渲染描述文案栏
+    // 缺少共同祖先时不能用“对比 Base”的措辞，否则用户会误以为空文本就是真实祖先
+    // Without an ancestor the diff-vs-base wording is misleading: empty text is not a real base
     container.createDiv({
-      cls: "conflict-resolve-desc",
-      text: $("ui.conflict.modal_desc") || "本地版本和远端版本为只读对照，请在最右侧的「冲突解决版本」中编辑出最终内容，然后点击下方「解决冲突」进行保存和提交。"
+      cls: this.baseMissing ? "conflict-resolve-desc conflict-resolve-desc-base-missing" : "conflict-resolve-desc",
+      text: this.baseMissing
+        ? ($("ui.conflict.modal_desc_no_base") || "本地笔记与远端同名笔记内容不同，但两端没有可用的共同基线（可能是首次接入或本地同步状态丢失）。两侧内容均未被改动，请在最右侧编辑最终内容后提交；差异仅作对照，不代表本地或远端是对方的修改。")
+        : ($("ui.conflict.modal_desc") || "本地版本和远端版本为只读对照，请在最右侧的「冲突解决版本」中编辑出最终内容，然后点击下方「解决冲突」进行保存和提交。")
     });
+    if (this.baseMissing) {
+      container.createDiv({
+        cls: "conflict-resolve-base-missing-badge",
+        text: $("ui.conflict.base_missing_badge") || "缺少共同基线 · 两侧均保留",
+      });
+    }
 
     const diffWrap = container.createDiv({ cls: "conflict-resolve-diff-wrap" });
 
@@ -361,35 +376,10 @@ export class ConflictResolveModal extends Modal {
         // Remove path from suppressed collection // 解除路径抑制
         this.plugin.menuManager.removeConflictedPath(this.file.path);
 
-        // 清理本地 conflict-notes 中的备份文件 (位于插件目录下，文件名附加路径哈希以防碰撞)
+        // 清理本地 conflict-notes 中的备份文件（含阶段 B 的元数据与本地侧备份）
+        // Clean up conflict-notes backups, including the stage-B metadata and local-side copy
         try {
-          const adapter = this.app.vault.adapter;
-          const safeName = this.file.path.replace(/\.md$/, "").replace(/[/\\]/g, "_");
-          const pathHash = hashContent(this.file.path);
-          const conflictDir = `${getPluginDir(this.plugin)}/conflict-notes`;
-          const baseBackupPath = `${conflictDir}/${safeName}_${pathHash}.base.md`;
-          const remoteBackupPath = `${conflictDir}/${safeName}_${pathHash}.remote.md`;
-
-          const deletePromises: Promise<void>[] = [];
-          if (await adapter.exists(baseBackupPath)) {
-            deletePromises.push(adapter.remove(baseBackupPath));
-          }
-          if (await adapter.exists(remoteBackupPath)) {
-            deletePromises.push(adapter.remove(remoteBackupPath));
-          }
-          await Promise.all(deletePromises);
-
-          // 如果 conflict-notes 文件夹已空，则尝试一并清理（若被 Windows 锁定 busy 则静默忽略）
-          if (await adapter.exists(conflictDir)) {
-            const files = await adapter.list(conflictDir);
-            if (files && files.files.length === 0 && files.folders.length === 0) {
-              try {
-                await adapter.rmdir(conflictDir, true);
-              } catch {
-                // Ignore EBUSY/locked folder error, keeping empty folder is harmless // 忽略文件夹繁忙/锁定错误，保留空文件夹无害
-              }
-            }
-          }
+          await removeConflictBackups(this.plugin, this.file.path);
         } catch (e) {
           console.error("Failed to clean up conflict-notes files on resolve:", e);
         }

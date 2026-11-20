@@ -4,13 +4,14 @@ import { startupSync, startupFullSync, resetSettingSyncTime, rebuildAllHashes, c
 import { AppWithInternal, MenuItemWithDom, MenuWithHide, MenuItemWithInternal } from "../utils/types";
 import { NoteHistoryModal } from '../../views/note-history/history-modal';
 import { RecycleBinModal } from '../../views/recycle-bin-modal';
-import { showSyncNotice, getPluginDir, hashContent } from '../utils/helpers';
+import { showSyncNotice } from '../utils/helpers';
 import { ShareModal } from '../../views/share-modal';
 import { AboutModal } from '../../views/about-modal';
 import { $ } from "../../i18n/lang";
 import FastSync from "../../main";
 import { StatusBarManager } from './status_bar_manager';
 import { SyncLogManager } from '../sync/sync_log_manager';
+import { conflictBackupPaths, readConflictMeta } from '../sync/operator_note';
 
 
 
@@ -786,15 +787,16 @@ export class MenuManager {
 
     try {
       const adapter = this.plugin.app.vault.adapter;
-      const safeName = normalizedPath.replace(/\.md$/, "").replace(/[/\\]/g, "_");
-      const pathHash = hashContent(normalizedPath);
-      const conflictDir = `${getPluginDir(this.plugin)}/conflict-notes`;
-      const baseBackupPath = `${conflictDir}/${safeName}_${pathHash}.base.md`;
-      const remoteBackupPath = `${conflictDir}/${safeName}_${pathHash}.remote.md`;
+      const { baseBackupPath, remoteBackupPath } = conflictBackupPaths(this.plugin, normalizedPath);
+      const meta = await readConflictMeta(this.plugin, normalizedPath);
+      // base 文件存在才算有共同祖先；空文件是“真实空 base”，不存在是“缺基线”，两者文案不同
+      // base exists => real ancestor (an empty file is a real empty base); absent => missing base
+      const baseExists = await adapter.exists(baseBackupPath);
+      const baseMissing = !baseExists;
 
       let baseContent = "";
       let serverContent = "";
-      if (await adapter.exists(baseBackupPath)) {
+      if (baseExists) {
         baseContent = await adapter.read(baseBackupPath);
       }
       if (await adapter.exists(remoteBackupPath)) {
@@ -826,8 +828,9 @@ export class MenuManager {
         }
       }
 
+      if (baseMissing && meta?.remoteHash && !serverHash) serverHash = meta.remoteHash;
       const { ConflictResolveModal } = await import("../../views/conflict-resolve-modal");
-      new ConflictResolveModal(this.plugin.app, this.plugin, file, localContent, serverContent, baseContent, serverHash).open();
+      new ConflictResolveModal(this.plugin.app, this.plugin, file, localContent, serverContent, baseContent, serverHash, baseMissing).open();
     } catch (e) {
       console.error("Failed to open conflict resolver for path:", e);
       new Notice($("ui.conflict.open_failed", { path: normalizedPath }));

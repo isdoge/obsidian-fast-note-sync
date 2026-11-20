@@ -3,7 +3,7 @@ import { TFolder, TFile, normalizePath } from "obsidian";
 import { receiveFileUpload, receiveFileSyncUpdate, receiveFileSyncDelete, receiveFileSyncMtime, receiveFileSyncChunkDownload, receiveFileSyncEnd, checkAndUploadAttachments, receiveFileSyncRename, receiveFileRenameAck, receiveFileUploadAck, receiveFileDeleteAck, isPluginUnloading, sweepStalledDownloadSessions, invalidateFileDownloads, isAttachmentUploadActive } from "./operator_file";
 import { hashContent, hashContentAsync, dump, isPathExcluded, isFolderSyncPathExcluded, configIsPathExcluded, getConfigSyncCustomDirs, generateUUID, showSyncNotice, isLargeBinarySyncRisk, describeBinarySyncLimit, hashFileAsync, formatFileSize, yieldToMain, getPluginDir } from "../utils/helpers";
 import { receiveConfigSyncModify, receiveConfigUpload, receiveConfigSyncMtime, receiveConfigSyncDelete, receiveConfigSyncEnd, configAllPaths, receiveConfigSyncClear, receiveConfigModifyAck, receiveConfigDeleteAck } from "./operator_config";
-import { receiveNoteSyncModify, receiveNoteUpload, receiveNoteSyncMtime, receiveNoteSyncDelete, receiveNoteSyncEnd, receiveNoteSyncRename, receiveNoteModifyAck, receiveNoteRenameAck, receiveNoteDeleteAck } from "./operator_note";
+import { receiveNoteSyncModify, receiveNoteUpload, receiveNoteSyncMtime, receiveNoteSyncDelete, receiveNoteSyncEnd, receiveNoteSyncRename, receiveNoteModifyAck, receiveNoteRenameAck, receiveNoteDeleteAck, conflictBackupPaths } from "./operator_note";
 import { SyncMode, SnapFile, SnapFolder, SyncEndData, PathHashFile, NoteSyncData, FileSyncData, ConfigSyncData, FolderSyncData } from "../utils/types";
 import { receiveFolderSyncModify, receiveFolderSyncDelete, receiveFolderSyncRename, receiveFolderSyncEnd, receiveFolderRetryAck } from "./operator_folder";
 import { FileCloudPreview } from "../storage/file_cloud_preview";
@@ -386,6 +386,16 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, _sync
     plugin.syncState.silentSync = false;
     plugin.updateStatusBar(completionText);
 
+    // 本轮因“本地有内容但无可信基线”进入待对齐的笔记合并提示一次，避免逐篇 Notice 刷屏
+    // One aggregated notice for notes queued for alignment this round, not one Notice per note
+    const unalignedThisRound = plugin.syncState.newUnalignedPathsThisRound?.size ?? 0;
+    if (unalignedThisRound > 0) {
+      if (plugin.settings.isShowNotice) {
+        showSyncNotice($("ui.conflict.unaligned_summary", { count: String(unalignedThisRound) }), 12000);
+      }
+      plugin.syncState.newUnalignedPathsThisRound.clear();
+    }
+
     // 同步成功完成后，如果在此次同步中捕获到了需要手动合并解决的新冲突，则在此时一并弹出冲突文件列表视图
     if (plugin.syncState.newConflictedPathsThisRound.size > 0) {
       plugin.syncState.newConflictedPathsThisRound.clear();
@@ -747,9 +757,13 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       // Keep the base/remote backups of unresolved conflicts for the resolve modal (their uploads are paused, see #276)
       const keep = new Set<string>();
       for (const p of plugin.syncState.conflictedPaths) {
-        const stem = `${conflictDir}/${p.replace(/\.md$/, "").replace(/[/\\]/g, "_")}_${hashContent(p)}`;
-        keep.add(`${stem}.base.md`);
-        keep.add(`${stem}.remote.md`);
+        // 与 conflictBackupPaths() 保持一致：元数据与本地侧备份同属未解决条目，必须保留
+        // Keep metadata and the local-side copy for unresolved entries (see conflictBackupPaths)
+        const backup = conflictBackupPaths(plugin, p);
+        keep.add(backup.baseBackupPath);
+        keep.add(backup.remoteBackupPath);
+        keep.add(backup.metaPath);
+        keep.add(backup.localBackupPath);
       }
       const deletePromises: Promise<void>[] = [];
       if (files && files.files) {
@@ -767,6 +781,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
   // 仅清空本轮捕获的局部新冲突集合，防止上一轮残留的冲突引起本轮再次多余弹出冲突列表。
   // 我们不再清空全局和持久化的 conflictedPaths 集合，这样在未解决冲突前，角标和状态栏均会一直保留它。
   plugin.syncState.newConflictedPathsThisRound.clear();
+  plugin.syncState.newUnalignedPathsThisRound?.clear();
   // 提到 try 外部，使 catch/finally 也能引用本次会话的 context 做归属判断
   // Hoisted outside try so catch/finally can reference this session's context for ownership checks
   let context = "";

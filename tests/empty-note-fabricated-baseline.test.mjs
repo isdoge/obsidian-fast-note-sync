@@ -61,9 +61,11 @@ const { FileHashManager } = loadModule("src/lib/storage/file_hash_manager.ts", (
   throw new Error(`Unexpected require in file_hash_manager: ${id}`);
 });
 
-// New install: no saved state at all. Local vault already has files (the daily-note case):
-// an empty today.md and a non-empty real.md. initialize() must build the local cache and
-// migrate a baseline ONLY for the non-empty file.
+// Stage B: the startup scan only fills the disk-hash cache. It must never fabricate a trusted
+// sync baseline, not even for a non-empty file: an existing vault attaching to a same-named
+// remote vault would otherwise treat its local bytes as "already synced" and let the first
+// remote modify overwrite it. Empty files still get no baseline either (#205).
+// Stage B：启动扫描只填磁盘缓存，任何文件都不伪造可信基线；空文件同样不伪造（#205）。
 {
   const ls = new Map();
   const files = new Map();
@@ -96,12 +98,13 @@ const { FileHashManager } = loadModule("src/lib/storage/file_hash_manager.ts", (
   const mgr = new FileHashManager(plugin);
   await mgr.initialize();
   mgr.flush();
-  assert.equal(mgr.getPathHash("diary/real.md") !== null, true, "non-empty note gets a fabricated baseline (upgrade/new users unchanged)");
+  assert.equal(mgr.getPathHash("diary/real.md"), null, "startup scan never fabricates a trusted baseline (stage B)");
   assert.equal(mgr.getPathHash("diary/today.md"), null, "empty note gets NO fabricated baseline (#205)");
+  assert.notEqual(mgr.getValidHash("diary/real.md", 1, 9), null, "the disk-hash cache is still populated for performance");
 }
 
-// Upgrade user: hashMap pre-populated (old version data), no syncHashMap. Non-empty entries
-// migrate; an empty entry does not.
+// Upgrade user: hashMap pre-populated (old version data), no syncHashMap. Stage B never
+// promotes the legacy cache into trusted baselines.
 {
   const ls = new Map(), files = new Map();
   ls.set("fns-fileHashMap", JSON.stringify({
@@ -122,7 +125,7 @@ const { FileHashManager } = loadModule("src/lib/storage/file_hash_manager.ts", (
   };
   const mgr = new FileHashManager(plugin);
   await mgr.initialize();
-  assert.equal(mgr.getPathHash("a/old.md"), "h1", "upgrade: non-empty entry migrated");
+  assert.equal(mgr.getPathHash("a/old.md"), null, "upgrade: legacy cache is not promoted to a trusted baseline");
   assert.equal(mgr.getPathHash("a/blank.md"), null, "upgrade: empty entry not migrated");
 }
 

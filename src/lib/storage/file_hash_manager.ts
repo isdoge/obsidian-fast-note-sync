@@ -13,15 +13,45 @@ interface HashCache {
 }
 
 /**
+ * 可信基线的来源标记（阶段 B）。
+ * - confirmed: 由服务端确认（Ack / 下载落盘 / 推送内容与本地一致）建立的基线；
+ * - persisted_verified: 升级自旧版持久化基线，仅当本地当前内容与记录值相等时按“未偏离”接受；
+ * - none / unverified: 没有可信基线，或旧版基线无法用当前本地内容自证。
+ *
+ * Provenance of a trusted baseline (stage B):
+ * - confirmed: established at a server-confirmed moment (Ack / downloaded content / push that
+ *   equals local content);
+ * - persisted_verified: legacy persisted baseline accepted only because local content still
+ *   matches the recorded value;
+ * - none / unverified: no trustworthy baseline, or a legacy baseline the current local content
+ *   cannot vouch for.
+ */
+export type BaselineProvenance = "confirmed" | "persisted_verified" | "unverified" | "none";
+
+/**
  * 文件哈希管理器
  * 负责管理文件路径与哈希值的映射关系,存储在 localStorage 中
+ *
+ * 两张表职责严格分离（阶段 B 核心不变量）：
+ * - hashMap: 本地磁盘当前内容的哈希缓存，启动扫描 / 扫描结果只允许写入这里；
+ * - syncHashMap: 已同步可信基线，只允许在服务端确认、远端落盘或内容相等核验时写入。
+ * 启动扫描绝不允许把本地算出的哈希直接复制成可信基线。
+ *
+ * The two tables have strictly separate duties (stage-B invariant):
+ * - hashMap: cache of the content currently on disk; startup/local scans may only write here;
+ * - syncHashMap: trusted sync baseline, written only when the server confirms, remote content
+ *   lands on disk, or content equality is verified. Scans must never promote themselves.
  */
 export class FileHashManager {
   private plugin: FastSync;
   private hashMap: Map<string, HashCache> = new Map();
   private syncHashMap: Map<string, string> = new Map(); // path -> baseHash
+  /** 服务端确认过的基线路径；升级自旧版时缺失，只能按内容相等自证 */
+  /** Paths whose baseline was confirmed by the server; absent for legacy data (equality-only) */
+  private confirmedPaths: Set<string> = new Set();
   private storageKey: string;
   private syncStorageKey: string;
+  private confirmedStorageKey: string;
   private isInitialized: boolean = false;
   // 脏标记 + 防抖落盘：高频单条写入（下载/Ack 路径）不再逐条同步整表 JSON.stringify，
   // 避免高频写 localStorage 阻塞主线程导致界面白屏
@@ -39,6 +69,7 @@ export class FileHashManager {
     // (与 local_storage_manager.ts getInternalKey 的修复同理)，历史键迁移见 loadFromStorage
     this.storageKey = `fns-fileHashMap`;
     this.syncStorageKey = `fns-syncHashMap`;
+    this.confirmedStorageKey = `fns-syncHashMapConfirmed`;
     this.debouncedFlush = debounce(() => this.flush(), 500);
     this.mirror = new LocalStateFileMirror(plugin, "fileHashMap.json");
     this.syncMirror = new LocalStateFileMirror(plugin, "syncHashMap.json");
@@ -91,6 +122,13 @@ export class FileHashManager {
         hasRestoredSync = true;
       }
     }
+    // 确认来源表单独恢复：旧版没有这张表，所有旧基线一律按“需内容相等自证”处理
+    // Restore the confirmation table separately: legacy installs lack it, so every old baseline
+    // is treated as needing an equality check before it can be trusted.
+    this.loadConfirmedFromStorage();
+    if (hasRestoredSync && this.syncHashMap.size > 0) {
+      dump(`FileHashManager: ${this.confirmedPaths.size} of ${this.syncHashMap.size} baselines are server-confirmed`);
+    }
 
     // 2. 恢复本地最新计算哈希缓存表 (hashMap)
     const loaded = this.loadFromStorage();
@@ -113,25 +151,33 @@ export class FileHashManager {
       await this.buildFileHashMap();
     }
 
-    // 3. 数据平滑迁移：全新用户或旧版插件升级用户 (syncHashMap 尚未创建但 hashMap 已有历史数据)
+    // 3. 阶段 B 核心不变量：启动扫描（hashMap）绝不复制为可信基线。
+    // 旧实现会在首次启动/旧版升级时把整个扫描结果迁移进 syncHashMap，等于把“本地磁盘当前
+    // 内容”冒充成“服务端确认过的已同步基线”；已有内容的库首次接入远端同名库时，远端修改
+    // 会因此被直接覆盖。现在宁可让这些条目显示为“无基线”，交给相等内容自动核验或首次对齐。
+    // Stage-B invariant: the startup scan (hashMap) is never promoted to a trusted baseline. The
+    // old migration copied every scanned hash into syncHashMap on first install / upgrade, which
+    // turned "current local content" into a fake "server-confirmed baseline" and let a remote
+    // modify silently overwrite an existing local note on first attach. Such paths now have no
+    // baseline until equality is verified or the user aligns them.
     this.syncBaselineRestoredFromPersisted = hasRestoredSync;
-    if (!hasRestoredSync) {
-      dump("FileHashManager: sync baseline is empty, migrating from local hash cache...");
-      for (const [path, cache] of this.hashMap.entries()) {
-        // #205：迁移是给"从未同步过"的文件伪造基线，而空文件恰恰是探测拦截的反例——
-        // 新设备上 Obsidian 自动创建的空白日记若被伪造成基线，首次同步会绕过探测，
-        // 把空内容上传覆盖服务端当天日记。空文件不伪造基线，留给探测逻辑处理
-        // #205: the migration fabricates a baseline for never-synced files, but an empty file is
-        // exactly the case the #205 probe must intercept — if Obsidian's auto-created empty daily
-        // note got a fabricated baseline on a new device, the first sync would bypass the probe
-        // and overwrite the server copy. Empty files get no fabricated baseline; the probe handles them
-        if (cache.size === 0) continue;
-        this.syncHashMap.set(path, cache.hash);
-      }
-      this.saveSyncToStorage();
-    }
 
     this.isInitialized = true;
+  }
+
+  private loadConfirmedFromStorage(): void {
+    this.confirmedPaths.clear();
+    try {
+      const raw = this.plugin.app.loadLocalStorage(this.confirmedStorageKey) as string | null;
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as unknown;
+      if (!Array.isArray(parsed)) return;
+      for (const path of parsed) {
+        if (typeof path === "string" && this.syncHashMap.has(path)) this.confirmedPaths.add(path);
+      }
+    } catch (error) {
+      dump("FileHashManager: failed to load confirmed baseline provenance", error);
+    }
   }
 
   private loadSyncFromStorage(): boolean {
@@ -297,6 +343,35 @@ export class FileHashManager {
   }
 
   /**
+   * 判断某条基线在当前本地内容下是否可信（阶段 B）。
+   * 服务端确认过的基线直接可信；升级自旧版的持久化基线只有在本地内容仍等于记录值时才可信
+   * （“未偏离”）；不相等或没有记录即视为无可信基线。远端下行修改的覆盖保护必须用这个判断，
+   * 不能用裸的 getPathHash。
+   *
+   * Whether a baseline is trustworthy for the current local content (stage B). A
+   * server-confirmed baseline is trusted unconditionally; a legacy persisted baseline is trusted
+   * only while the local content still equals the recorded value; otherwise there is no trusted
+   * baseline. Remote-modify overwrite protection must use this, never raw getPathHash.
+   */
+  getVerifiedPathHash(path: string, localContentHash: string | null): string | null {
+    const stored = this.syncHashMap.get(path);
+    if (stored === undefined) return null;
+    if (this.confirmedPaths.has(path)) return stored;
+    return localContentHash !== null && localContentHash === stored ? stored : null;
+  }
+
+  /**
+   * 查询某条基线的来源，供诊断与测试使用。
+   * Report a baseline's provenance for diagnostics and tests.
+   */
+  getBaselineProvenance(path: string, localContentHash: string | null): BaselineProvenance {
+    const stored = this.syncHashMap.get(path);
+    if (stored === undefined) return "none";
+    if (this.confirmedPaths.has(path)) return "confirmed";
+    return localContentHash !== null && localContentHash === stored ? "persisted_verified" : "unverified";
+  }
+
+  /**
    * 内容仍是同步基准时，返回缓存记录的同步时 mtime（没有则 undefined）。
    * 打开 canvas 等只改写 mtime 不改内容时，用它代替被刷新的本地 mtime 上报（#256）
    * While the content is still the sync baseline, return the mtime cached at sync time (undefined if
@@ -323,6 +398,10 @@ export class FileHashManager {
     if (cacheContent) this.hashMap.set(path, { hash, mtime, size });
     else this.hashMap.delete(path);
     this.syncHashMap.set(path, hash);
+    // 只有服务端确认过的写入才能把基线标为 confirmed；扫描/本地缓存路径不经过这里
+    // Only server-confirmed writes reach here, so the baseline is marked confirmed. Scans and
+    // local-cache-only paths never call this method.
+    this.confirmedPaths.add(path);
     this.scheduleSave();
   }
 
@@ -346,6 +425,7 @@ export class FileHashManager {
   removeFileHash(path: string): void {
     const deleted1 = this.hashMap.delete(path);
     const deleted2 = this.syncHashMap.delete(path);
+    this.confirmedPaths.delete(path);
     if (deleted1 || deleted2) {
       this.scheduleSave();
     }
@@ -356,6 +436,7 @@ export class FileHashManager {
     for (const path of paths) {
       changed = this.hashMap.delete(path) || changed;
       changed = this.syncHashMap.delete(path) || changed;
+      this.confirmedPaths.delete(path);
     }
     if (changed) this.scheduleSave();
   }
@@ -471,6 +552,10 @@ export class FileHashManager {
 
     try {
       this.plugin.app.saveLocalStorage(this.syncStorageKey, data);
+      // 来源表只记录 confirmed 路径；旧版没有这张表时，重启后一律回退为“需内容相等自证”
+      // Persist only confirmed paths. A legacy install lacks this table, so after a restart all
+      // its entries fall back to equality-only verification.
+      this.plugin.app.saveLocalStorage(this.confirmedStorageKey, JSON.stringify(Array.from(this.confirmedPaths)));
     } catch (error) {
       dump("FileHashManager: failed to save sync baseline hash map to localStorage", error);
     }
@@ -488,13 +573,12 @@ export class FileHashManager {
    */
   async rebuildHashMap(): Promise<void> {
     dump("FileHashManager: manual hash map rebuild");
-    this.clearAll();
+    // 只重建“本地磁盘哈希缓存”。手动重建同样不是服务端确认，绝不生成可信基线。
+    // Rebuild only the local disk-hash cache. A manual rebuild is not a server confirmation and
+    // must never create trusted baselines.
+    this.hashMap.clear();
     await this.buildFileHashMap();
-    // 重新扫描完成后，将本地最新计算的哈希复制写入同步基准，作为当前最新的同步对齐基准
-    for (const [path, cache] of this.hashMap.entries()) {
-      this.syncHashMap.set(path, cache.hash);
-    }
-    this.saveSyncToStorage();
+    this.scheduleSave();
   }
 
   /**
@@ -503,6 +587,7 @@ export class FileHashManager {
   clearAll(): void {
     this.hashMap.clear();
     this.syncHashMap.clear();
+    this.confirmedPaths.clear();
     this.saveToStorage();
   }
 

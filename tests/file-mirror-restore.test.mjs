@@ -176,7 +176,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const plugin = makeFakePlugin(ls, files);
   const mgr = new FileHashManager(plugin);
   await mgr.initialize();
-  assert.equal(mgr.getPathHash("old/n.md"), "h-old", "旧 key 数据应可读到");
+  // 阶段 B：旧 key 迁移只恢复磁盘缓存，不伪造可信同步基线
+  // Stage B: legacy-key migration restores the disk cache only, never a trusted baseline
+  assert.equal(mgr.getValidHash("old/n.md", 1, 2), "h-old", "旧 key 数据应可读到");
+  assert.equal(mgr.getPathHash("old/n.md"), null, "旧 key 数据不冒充可信基线");
   assert.equal(ls.has("fns-fileHashMap"), true, "旧 key 数据应迁移到稳定 key");
 }
 
