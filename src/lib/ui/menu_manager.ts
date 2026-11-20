@@ -12,6 +12,7 @@ import FastSync from "../../main";
 import { StatusBarManager } from './status_bar_manager';
 import { SyncLogManager } from '../sync/sync_log_manager';
 import { conflictBackupPaths, readConflictMeta } from '../sync/operator_note';
+import { FireflyPostModal, CreateFireflyPostModal, CheckFireflyPostModal, activeMarkdownFile, triggerFireflyPublish } from '../../views/firefly-post-modal';
 
 
 
@@ -208,6 +209,52 @@ export class MenuManager {
         }
       },
     })
+
+    this.registerFireflyCommands()
+  }
+
+  /**
+   * 注册 Firefly 博客相关命令（属性面板 / 新建 / 合规检查 / 立即发布）。
+   * Register the Firefly blog commands.
+   */
+  private registerFireflyCommands() {
+    this.plugin.addCommand({
+      id: "firefly-edit-post-meta",
+      name: $("ui.firefly.cmd_edit_meta"),
+      checkCallback: (checking: boolean) => {
+        const file = activeMarkdownFile(this.plugin.app);
+        if (!file) return false;
+        if (!checking) new FireflyPostModal(this.plugin.app, this.plugin, file).open();
+        return true;
+      },
+    });
+
+    this.plugin.addCommand({
+      id: "firefly-create-post",
+      name: $("ui.firefly.cmd_create_post"),
+      callback: () => {
+        new CreateFireflyPostModal(this.plugin.app, this.plugin).open();
+      },
+    });
+
+    this.plugin.addCommand({
+      id: "firefly-check-post",
+      name: $("ui.firefly.cmd_check_post"),
+      checkCallback: (checking: boolean) => {
+        const file = activeMarkdownFile(this.plugin.app);
+        if (!file) return false;
+        if (!checking) new CheckFireflyPostModal(this.plugin.app, this.plugin, file).open();
+        return true;
+      },
+    });
+
+    this.plugin.addCommand({
+      id: "firefly-trigger-publish",
+      name: $("ui.firefly.cmd_trigger_publish"),
+      callback: () => {
+        void triggerFireflyPublish(this.plugin);
+      },
+    });
   }
 
 
@@ -779,11 +826,6 @@ export class MenuManager {
       return;
     }
     const file = this.plugin.app.vault.getFileByPath(normalizedPath);
-    if (!file) {
-      new Notice($("ui.conflict.missing_local", { path: normalizedPath }));
-      new NoteHistoryModal(this.plugin.app, this.plugin, normalizedPath).open();
-      return;
-    }
 
     try {
       const adapter = this.plugin.app.vault.adapter;
@@ -792,13 +834,26 @@ export class MenuManager {
       // 四类资源分流：附件/目录用选择框，笔记与文本配置用差异编辑器（设计稿 §5.3）
       // Route by kind: attachments/folders use a choice modal, notes and text settings use the
       // diff editor (design §5.3)
-      const { readUnifiedConflictMeta } = await import("../sync/conflict_store");
-      const { conflictSupportsDiffEditor } = await import("../sync/conflict_resolve");
-      const unified = await readUnifiedConflictMeta(this.plugin, normalizedPath);
-      const conflictKind = unified?.kind || (normalizedPath.endsWith(".md") ? "note" : "file");
-      if (!conflictSupportsDiffEditor(conflictKind)) {
+      const conflictStoreMod = await import("../sync/conflict_store");
+      const conflictResolveMod = await import("../sync/conflict_resolve");
+      const unified = typeof conflictStoreMod.readUnifiedConflictMeta === "function"
+        ? await conflictStoreMod.readUnifiedConflictMeta(this.plugin, normalizedPath)
+        : null;
+      const conflictKind = unified?.kind
+        || (normalizedPath.startsWith(".obsidian/") || normalizedPath.startsWith("_localStorage/")
+          ? "setting"
+          : (normalizedPath.endsWith(".md") ? "note" : "file"));
+      const supportsDiff = typeof conflictResolveMod.conflictSupportsDiffEditor === "function"
+        ? conflictResolveMod.conflictSupportsDiffEditor(conflictKind)
+        : (conflictKind === "note" || conflictKind === "setting");
+      if (!supportsDiff || (!file && conflictKind !== "setting" && unified)) {
         const { ConflictChoiceModal } = await import("../../views/conflict-choice-modal");
         new ConflictChoiceModal(this.plugin.app, this.plugin, normalizedPath).open();
+        return;
+      }
+      if (!file && conflictKind !== "setting") {
+        new Notice($("ui.conflict.missing_local", { path: normalizedPath }));
+        new NoteHistoryModal(this.plugin.app, this.plugin, normalizedPath).open();
         return;
       }
       // base 文件存在才算有共同祖先；空文件是“真实空 base”，不存在是“缺基线”，两者文案不同
@@ -815,14 +870,20 @@ export class MenuManager {
         serverContent = await adapter.read(remoteBackupPath);
       }
 
-      const localContent = await this.plugin.app.vault.read(file);
       if (conflictKind === "setting") {
+        let settingLocalContent = "";
+        if (normalizedPath.startsWith("_localStorage/")) {
+          const lsKey = normalizedPath.slice("_localStorage/".length);
+          settingLocalContent = window.localStorage.getItem(lsKey) || "";
+        } else if (await adapter.exists(normalizedPath)) {
+          settingLocalContent = await adapter.read(normalizedPath);
+        }
         const { ConflictResolveModal } = await import("../../views/conflict-resolve-modal");
         // TFile 不覆盖 .obsidian：用最小路径对象交给弹窗，写盘分支按 kind 走 adapter
         // TFile does not cover .obsidian: hand the modal a minimal path object; the write branch
         // uses the adapter for settings
-        const pseudoFile = { path: normalizedPath, stat: { ctime: 0, mtime: 0 } } as unknown as typeof file;
-        new ConflictResolveModal(this.plugin.app, this.plugin, pseudoFile, localContent, serverContent, baseContent,
+        const pseudoFile = { path: normalizedPath, stat: { ctime: 0, mtime: 0 } } as unknown as NonNullable<typeof file>;
+        new ConflictResolveModal(this.plugin.app, this.plugin, pseudoFile, settingLocalContent, serverContent, baseContent,
           unified?.serverHash || unified?.remoteHash || "", baseMissing, {
             kind: "setting",
             path: normalizedPath,
@@ -831,6 +892,14 @@ export class MenuManager {
           }).open();
         return;
       }
+
+      if (!file) {
+        new Notice($("ui.conflict.missing_local", { path: normalizedPath }));
+        new NoteHistoryModal(this.plugin.app, this.plugin, normalizedPath).open();
+        return;
+      }
+
+      const localContent = await this.plugin.app.vault.read(file);
 
       interface SyncLogItem {
         path?: string;

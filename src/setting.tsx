@@ -119,6 +119,10 @@ export interface PluginSettings {
   hashSyncLimit: number
   /** 已提示过大文件跳过同步的 "path|size" 记录，避免同一文件每轮同步重复弹通知 */
   largeFileNoticeShown: string[]
+  /** 是否在 Markdown 文件右键菜单显示 Firefly 博客快捷项 */
+  fireflyMenuEnabled: boolean
+  /** 新建 Firefly 经验分享文章的默认根目录 */
+  fireflyDefaultBlogDir: string
 }
 
 /**
@@ -183,6 +187,8 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   hashSyncLimitEnabled: false,
   hashSyncLimit: 50000,
   largeFileNoticeShown: [],
+  fireflyMenuEnabled: true,
+  fireflyDefaultBlogDir: "Blog",
 }
 
 export type TabId = "GENERAL" | "DISPLAY" | "SHORTCUT" | "REMOTE" | "SYNC" | "CLOUD" | "DEBUG"
@@ -538,6 +544,28 @@ export class SettingTab extends PluginSettingTab {
         }),
     )
     this.setDescWithBreaks(set.lastElementChild as HTMLElement, $("setting.debug.update_source_desc"))
+
+    // ── 博客 / Firefly ──────────────────────────────────────────────
+    new Setting(set).setName($("setting.general.firefly_section")).setHeading().setClass("fast-note-sync-settings-tag")
+
+    new Setting(set).setName($("setting.general.firefly_menu")).setClass("fns-setting-item-checkbox").addToggle((toggle) =>
+      toggle.setValue(this.plugin.settings.fireflyMenuEnabled !== false).onChange(async (value) => {
+        this.plugin.settings.fireflyMenuEnabled = value
+        await this.plugin.saveSettings()
+      }),
+    )
+    this.setDescWithBreaks(set.lastElementChild as HTMLElement, $("setting.general.firefly_menu_desc"))
+
+    new Setting(set).setName($("setting.general.firefly_blog_dir")).addText((text) =>
+      text
+        .setPlaceholder("Blog")
+        .setValue(this.plugin.settings.fireflyDefaultBlogDir || "Blog")
+        .onChange(async (value) => {
+          this.plugin.settings.fireflyDefaultBlogDir = value.trim() || "Blog"
+          await this.plugin.saveSettings()
+        }),
+    )
+    this.setDescWithBreaks(set.lastElementChild as HTMLElement, $("setting.general.firefly_blog_dir_desc"))
 
     new Setting(set).setName($("setting.support.title")).setHeading().setClass("fast-note-sync-settings-tag")
 

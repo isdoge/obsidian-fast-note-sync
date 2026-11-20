@@ -1,5 +1,16 @@
 # 更新日志
 
+## v2.6.5
+> *2026/11/20*
+
+### ✨ 新增
+
+- **博客发布（Firefly）**: 新增 Astro Firefly 博客写作与自动发布配套支持（4 条命令 + Markdown 文件右键菜单入口）：
+  - **设置 Firefly 文章属性与封面**：可视化编辑并校验 `title`、锁定 `slug`（`experience/<分类>/<短名>`）、`published`/`updated`（自动去除 YAML 日期引号以适配 Astro `z.date()`）、`category`、`tags`、`description`、`draft`、`scope`、`type: share`，支持从同目录 `./assets/` 预览选择封面或从库内其它位置自动复制导入；
+  - **新建 Firefly 经验分享文章**：按标准写作模板与当天合法日期一键创建文章，杜绝遗留 `YYYY-MM-DD` 占位符导致构建中断；
+  - **发布前合规检查与一键修复**：支持将正文中的 `![[wiki图片]]` 与跨目录图片一键汇聚到同目录 `./assets/` 并改写链接，公开前检测并支持一键清理 `AUTHOR-REVIEW` 审阅块、`obsidian://` 链接与作者取材索引；
+  - **立即发布到 Firefly 博客**：调用服务端客户端安全接口触发 Git 子目录同步发布并轮询展示远端 `post-receive` 部署回执。
+
 ## v2.6.4
 > *2026/11/20*
 

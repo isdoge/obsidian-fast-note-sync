@@ -148,6 +148,27 @@ export interface ApiResponse<T = unknown> {
     data: T;
 }
 
+/** 服务端 Git 同步公开状态（不含仓库地址与凭据） */
+export interface GitSyncPublicStatus {
+    id: number;
+    vault: string;
+    branch: string;
+    targetSubdir: string;
+    isEnabled: boolean;
+    lastSyncTime?: string;
+    lastStatus: number;
+    lastMessage: string;
+    updatedAt?: string;
+}
+
+/** 服务端通用结果包装 */
+export interface ApiResult<T = unknown> {
+    ok: boolean;
+    status: number;
+    message: string;
+    data?: T;
+}
+
 /**
  * 统一的 HTTP API 服务类
  */
@@ -994,6 +1015,60 @@ export class HttpApiService {
             throw e;
         } finally {
             window.clearTimeout(timeoutId);
+        }
+    }
+
+    /**
+     * 查询当前 vault 的 Git / Firefly 同步状态（不含仓库地址与凭据）
+     * GET /api/git-sync/status?vault=...
+     */
+    async getGitSyncStatus(vault?: string): Promise<ApiResult<GitSyncPublicStatus[]>> {
+        const params = new URLSearchParams({ vault: vault || this.plugin.settings.vault });
+        const endpoint = `/api/git-sync/status?${params.toString()}`;
+        try {
+            const { status, json } = await this.request(endpoint, { method: "GET" });
+            const res = json as ApiResponse<GitSyncPublicStatus[]> | null;
+            const list = Array.isArray(res?.data)
+                ? res.data
+                : (res?.data && Array.isArray((res.data as { list?: GitSyncPublicStatus[] }).list)
+                    ? (res.data as { list: GitSyncPublicStatus[] }).list
+                    : []);
+            return {
+                ok: status === 200 && this.isSuccess(json),
+                status,
+                message: res?.message || (status === 200 ? "" : `HTTP ${status}`),
+                data: list,
+            };
+        } catch (e) {
+            dumpError("getGitSyncStatus error:", e);
+            return { ok: false, status: 0, message: e instanceof Error ? e.message : String(e), data: [] };
+        }
+    }
+
+    /**
+     * 立即触发当前 vault 的 Git / Firefly 同步与发布
+     * POST /api/git-sync/trigger
+     */
+    async triggerGitSync(vault?: string, configId?: number): Promise<ApiResult<unknown>> {
+        const endpoint = `/api/git-sync/trigger`;
+        try {
+            const { status, json } = await this.request(endpoint, {
+                method: "POST",
+                body: JSON.stringify({
+                    vault: vault || this.plugin.settings.vault,
+                    configId: configId || 0,
+                }),
+            });
+            const res = json as ApiResponse<unknown> | null;
+            return {
+                ok: status === 200 && this.isSuccess(json),
+                status,
+                message: res?.message || (status === 200 ? "" : `HTTP ${status}`),
+                data: res?.data,
+            };
+        } catch (e) {
+            dumpError("triggerGitSync error:", e);
+            return { ok: false, status: 0, message: e instanceof Error ? e.message : String(e) };
         }
     }
 }
