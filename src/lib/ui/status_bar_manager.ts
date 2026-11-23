@@ -113,7 +113,13 @@ export class StatusBarManager {
     let icon = "sync";
 
     if (limits.readOnly) {
-      labels.push($("ui.mode.status_token_readonly"));
+      // 只缺部分写权限时不能说成「令牌只读」；与菜单顶部的权限提示保持同一口径
+      // A token missing only some write bits is not read-only; mirror the menu banner's wording
+      if (limits.missingWrite.length > 0 && !caps?.readOnly) {
+        labels.push($("ui.mode.token_missing_write", { perms: limits.missingWrite.join(", ") }));
+      } else {
+        labels.push($("ui.mode.status_token_readonly"));
+      }
       tooltips.push($("ui.mode.token_readonly_desc"));
       icon = "lock";
     }

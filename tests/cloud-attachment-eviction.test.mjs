@@ -113,6 +113,7 @@ assert.equal(reloaded.isEvicted('img/full-size.png'), false, 'switching vault cl
 // ---------------------------------------------------------------------------
 const helperState = { present: true, events: [], readbackThrows: false, trashThrows: false, localBytes: new Uint8Array([1, 2, 3]), remoteBytes: new Uint8Array([1, 2, 3]), info: null };
 const evictionEvents = { record: 0, remove: 0 };
+const evictionState = { usable: true };
 class HttpApiService {
   async getFileInfo() { return helperState.info; }
   async getFileContentForVerification() {
@@ -180,8 +181,12 @@ function makePlugin() {
       addIgnoredFile: () => helperState.events.push('ignore'),
       removeIgnoredFile: () => helperState.events.push('unignore'),
       cloudAttachmentEviction: {
-        record: async () => { evictionEvents.record++; helperState.events.push('record'); },
+        record: async () => {
+          if (!evictionState.usable) throw new Error('Cloud attachment eviction journal is unavailable');
+          evictionEvents.record++; helperState.events.push('record');
+        },
         remove: async () => { evictionEvents.remove++; helperState.events.push('rollback'); },
+        get isUsable() { return evictionState.usable; },
       },
     },
   };
@@ -197,6 +202,7 @@ function resetHelper({ remoteBytes = new Uint8Array([1, 2, 3]), readbackThrows =
   helperState.info = { path: 'a.png', size, mtime: 2e12, contentHash: 'content-hash' };
   evictionEvents.record = 0;
   evictionEvents.remove = 0;
+  evictionState.usable = true;
 }
 
 // 2a. Full byte mismatch: keep the local file, never journal or trash it
@@ -250,6 +256,17 @@ function resetHelper({ remoteBytes = new Uint8Array([1, 2, 3]), readbackThrows =
   assert.ok(helperState.events.indexOf('record') < helperState.events.indexOf('trash'));
   assert.ok(helperState.events.includes('rollback'), 'failed move rolls the eviction record back');
   assert.equal(evictionEvents.remove, 1);
+}
+
+// 2f. Corrupt journal: cleanup is refused, the local file stays and nothing is reported
+{
+  resetHelper();
+  evictionState.usable = false;
+  const { plugin, file } = makePlugin();
+  assert.equal(await maybeAutoDeleteUploadedAttachment(plugin, file, 'content-hash'), false);
+  assert.equal(helperState.present, true, 'an unusable journal keeps the local file');
+  assert.equal(evictionEvents.record, 0, 'no eviction is recorded');
+  assert.ok(!helperState.events.includes('trash'), 'nothing is moved to the bin');
 }
 
 // ---------------------------------------------------------------------------
@@ -311,7 +328,7 @@ const scanModules = {
   '../../views/confirm-modal': { ConfirmModal: class ConfirmModal {} },
 };
 
-function makeScanPlugin(trackedPaths, localFiles, evictedPaths) {
+function makeScanPlugin(trackedPaths, localFiles, evictedPaths, { evictionUsable = true } = {}) {
   const forgotten = [];
   const sent = [];
   const tasks = () => ({ needUpload: 0, needModify: 0, needSyncMtime: 0, needDelete: 0, needConflict: 0, completed: 0, failed: 0 });
@@ -365,7 +382,7 @@ function makeScanPlugin(trackedPaths, localFiles, evictedPaths) {
     isSyncBaselineModeEnabled: () => false,
     cloudAttachmentEviction: {
       initialize: async () => undefined,
-      isUsable: true,
+      isUsable: evictionUsable,
       isEvicted: (p) => evictedPaths.has(p),
       forget: async (paths) => { forgotten.push(...paths); },
     },
@@ -406,6 +423,55 @@ const operator = loadScanModule('src/lib/sync/operator.ts', scanModules);
   const fileSync = sent.find(entry => entry.action === 'FileSync');
   const delPaths = Array.from(fileSync.payload.delFiles ?? [], item => item.path);
   assert.deepEqual(delPaths, ['img/user-deleted.png']);
+}
+
+// 3c. Unusable journal: no attachment deletion is reported at all this round
+{
+  const { plugin, sent, forgotten } = makeScanPlugin(
+    ['img/evicted.png', 'img/user-deleted.png', 'note.md'],
+    [],
+    new Set(['img/evicted.png']),
+    { evictionUsable: false },
+  );
+  await operator.handleSync(plugin, true);
+  const fileSync = sent.find(entry => entry.action === 'FileSync');
+  assert.ok(fileSync, 'a FileSync payload is sent');
+  assert.deepEqual(Array.from(fileSync.payload.delFiles ?? [], item => item.path), [],
+    'an unusable journal suppresses every attachment deletion');
+  const noteSync = sent.find(entry => entry.action === 'NoteSync');
+  assert.ok(Array.from(noteSync?.payload?.delNotes ?? [], item => item.path).includes('note.md'),
+    'notes are unaffected: the journal only guards attachment deletes');
+  assert.deepEqual(forgotten, [], 'records are not touched while the journal is unusable');
+}
+
+// 3d. Corrupt journal on disk: load marks it unusable and the real scan stays fail-closed
+{
+  const corruptDisks = new Map([[journalPath, '{ this is not valid json']]);
+  const corruptAdapter = {
+    exists: async (p) => corruptDisks.has(p),
+    read: async (p) => {
+      if (!corruptDisks.has(p)) throw new Error(`missing ${p}`);
+      return corruptDisks.get(p);
+    },
+    write: async (p, data) => { corruptDisks.set(p, data); },
+    remove: async (p) => { corruptDisks.delete(p); },
+    rename: async (from, to) => {
+      if (!corruptDisks.has(from)) throw new Error(`missing ${from}`);
+      corruptDisks.set(to, corruptDisks.get(from));
+      corruptDisks.delete(from);
+    },
+  };
+  const corruptPlugin = { settings: { api: 'http://server.example', vault: 'vault-a' }, app: { vault: { adapter: corruptAdapter } } };
+  const corruptJournal = new CloudAttachmentEviction(corruptPlugin);
+  await corruptJournal.initialize();
+  assert.equal(corruptJournal.isUsable, false, 'a corrupt journal file is unusable');
+  assert.equal(corruptJournal.isEvicted('img/evicted.png'), false);
+  await assert.rejects(
+    corruptJournal.record({ path: 'img/evicted.png', sha256: 'sha-a', size: 3, evictedAt: clock++ }),
+    /unavailable/,
+    'cleanup cannot be journaled on a corrupt journal',
+  );
+  assert.equal(corruptDisks.get(journalPath), '{ this is not valid json', 'the corrupt file is left untouched');
 }
 
 console.log('PASS: cloud attachment eviction journal guards local cleanup and offline delete reporting');

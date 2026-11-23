@@ -160,4 +160,60 @@ const jwt = [jwtHeader, jwtPayload, 'c2lnbmF0dXJl'].join('.');
   assert.ok(exported.includes('Bearer [redacted]'));
 }
 
+// 9. `name: value` colon forms, auth schemes, whole Cookie header and URL userinfo
+{
+  const secret = (n) => ['s3cr', 'et-', n, '-', Math.random().toString(36).slice(2)].join('');
+  const colon = secret('colon');
+  const apiToken = secret('apitoken');
+  const xApi = secret('xapi');
+  const xApiUpper = secret('xapiupper');
+  const fullWidth = secret('fullwidth');
+  const jsonToken = secret('json');
+  const basic = secret('basic');
+  const tokenScheme = secret('scheme');
+  const lowerScheme = secret('lower');
+  const cookie1 = secret('cookie1');
+  const cookie2 = secret('cookie2');
+  const userinfo = secret('userinfo');
+
+  const text = [
+    `token: ${colon}`,
+    `apiToken: ${apiToken}`,
+    `x-api-token: ${xApi}`,
+    `X-Api-Token: ${xApiUpper}`,
+    `token：${fullWidth}`,
+    `{"x-api-token":"${jsonToken}"}`,
+    `Authorization: Basic ${basic}`,
+    `Authorization: Token ${tokenScheme}`,
+    `authorization: token ${lowerScheme}`,
+    `Cookie: sid=${cookie1}; theme=${cookie2}`,
+    `https://user:${userinfo}@host.example/x`,
+  ].join('\n');
+  const redacted = redactDiagnosticText(text);
+  for (const value of [colon, apiToken, xApi, xApiUpper, fullWidth, jsonToken, basic, tokenScheme, lowerScheme, cookie1, cookie2, userinfo]) {
+    assert.ok(!redacted.includes(value), `secret must be redacted: ${value}`);
+  }
+  assert.ok(redacted.includes(`token: [redacted]`), 'colon form is redacted');
+  assert.ok(redacted.includes(`apiToken: [redacted]`));
+  assert.ok(redacted.includes(`x-api-token: [redacted]`));
+  assert.ok(redacted.includes(`X-Api-Token: [redacted]`));
+  assert.ok(redacted.includes(`token：[redacted]`), 'full-width colon keeps its separator');
+  assert.ok(redacted.includes(`"x-api-token":"[redacted]"`), 'JSON field with a header-style key is redacted');
+  assert.ok(redacted.includes('Authorization: Basic [redacted]'), 'scheme name survives, credential does not');
+  assert.ok(redacted.includes('Authorization: Token [redacted]'));
+  assert.ok(redacted.includes('authorization: token [redacted]'));
+  assert.ok(!redacted.includes('[redacted] ' + basic), 'scheme credential must not follow the placeholder');
+  assert.ok(redacted.includes('Cookie: [redacted]'), 'the whole Cookie header is replaced');
+  assert.ok(!redacted.includes('theme='), 'later cookies in the header do not survive');
+  assert.ok(redacted.includes('https://user:[redacted]@host.example/x'), 'URL userinfo password is replaced');
+
+  // Bearer keeps its existing behaviour
+  const bearerRedacted = redactDiagnosticText(`Authorization: Bearer ${bearer}`);
+  assert.ok(bearerRedacted.includes('Authorization: Bearer [redacted]'));
+
+  // Object keys written like headers are redacted too
+  const objectOut = formatDiagnostic({ 'x-api-token': xApi, headers: { 'X-Api-Token': xApiUpper } });
+  assert.ok(!objectOut.includes(xApi) && !objectOut.includes(xApiUpper));
+}
+
 console.log('PASS: diagnostic logs redact credentials, bodies and binary while keeping Error stacks');

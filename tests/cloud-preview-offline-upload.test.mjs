@@ -33,7 +33,7 @@ function load(rel, modules = {}) {
   const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
   const module = { exports: {} };
   vm.runInNewContext(code, {
-    module, exports: module.exports, console, Map, Set, WeakMap, URLSearchParams, TextEncoder,
+    module, exports: module.exports, console, Map, Set, WeakMap, URLSearchParams, URL, TextEncoder,
     crypto: globalThis.crypto, AbortController,
     window: { setTimeout: () => 1, clearTimeout: noop },
     require(id) {
