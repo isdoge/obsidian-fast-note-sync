@@ -408,4 +408,18 @@ const operator = loadScanModule('src/lib/sync/operator.ts', scanModules);
   assert.deepEqual(delPaths, ['img/user-deleted.png']);
 }
 
+// 3c. Unreadable journal (corrupt JSON -> isUsable=false): no attachment deletion is reported at
+// all this round (fail-closed), while note deletions are unaffected.
+{
+  const { plugin, sent } = makeScanPlugin(['img/user-deleted.png', 'notes/gone.md'], [], new Set());
+  plugin.cloudAttachmentEviction.isUsable = false;
+  plugin.cloudAttachmentEviction.initialize = async () => { throw new Error('corrupt eviction journal JSON'); };
+  await operator.handleSync(plugin, true);
+  const fileSync = sent.find(entry => entry.action === 'FileSync');
+  const noteSync = sent.find(entry => entry.action === 'NoteSync');
+  assert.ok(fileSync, 'FileSync is still sent');
+  assert.deepEqual(Array.from(fileSync.payload.delFiles ?? [], item => item.path), [], 'an unusable journal suppresses every attachment deletion');
+  assert.deepEqual(Array.from(noteSync?.payload.delNotes ?? [], item => item.path), ['notes/gone.md'], 'note deletions are unaffected by the eviction journal');
+}
+
 console.log('PASS: cloud attachment eviction journal guards local cleanup and offline delete reporting');
