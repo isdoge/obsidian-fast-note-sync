@@ -173,6 +173,24 @@ export interface ApiResult<T = unknown> {
 }
 
 /**
+ * 判断请求 URL 是否与配置的 API 地址同源（协议 + 主机 + 端口）。
+ * requestUrl 拿不到最终 URL，无法事后校验跳转，只能限定请求本身同源。
+ *
+ * Whether a request URL shares the origin (scheme + host + port) of the configured API base.
+ * requestUrl exposes no final URL, so redirects cannot be checked after the fact; only
+ * same-origin requests are allowed instead.
+ */
+export function isSameOriginRequestUrl(requestUrl: string, apiBase: string): boolean {
+    try {
+        const request = new URL(requestUrl);
+        const base = new URL(apiBase);
+        return request.protocol === base.protocol && request.host === base.host;
+    } catch {
+        return false;
+    }
+}
+
+/**
  * 统一的 HTTP API 服务类
  */
 export class HttpApiService {
@@ -557,7 +575,21 @@ export class HttpApiService {
         const timer = window.setTimeout(() => controller.abort(), 15000);
         try {
             if (this.plugin.settings.networkLibrary === "requestUrl") {
-                const response = await requestUrl({ url, method: "GET", headers, throw: false });
+                // requestUrl 不返回最终 URL，也不接受 signal：无法事后校验跳转，只能对请求 URL 本身
+                // 做同源限定，并用 Promise.race 自行加超时。非同源时按「校验失败、保留本地文件」处理。
+                // requestUrl exposes no final URL and accepts no signal: redirects cannot be checked
+                // afterwards, so only same-origin request URLs are allowed and a manual timeout is
+                // raced in. A cross-origin request URL is treated as a failed verification.
+                if (!isSameOriginRequestUrl(url, this.plugin.settings.api)) {
+                    throw new Error("Cross-origin attachment read-back blocked: requestUrl cannot verify redirects");
+                }
+                const requestPromise = requestUrl({ url, method: "GET", headers, throw: false });
+                const timeoutPromise = new Promise<never>((_, reject) => {
+                    const abort = () => reject(new Error("Network request timeout while reading back an attachment"));
+                    controller.signal.addEventListener("abort", abort, { once: true });
+                    if (controller.signal.aborted) abort();
+                });
+                const response = await Promise.race([requestPromise, timeoutPromise]);
                 if (response.status !== 200) {
                     throw new Error(`HTTP ${response.status}: Failed to read back attachment`);
                 }
