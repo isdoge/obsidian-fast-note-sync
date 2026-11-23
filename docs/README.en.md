@@ -42,7 +42,7 @@ This repository is an independently maintained edition of [haierkeys/obsidian-fa
 - **Versioning**: Incremented independently starting from v2.5.0 and no longer tracks upstream.
 - **Plugin ID Unchanged**: Remains `fast-note-sync`. Overwrite the files in `.obsidian/plugins/fast-note-sync` with the releases from this repository and all existing settings and sync state will carry over—no reconfiguration needed.
 - **Installation & Updates**: Distributed exclusively via [GitHub Releases](https://github.com/isdoge/obsidian-fast-note-sync/releases) in this repository and not listed on the Obsidian Community Plugins store. One-click upgrades inside the plugin download from this repository's Releases; new-version notifications are pushed by the connected server and point to this repository when paired with this repository's server. Obsidian's built-in "Check for updates" checks the upstream version in the store—do not use it to update this plugin.
-- **Companion Server**: Use alongside the independently maintained [isdoge/fast-note-sync-service](https://github.com/isdoge/fast-note-sync-service). Basic sync requires server v3.7.0 or later; the full sync-baseline protocol requires v3.8.4 or later; the Firefly blog auto-publish assistant requires v3.8.5 or later. Some fixes take effect only when both the plugin and the server are updated.
+- **Companion Server**: Use alongside the independently maintained [isdoge/fast-note-sync-service](https://github.com/isdoge/fast-note-sync-service). Basic sync requires server v3.7.0 or later; the full sync-baseline protocol requires v3.8.4 or later; the Firefly blog auto-publish assistant requires v3.8.5 or later; token permission notices require v3.8.8 or later. Some fixes take effect only when both the plugin and the server are updated.
 - **Preserved**: Original author credits and sponsorship links remain unchanged.
 - **Feedback**: Please report issues and feature requests in this repository's [Issues](https://github.com/isdoge/obsidian-fast-note-sync/issues), not in the upstream repository.
 
@@ -84,6 +84,7 @@ The following items have been removed in this independently maintained edition. 
     > ⚠️ **Note**: Requires v1.4+, Server v1.0+. Currently in the testing phase, please use with caution.
 - 🛂 **Sync Exclusions & Whitelist**:
     - Provides sync exclusion and whitelist functions, allowing you to customize your own sync strategies.
+    - Skips system junk files by default (`.DS_Store`, `Thumbs.db`, `desktop.ini`, and files beginning with `._`). Add them to the whitelist if you need to sync them.
 - 🔄 **Multi-device Sync**:
     - Supports Mac, Windows, Android, iOS, and other platforms.
     - Sync state has a file mirror, allowing it to be restored if the system clears mobile local storage, without falling back to a full sync.
@@ -100,6 +101,7 @@ The following items have been removed in this independently maintained edition. 
     - One-click upgrades download from this repository's GitHub Releases.
 - ☁️ **Cloud Preview of Attachments**:
     - Provides online attachment preview, meaning attachments do not need to be synced to the local device, thereby saving local storage space.
+    - "Delete After Upload" compares local files with the complete server content before cleaning them up; files are kept locally if they do not match.
     > Combined with the plugin's exclusion settings, you can directly use a third-party repository (like WebDav) for certain types of attachments without uploading via the server.
 - 🗒️ **Sync Logs**:
     - Provides sync log functionality, making it easy to view detailed information for each synchronization.
@@ -109,6 +111,13 @@ The following items have been removed in this independently maintained edition. 
 - 🧬 **Sync Baseline Protocol, Conflict Alignment & Batch Handling**:
     - Every write is verified against a server-issued revision token. Conflicts carry the exact remote version, are listed in one panel, and can be resolved in bulk (local / remote / keep both); binary settings and attachments are transferred and restored byte-exactly.
     > ⚠️ **Note**: The full baseline protocol requires server v3.8.4+; older servers fall back to compatibility mode automatically.
+- 🔒 **Read-only / Manual Sync Modes & Sync Protection**:
+    - Switch "Read-only Sync Mode" and "Manual Sync Mode" with one click from the command palette or status bar menu and see the current mode. These switches only affect this device and do not change the server token's permissions.
+    - Automatically checks the token's actual permissions and explains why when the token is read-only, lacks some write permissions, or does not allow access to the current vault.
+    - "Mass file disappearance" protection: if a full scan finds that most synced files are missing locally (for example, the vault folder was moved or a disk is not mounted), deletions are not reported to the server for that round and a notice appears.
+    > ⚠️ **Note**: Token permission notices require server v3.8.8+. Read-only devices follow the server: when another device deletes a file, the file with the same name on this device is also deleted, even if it has changes that have not been uploaded.
+- 🧹 **Automatic Debug Log Redaction**:
+    - Debug logs automatically hide tokens, passwords, note contents, local paths, system usernames, server addresses, and vault names when recorded and copied, so you can paste them directly when reporting issues.
 - **Cloud Backup**: Provides cloud backup functionality to protect your note data from being lost.
 
 ### Recovery of remotely deleted files
