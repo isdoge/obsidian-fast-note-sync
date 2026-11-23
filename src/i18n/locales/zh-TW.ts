@@ -622,6 +622,7 @@ export default {
   "ui.notice.protobuf_fallback": "Protobuf 訊息解碼失敗，本次工作階段已切換為 JSON；儲存的 Protobuf 設定未變更。",
   "ui.notice.hash_limit_exceeded": "已達到單次雜湊計算上限 (${limit})，本次跳過 ${skipped} 個檔案，將在下次同步時繼續處理；也可以調高上限或關閉限制。",
   "ui.notice.hash_timeout": "本輪有 ${count} 個檔案因雜湊計算逾時而略過，受影響類型的同步時間已保留，將於下次同步重試。",
+  "ui.notice.mass_delete_guard": "偵測到本機掃描異常：基線中 ${deleted}/${total} 個檔案同時消失，已中止本輪刪除同步以免誤刪遠端資料；若確認要清空，請分批刪除或重設同步基線。",
   "ui.conflict.list_count": "${count} 個檔案衝突",
   "ui.conflict.list_empty": "目前沒有發生衝突的筆記",
   "ui.conflict.unaligned_tag": "待對齊：本機有內容、無共同基線",

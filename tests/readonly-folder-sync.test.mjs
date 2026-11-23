@@ -33,6 +33,8 @@ function load(file, extraRequire) {
       }, { get: (t, k) => t[k] ?? noop });
       if (id.includes("sync_log_manager")) return { SyncLogManager: { getInstance: () => ({ addOrUpdateLog: noop, addLog: noop }) } };
       if (id.includes("i18n")) return { $: k => k };
+      // Mass-delete guard is not the subject of this test; keep it inert.
+      if (id === "./mass_delete_guard") return { evaluateMassDeleteGuard: () => ({ triggered: false, confirmedBaselineCount: 0, pendingDeleteCount: 0, missingRatio: 0, minBaselineCount: 100, ratioThreshold: 0.8 }) };
       return {};
     },
   });

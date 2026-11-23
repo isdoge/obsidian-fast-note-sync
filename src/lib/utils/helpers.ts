@@ -229,6 +229,35 @@ export const stringifyRules = function (rules: SyncRule[]): string {
 }
 
 /**
+ * 内置系统垃圾文件判定（按路径段精确匹配，不做子串匹配）。
+ * Built-in system junk detection (exact path segments, never substring matching).
+ *
+ * - 任一路径段（大小写不敏感）等于 `.DS_Store`、`Thumbs.db`、`desktop.ini`；
+ * - 任一路径段以 `._` 开头（macOS AppleDouble 资源分叉文件，如 `._photo.png`、`folder/._note.md`）。
+ *
+ * `my._notes.md`、`foo._.bar.md` 这类正常文件名不会被误伤；`.tmp` 等用户可能有意同步的名称
+ * 也不在默认排除内。isPathExcluded 先检查用户白名单并在命中时直接放行，因此白名单优先级更高。
+ *
+ * - Any segment (case-insensitive) equals `.DS_Store`, `Thumbs.db`, or `desktop.ini`;
+ * - Any segment starts with `._` (macOS AppleDouble resource-fork files).
+ *
+ * Normal names such as `my._notes.md` or `foo._.bar.md` are untouched, and names like `.tmp`
+ * that a user might sync intentionally are not excluded by default. isPathExcluded checks the
+ * user whitelist first and returns early, so an explicit whitelist entry always wins.
+ */
+const SYSTEM_JUNK_SEGMENT_NAMES = new Set([".ds_store", "thumbs.db", "desktop.ini"])
+export const isSystemJunkPath = function (path: string): boolean {
+  if (!path) return false
+  const segments = path.replace(/\\/g, "/").split("/")
+  for (const segment of segments) {
+    if (!segment) continue
+    if (segment.startsWith("._")) return true
+    if (SYSTEM_JUNK_SEGMENT_NAMES.has(segment.toLowerCase())) return true
+  }
+  return false
+}
+
+/**
  * 检查路径是否被排除 (针对笔记和附件)
  */
 export const isPathExcluded = function (path: string, plugin: FastSync): boolean {
@@ -243,6 +272,13 @@ export const isPathExcluded = function (path: string, plugin: FastSync): boolean
     if (whitelist.some((rule) => isPathMatch(normalizedPath, rule.pattern, rule.caseSensitive))) {
       return false
     }
+  }
+
+  // 内置系统垃圾文件（.DS_Store / Thumbs.db / desktop.ini / AppleDouble `._*`）。
+  // 按路径段精确匹配，白名单已在上方优先放行。
+  // Built-in system junk files; segment-exact matching, and the whitelist above already won.
+  if (isSystemJunkPath(normalizedPath)) {
+    return true
   }
 
   // 1. 检查扩展名排除

@@ -182,6 +182,8 @@ const operator = loadModule("src/lib/sync/operator.ts", (id) => {
   if (id === "../../views/confirm-modal") return { ConfirmModal: class {} };
   if (id === "../storage/baseline_scope") return baselineScope;
   if (id === "./conflict_store") return conflictStore;
+  // Mass-delete guard is not the subject of this test; keep it inert.
+  if (id === "./mass_delete_guard") return { evaluateMassDeleteGuard: () => ({ triggered: false, confirmedBaselineCount: 0, pendingDeleteCount: 0, missingRatio: 0, minBaselineCount: 100, ratioThreshold: 0.8 }) };
   if (id === "../../main") return {};
   throw new Error(`Unexpected require in operator: ${id}`);
 });
