@@ -60,6 +60,7 @@ const MAX_ENTRIES = 300;
 const MAX_MESSAGE_LENGTH = 800;
 const PERSIST_DEBOUNCE_MS = 2000;
 const MAX_ROUND_SUMMARIES = 5;
+const MAX_READONLY_SKIP_PATHS_PER_ROUND = 100;
 
 let plugin: FastSync | null = null;
 let mirrorPath = "";
@@ -71,6 +72,7 @@ let roundSummaries: string[] = [];
 let round: RoundStats | null = null;
 let connectionVaultMismatchCount = 0;
 let vaultMismatchLogged = false;
+let readonlySkipPathsThisRound = 0;
 let persistTimer: number | null = null;
 let writeInFlight = false;
 let writePending = false;
@@ -310,6 +312,7 @@ export function beginSyncRound(type: string, readonly: boolean, initSync: boolea
         scanErrors: 0,
         scanErrorPaths: [],
     };
+    readonlySkipPathsThisRound = 0;
 }
 
 /** 扫描上报条数与无基线条数 / Reported scan counts and no-baseline subset */
@@ -346,9 +349,15 @@ export function recordScanFileError(path: string | undefined, error: unknown): v
     }
 }
 
-/** 只读轮里服务端要求上传但被拦下的条目 / Upload requested by the server but blocked in a read-only round */
+/**
+ * 只读轮里服务端要求上传但被拦下的条目：总数全部累加，带路径的条目每轮最多写 100 条。
+ * Upload requests blocked in a read-only round: always count, but write at most 100 pathed
+ * entries per round (the same cap applies when no round is active).
+ */
 export function recordUploadSkippedReadOnly(path: string): void {
     if (round) round.uploadSkippedReadOnly++;
+    if (readonlySkipPathsThisRound >= MAX_READONLY_SKIP_PATHS_PER_ROUND) return;
+    readonlySkipPathsThisRound++;
     append("info", "UploadSkippedReadOnly", "Read-only round: upload request skipped", path);
 }
 
