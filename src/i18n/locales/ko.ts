@@ -647,7 +647,7 @@ export default {
   "ui.notice.protobuf_fallback": "Protobuf 메시지 디코딩에 실패하여 이 세션에서는 JSON으로 전환했습니다. 저장된 Protobuf 설정은 변경되지 않았습니다.",
   "ui.notice.hash_limit_exceeded": "단일 해시 계산 상한(${limit})에 도달하여 이번에 ${skipped}개 파일을 건너뛰었습니다. 다음 동기화에서 계속 처리됩니다. 상한을 높이거나 제한을 비활성화할 수도 있습니다.",
   "ui.notice.hash_timeout": "해시 계산 시간 초과로 파일 ${count}개를 건너뛰었습니다. 해당 유형의 동기화 시간을 유지하여 다음 동기화에서 다시 시도합니다.",
-  "ui.notice.mass_delete_guard": "로컬 스캔 이상 감지: 기준선의 파일 ${deleted}/${total}개가 동시에 사라졌습니다. 원격 데이터가 실수로 삭제되는 것을 막기 위해 이번 삭제 동기화를 중단했습니다. 의도한 삭제라면 소량씩 나누어 삭제하거나 동기화 기준선을 재설정하세요.",
+  "ui.notice.mass_delete_guard": "로컬 스캔 이상 감지: 기준선의 파일 ${deleted}/${total}개가 동시에 사라졌습니다. 원격 데이터가 실수로 삭제되는 것을 막기 위해 이번 삭제 동기화를 중단했습니다. 의도한 삭제라면 소량씩 나누어 삭제하거나 \"동기화 캐시 지우기\" 명령을 실행한 뒤 다시 동기화하세요.",
   "ui.conflict.list_count": "${count}개 파일 충돌",
   "ui.conflict.list_empty": "현재 충돌하는 노트가 없습니다",
   "ui.conflict.unaligned_tag": "정렬 대기: 로컬에 내용 있음, 공통 기준 없음",
