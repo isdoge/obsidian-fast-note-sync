@@ -100,7 +100,13 @@ function append(level: DiagLevel, kind: string, message: unknown, path?: string)
     };
     if (path) entry.path = clean(path);
     entries.push(entry);
-    if (entries.length > MAX_ENTRIES) entries.splice(0, entries.length - MAX_ENTRIES);
+    if (entries.length > MAX_ENTRIES) {
+        // 超限时先淘汰最早的一条 info，没有 info 才淘汰最早的一条（warn / error 同等对待）
+        // Evict the oldest info first; only when none remains, evict the oldest entry
+        // (warn and error are treated equally and outlive info)
+        const infoIndex = entries.findIndex(item => item.level === "info");
+        entries.splice(infoIndex >= 0 ? infoIndex : 0, 1);
+    }
     schedulePersist();
 }
 
