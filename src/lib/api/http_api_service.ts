@@ -523,6 +523,66 @@ export class HttpApiService {
         return res.data;
     }
 
+    /**
+     * 只读拉取远端附件的原始字节，用于「删除本地副本」前的完整内容校验。
+     * 仅接受明确且合理的已声明大小；任何异常由调用方按「校验失败、保留本地文件」处理。
+     *
+     * Read-only fetch of an attachment's raw bytes, used to fully verify the remote copy before
+     * deleting the local one. Only an explicit, sane declared size is accepted; failures are
+     * handled by the caller as "verification failed, keep the local file".
+     */
+    async getFileContentForVerification(path: string, expectedSize: number): Promise<ArrayBuffer> {
+        if (!Number.isFinite(expectedSize) || expectedSize <= 0 || expectedSize > 20 * 1024 * 1024) {
+            throw new Error(`Refusing to read back attachment with unverifiable size: ${expectedSize}`);
+        }
+
+        const params = new URLSearchParams({
+            vault: this.plugin.settings.vault,
+            path: path,
+            pathHash: hashContent(path).toString(),
+            isRecycle: "false"
+        });
+        const base = (this.plugin.runApi || this.plugin.settings.api).replace(/\/+$/, "");
+        const url = addRandomParam(`${base}/api/file?${params.toString()}`);
+        const headers: Record<string, string> = {
+            "x-client": CLIENT_TYPE,
+            "x-client-name": encodeURIComponent(this.plugin.getClientName()),
+            "x-client-version": (this.plugin.manifest as { version?: string }).version || ""
+        };
+        if (this.plugin.settings.apiToken) {
+            headers["Authorization"] = `Bearer ${this.plugin.settings.apiToken}`;
+        }
+
+        const controller = new AbortController();
+        const timer = window.setTimeout(() => controller.abort(), 15000);
+        try {
+            if (this.plugin.settings.networkLibrary === "requestUrl") {
+                const response = await requestUrl({ url, method: "GET", headers, throw: false });
+                if (response.status !== 200) {
+                    throw new Error(`HTTP ${response.status}: Failed to read back attachment`);
+                }
+                return response.arrayBuffer;
+            }
+
+            const response = await nativeFetch(url, {
+                method: "GET",
+                headers,
+                redirect: "follow",
+                signal: controller.signal
+            });
+            if (response.url && response.url !== url
+                && !isAllowedRedirect(url, response.url, this.plugin.settings.allowedRedirectDomains)) {
+                throw new Error("Unsafe cross-domain redirect blocked while reading back an attachment");
+            }
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: Failed to read back attachment`);
+            }
+            return await response.arrayBuffer();
+        } finally {
+            window.clearTimeout(timer);
+        }
+    }
+
     /** Existing read-only endpoints; never use sync/check requests, which can mutate state. */
     async getRetryQueueState(kind: "note" | "file", path: string): Promise<{ path: string; contentHash: string } | null> {
         const controller = new AbortController();

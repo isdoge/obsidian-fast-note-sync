@@ -1,7 +1,7 @@
 import { TFolder, TFile, normalizePath } from "obsidian";
 
 import { receiveFileUpload, receiveFileSyncUpdate, receiveFileSyncDelete, receiveFileSyncMtime, receiveFileSyncChunkDownload, receiveFileSyncEnd, checkAndUploadAttachments, receiveFileSyncRename, receiveFileRenameAck, receiveFileUploadAck, receiveFileDeleteAck, isPluginUnloading, sweepStalledDownloadSessions, invalidateFileDownloads, isAttachmentUploadActive } from "./operator_file";
-import { hashContent, hashContentAsync, dump, isPathExcluded, isFolderSyncPathExcluded, configIsPathExcluded, getConfigSyncCustomDirs, generateUUID, showSyncNotice, isLargeBinarySyncRisk, describeBinarySyncLimit, hashFileAsync, formatFileSize, yieldToMain, getPluginDir } from "../utils/helpers";
+import { hashContent, hashContentAsync, dump, dumpError, isPathExcluded, isFolderSyncPathExcluded, configIsPathExcluded, getConfigSyncCustomDirs, generateUUID, showSyncNotice, isLargeBinarySyncRisk, describeBinarySyncLimit, hashFileAsync, formatFileSize, yieldToMain, getPluginDir } from "../utils/helpers";
 import { receiveConfigSyncModify, receiveConfigUpload, receiveConfigSyncMtime, receiveConfigSyncDelete, receiveConfigSyncEnd, configAllPaths, receiveConfigSyncClear, receiveConfigModifyAck, receiveConfigDeleteAck } from "./operator_config";
 import { receiveNoteSyncModify, receiveNoteUpload, receiveNoteSyncMtime, receiveNoteSyncDelete, receiveNoteSyncEnd, receiveNoteSyncRename, receiveNoteModifyAck, receiveNoteRenameAck, receiveNoteDeleteAck, conflictBackupPaths } from "./operator_note";
 import { SyncMode, SnapFile, SnapFolder, SyncEndData, PathHashFile, NoteSyncData, FileSyncData, ConfigSyncData, FolderSyncData } from "../utils/types";
@@ -1196,6 +1196,34 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       commitScannedHashes(plugin.scannedNoteHashes, (m) => plugin.fileHashManager.bulkSetFromScanned(m));
       commitScannedHashes(plugin.scannedFileHashes, (m) => plugin.fileHashManager.bulkSetFromScanned(m));
       dump(`[ScanPerf] Scan done: ${hashComputeCount}/${MAX_HASH_PER_CYCLE} hashes computed, notes=${notes.length}, files=${files.length}, folders=${folders.length}`);
+
+      // 设备本地驱逐日志：「上传后删除本地」的附件不能被当作离线删除上报服务端。
+      // 日志不可读时本轮不上报任何附件离线删除（宁可少删，也不能误删云端/其它设备副本）。
+      // Device-local eviction journal: attachments removed locally after upload must never be
+      // reported as offline deletions. If the journal is unreadable, no attachment deletion is
+      // reported this round — better to under-report than destroy remote/other-device copies.
+      const eviction = plugin.cloudAttachmentEviction;
+      let evictionUsable = false;
+      if (eviction) {
+        try {
+          await eviction.initialize();
+          evictionUsable = eviction.isUsable;
+        } catch (error) {
+          evictionUsable = false;
+          dumpError("Cloud attachment eviction journal initialization failed", error);
+        }
+        if (evictionUsable) {
+          // 附件重新出现在本地（用户下载回来或新建）：清除驱逐记录，恢复正常的删除语义
+          // The attachment reappeared locally (downloaded back or recreated): drop the eviction record
+          const reappeared = list
+            .filter(file => !(file instanceof TFolder) && eviction.isEvicted(file.path))
+            .map(file => file.path);
+          if (reappeared.length > 0) await eviction.forget(reappeared);
+        } else {
+          dumpError("Cloud attachment eviction journal unavailable; offline attachment deletions are not reported this round");
+        }
+      }
+
       if (truncatedNoteCount > 0) plugin.syncState.truncatedSyncFields?.add("lastNoteSyncTime");
       if (truncatedFileCount > 0) plugin.syncState.truncatedSyncFields?.add("lastFileSyncTime");
       const truncatedTotal = truncatedNoteCount + truncatedFileCount;
@@ -1224,6 +1252,10 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
           const baselineConfirmed = plugin.fileHashManager.getBaselineProvenance?.(path, null) === "confirmed";
           if (baselineConfirmed) confirmedBaselineTotal++;
           if (!localPathsSet.has(path)) {
+            // 设备本地驱逐（云附件上传后删除）不是用户删除；日志不可读时一律不上报附件删除
+            // Device-local eviction (cloud attachment deleted after upload) is not a user delete;
+            // an unreadable journal means no file deletion is reported at all
+            if (!path.endsWith(".md") && eviction && (!evictionUsable || eviction.isEvicted(path))) continue;
             if (baselineConfirmed) confirmedMissingCount++;
             const item = { path: path, pathHash: hashContent(path) };
             if (path.endsWith(".md")) {
@@ -1302,6 +1334,9 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
           if (isPathExcluded(path, plugin)) continue;
           if (plugin.syncState.conflictedPaths.has(path)) continue;
           if (!localPathsSet.has(path)) {
+            // 被设备本地驱逐的附件不是「服务端缺少」，不进入 missingFiles 上报
+            // An intentionally evicted attachment is not "missing on the server"
+            if (!path.endsWith(".md") && eviction && (!evictionUsable || eviction.isEvicted(path))) continue;
             const item = { path: path, pathHash: hashContent(path) };
             if (path.endsWith(".md")) {
               missingNotes.push(item);

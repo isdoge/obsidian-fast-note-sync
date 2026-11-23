@@ -36,7 +36,7 @@ export class DebugLogModal extends Modal {
             .addButton(btn => btn
                 .setButtonText($("ui.log.copy_all"))
                 .onClick(async () => {
-                    const logs = DebugLogManager.getInstance().getLogs().join("\n");
+                    const logs = DebugLogManager.getInstance().getRedactedLogs().join("\n");
                     await navigator.clipboard.writeText(logs);
                 })
             )

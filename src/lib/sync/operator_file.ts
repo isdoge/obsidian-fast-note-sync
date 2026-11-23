@@ -771,6 +771,131 @@ export const fileRename = async function (file: TAbstractFile, oldfile: string, 
 }
 
 
+/** 删除本地副本前完整校验的最大附件大小（含中间字节）/ Largest attachment fully verified before local deletion */
+const MAX_VERIFIABLE_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+
+/** 全量 SHA-256（不能使用带采样的滚动哈希）/ Full SHA-256 (the sampled rolling hash is insufficient) */
+async function sha256Hex(buffer: ArrayBuffer): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", buffer);
+  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * 「附件云预览 - 上传后删除本地」的安全清理：
+ * 1. path / size / mtime / contentHash 仍与刚上传的内容一致；
+ * 2. 大小已知且在 20MB 内，读回远端原始字节并用 SHA-256 核对与本地刚读取的字节完全一致；
+ * 3. 先把驱逐记录持久化到设备本地日志，再移入回收站；移动失败回滚记录。
+ * 任何一步不满足都保留本地文件；没有驱逐日志时不清理（无法保证扫描不误报删除）。
+ *
+ * Safe cleanup for "cloud preview — delete local after upload":
+ * 1. path / size / mtime / contentHash still describe the content just uploaded;
+ * 2. size is known and within 20MB, remote bytes are read back and their SHA-256 must equal the
+ *    local bytes read moments ago;
+ * 3. the device-local eviction record is persisted before the file is moved to the bin, and
+ *    rolled back if the move fails.
+ * Any failed step keeps the local file; without the journal nothing is deleted, because the
+ * offline scan could not tell this cleanup apart from a user deletion.
+ */
+export async function maybeAutoDeleteUploadedAttachment(plugin: FastSync, file: TFile, contentHash: string): Promise<boolean> {
+  if (!plugin.settings.cloudPreviewEnabled || !plugin.settings.cloudPreviewAutoDeleteLocal) return false;
+  const ext = file.path.substring(file.path.lastIndexOf(".")).toLowerCase();
+  if (plugin.settings.cloudPreviewTypeRestricted && !FileCloudPreview.isRestrictedType(ext)) return false;
+
+  await sleep(2000);
+  if (isPluginUnloading) return false;
+
+  try {
+    const apiService = new HttpApiService(plugin);
+    const serverInfo = await apiService.getFileInfo(file.path);
+    if (!serverInfo) return false;
+
+    // 核对 path、size、mtime 是否一致；还要求服务端内容哈希就是本次上传的内容，
+    // 大小和时间相同的旧记录不能当作"已收到"（haierkeys/fast-note-sync-service#512）；
+    // 服务端历史数据可能存秒级 mtime（#461），比较前归一化为毫秒
+    // Besides path, size and mtime the server must hold the content just uploaded; an older
+    // record with the same size and mtime does not prove the upload arrived
+    // (haierkeys/fast-note-sync-service#512); legacy rows may hold second-scale mtime
+    // (#461), normalize before comparing
+    if (!(serverInfo.path === file.path &&
+      serverInfo.size === file.stat.size &&
+      normalizeServerTimestamp(serverInfo.mtime) === file.stat.mtime &&
+      serverInfo.contentHash === contentHash)) {
+      dump(`Cloud Preview: Auto delete skip, info mismatch for ${file.path}`, { server: serverInfo, local: file.stat });
+      return false;
+    }
+
+    const size = file.stat.size;
+    if (size <= 0 || size > MAX_VERIFIABLE_ATTACHMENT_BYTES) {
+      dump(`Cloud Preview: Auto delete skip, unverifiable size for ${file.path}`, size);
+      return false;
+    }
+
+    const eviction = plugin.cloudAttachmentEviction;
+    if (!eviction) {
+      dump(`Cloud Preview: Auto delete skip, eviction journal unavailable for ${file.path}`);
+      return false;
+    }
+
+    if (plugin.app.vault.getFileByPath(file.path) !== file) return false;
+    const mtime = file.stat.mtime;
+
+    // 远端拉回失败 / 大小未知 / 哈希不一致：一律取消清理、保留本地文件
+    // Remote read-back failure, unknown size or hash mismatch: cancel cleanup and keep the local file
+    let remoteBytes: ArrayBuffer;
+    try {
+      remoteBytes = await apiService.getFileContentForVerification(file.path, size);
+    } catch (error) {
+      dump(`Cloud Preview: Auto delete skip, remote read-back failed for ${file.path}`, error);
+      return false;
+    }
+    if (remoteBytes.byteLength !== size) {
+      dump(`Cloud Preview: Auto delete skip, remote size mismatch for ${file.path}`, remoteBytes.byteLength);
+      return false;
+    }
+
+    const localBytes = await plugin.app.vault.readBinary(file);
+    if (localBytes.byteLength !== size || file.stat.mtime !== mtime || file.stat.size !== size) {
+      dump(`Cloud Preview: Auto delete skip, local file changed during verification for ${file.path}`);
+      return false;
+    }
+    if (plugin.app.vault.getFileByPath(file.path) !== file) return false;
+
+    const [localSha256, remoteSha256] = await Promise.all([sha256Hex(localBytes), sha256Hex(remoteBytes)]);
+    if (localSha256 !== remoteSha256) {
+      dump(`Cloud Preview: Auto delete skip, full content hash mismatch for ${file.path}`);
+      return false;
+    }
+
+    dump(`Cloud Preview: Auto delete verified file: ${file.path}`);
+    plugin.addIgnoredFile(file.path);
+    let recorded = false;
+    try {
+      // 先记账再清理：崩溃/重扫时扫描不会把这次设备本地清理当作离线删除
+      // Journal first, then clean up: a crash/rescan cannot mistake this for an offline delete
+      await eviction.record({ path: file.path, sha256: localSha256, size, evictedAt: Date.now() });
+      recorded = true;
+      await vaultDelete(plugin.app.vault, file);
+      plugin.fileHashManager.removeFileHash(file.path);
+      return true;
+    } finally {
+      // 移动失败（本地文件仍在）或后续步骤失败：撤销驱逐记录，避免它继续屏蔽真实的用户删除
+      // Move failed (local file still exists) or a later step failed: roll the record back so it
+      // cannot keep suppressing a genuine user deletion
+      if (recorded && plugin.app.vault.getFileByPath(file.path)) {
+        try {
+          await eviction.remove(file.path);
+        } catch (error) {
+          dumpError(`Cloud Preview: failed to roll back eviction record for ${file.path}`, error);
+        }
+      }
+      plugin.removeIgnoredFile(file.path);
+    }
+  } catch (error) {
+    dump(`Cloud Preview: Auto delete failed to fetch info for ${file.path}`, error);
+    return false;
+  }
+}
+
 /**
  * 接收服务端文件上传指令 (FileUpload)
  */
@@ -1047,52 +1172,11 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
       content = null;
       if (!uploadState.cancelled && sessionIdToPathMap.has(data.sessionId)) armUploadAckTimeout(data.path, plugin);
 
-      // 上传完成后，如果开启了附件云预览 - 上传后删除，则删除本地附件
+      // 上传完成后，如果开启了附件云预览 - 上传后删除，则在完整校验与记账后清理本地附件
+      // After upload, "cloud preview — delete local" removes the local attachment only after
+      // full content verification and the eviction record is persisted
       if (plugin.settings.cloudPreviewEnabled && plugin.settings.cloudPreviewAutoDeleteLocal) {
-        const ext = file.path.substring(file.path.lastIndexOf(".")).toLowerCase();
-        const isRestricted = FileCloudPreview.isRestrictedType(ext);
-
-        // 如果开启了类型限制，则仅删除受限类型 (图片/音频/视频/PDF)
-        // 如果未开启类型限制，则全部删除
-        if (plugin.settings.cloudPreviewTypeRestricted && !isRestricted) {
-          return;
-        }
-
-        void (async () => {
-          await sleep(2000);
-          if (isPluginUnloading) return;
-          try {
-            const apiService = new HttpApiService(plugin);
-            const serverInfo = await apiService.getFileInfo(file.path);
-
-            if (serverInfo) {
-              // 核对 path、size、mtime 是否一致；还要求服务端内容哈希就是本次上传的内容，
-              // 大小和时间相同的旧记录不能当作"已收到"（haierkeys/fast-note-sync-service#512）；
-              // 服务端历史数据可能存秒级 mtime（#461），比较前归一化为毫秒
-              // Besides path, size and mtime the server must hold the content just uploaded; an older
-              // record with the same size and mtime does not prove the upload arrived
-              // (haierkeys/fast-note-sync-service#512); legacy rows may hold second-scale mtime
-              // (#461), normalize before comparing
-              if (serverInfo.path === file.path &&
-                serverInfo.size === file.stat.size &&
-                normalizeServerTimestamp(serverInfo.mtime) === file.stat.mtime &&
-                serverInfo.contentHash === contentHash) {
-                dump(`Cloud Preview: Auto delete verified file: ${file.path}`);
-                plugin.addIgnoredFile(file.path);
-                try {
-                  await vaultDelete(plugin.app.vault, file);
-                  plugin.fileHashManager.removeFileHash(file.path);
-                } finally {
-                  plugin.removeIgnoredFile(file.path);
-                }
-              } else {
-                dump(`Cloud Preview: Auto delete skip, info mismatch for ${file.path}`, { server: serverInfo, local: file.stat });
-              }
-            }
-          } catch (e) {
-            dump(`Cloud Preview: Auto delete failed to fetch info for ${file.path}`, e);
-          }
-        })();
+        void maybeAutoDeleteUploadedAttachment(plugin, file, contentHash);
       }
     } catch (e) {
       dump(`Upload process error for ${data.path}`, e);

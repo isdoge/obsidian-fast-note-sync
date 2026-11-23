@@ -34,6 +34,7 @@ function load(rel, modules = {}) {
   const module = { exports: {} };
   vm.runInNewContext(code, {
     module, exports: module.exports, console, Map, Set, WeakMap, URLSearchParams, TextEncoder,
+    crypto: globalThis.crypto, AbortController,
     window: { setTimeout: () => 1, clearTimeout: noop },
     require(id) {
       if (id.includes("baseline_scope")) return { buildBaselineFields: (plugin, kind, path) => { if (kind === "folder" || !plugin) return {}; const m = kind === "setting" ? plugin.configHashManager : plugin.fileHashManager; const b = m && typeof m.getPathHash === "function" ? m.getPathHash(path) : null; return b !== null && b !== undefined ? { baseHash: b } : { baseHashMissing: true }; }, buildDeleteBaselineFields: () => ({}), baselineFieldsFromDeleteRecord: () => ({}), computeRemoteScope: () => "scope", parseScopedState: () => ({ state: { scope: "scope", revisions: {}, pendingDeletes: {} }, scopeChanged: false }), serializeScopedState: (state) => JSON.stringify(state) };
@@ -42,8 +43,13 @@ function load(rel, modules = {}) {
       if (id === "obsidian") return {
         TFile, normalizePath: p => p, Platform: { isMobile: false },
         requestUrl: async ({ url }) => {
-          const answer = server.get(new URL(url).searchParams.get("path"));
+          const parsed = new URL(url);
+          const answer = server.get(parsed.searchParams.get("path"));
           if (answer instanceof Error) throw answer;
+          // Full read-back used before deleting the local copy; the fixture's local bytes are [1, 2, 3]
+          if (parsed.pathname === "/api/file") {
+            return { status: 200, json: null, arrayBuffer: new Uint8Array([1, 2, 3]).buffer };
+          }
           return { status: 200, json: answer };
         },
       };
@@ -88,6 +94,8 @@ function fixture(files, baselines = {}) {
     concurrencyLimiter: { waitForSlot: async () => true, releaseSlot: noop, touch: noop },
     syncState: { activeSyncContext: null, pendingFilePushPageIndex: new Map() },
     isIgnoredFile: () => false, addIgnoredFile: noop, removeIgnoredFile: noop,
+    // Delete-after-upload now journals the eviction before touching the local file
+    cloudAttachmentEviction: { record: async () => {}, remove: async () => {} },
     fileSyncTasks: { failed: 0 }, totalChunksToUpload: 0, uploadedChunksCount: 0, recordSyncCompleted: noop,
   };
   return { plugin, sent };
