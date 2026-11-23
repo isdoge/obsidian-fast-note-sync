@@ -209,6 +209,7 @@ function restartStalledSync(plugin: FastSync, intervalId?: number): void {
       : 'Sync stalled waiting for server pages; restarting a new round', timestamp: Date.now()
   });
   plugin.syncState.activeSyncContext = null;
+  plugin.syncRoundReadonly = false; // 停滞重启：本轮已中止 / Round aborted: clear the read-only snapshot
   plugin.syncTypeCompleteCount = 0;
   plugin.resetSyncTasks();
   plugin.syncPageStateMap.clear();
@@ -367,6 +368,7 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, _sync
 
     if (totalFailed === 0 && hashTimeoutCount === 0) plugin.retryQueue?.completeScan(plugin.progressTracker.getActiveTypes());
     plugin.syncState.activeSyncContext = null; // 同步完成，清空活跃的上下文 / Sync completed, reset the active context
+    plugin.syncRoundReadonly = false; // 本轮结束，清空只读快照 / Round finished: clear the read-only snapshot
     plugin.isSyncing = false;
     plugin.syncTypeCompleteCount = 0;
     plugin.resetSyncTasks();
@@ -768,6 +770,14 @@ async function receiveSyncEndWrapper(data: unknown, plugin: FastSync, type: "not
   } else {
     dump(`[Sync] Skipping initial ACK for type: ${trackerType} because total tasks is 0 or initial ACK already sent`);
   }
+
+  // 所有类型的 SyncEnd 都到齐才清除入口只读快照：多类型轮次里若按单个 SyncEnd 清除，
+  // 后续类型（如配置）的 NeedPush 就会绕过本轮快照。
+  // Clear the entry read-only snapshot only once every type has sent SyncEnd: clearing on a
+  // single type's SyncEnd would let later types' NeedPush bypass the round snapshot.
+  if (plugin.noteSyncEnd && plugin.fileSyncEnd && plugin.folderSyncEnd && plugin.configSyncEnd) {
+    plugin.syncRoundReadonly = false;
+  }
 }
 
 /**
@@ -851,6 +861,10 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     // Read-only snapshot: the scan and send phases of this round use the value captured at
     // entry, so flipping the toggle mid-round cannot make one round half-new/half-old.
     const readonlyThisRound = !!plugin.settings.readonlySyncEnabled;
+    // 同时记到插件本轮状态上，供轮次内的接收端门禁（NeedPush 上传等）做 fail-closed 取或。
+    // Also record it on the plugin as this round's state, so receive-side gates inside the round
+    // (NeedPush uploads, etc.) can OR it fail-closed with the live setting.
+    plugin.syncRoundReadonly = readonlyThisRound;
     if (readonlyThisRound) {
       dump("Read-only mode: Proceeding with state gathering for remote-to-local sync.");
     }
@@ -1589,6 +1603,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     // clobber a newer session that has already taken over.
     if (plugin.syncState.activeSyncContext === context) {
       plugin.syncState.activeSyncContext = null; // 同步失败，清空上下文 / Sync failed, reset the context
+      plugin.syncRoundReadonly = false; // 出错即清空本轮只读快照 / Round failed: clear the read-only snapshot
       plugin.updateStatusBar($("ui.status.failed") || "Sync Failed");
       window.setTimeout(() => plugin.updateStatusBar(""), 10000);
     } else {
@@ -1602,6 +1617,10 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     if (plugin.syncState.activeSyncContext === null) {
       plugin.isSyncing = false;
       plugin.syncState.silentSync = false;
+      // 本轮已无活跃会话（提前返回/出错/已收尾）：清掉入口只读快照，避免影响下一轮
+      // No active session remains (early return / failure / already settled): clear the entry
+      // read-only snapshot so it cannot leak into the next round
+      plugin.syncRoundReadonly = false;
     }
   }
 };
@@ -1630,6 +1649,7 @@ export function cancelSync(plugin: FastSync): void {
   invalidateFileDownloads(plugin);
 
   plugin.syncState.activeSyncContext = null;
+  plugin.syncRoundReadonly = false; // 中止本轮：清空只读快照 / Round cancelled: clear the read-only snapshot
   plugin.syncTypeCompleteCount = 0;
   plugin.resetSyncTasks();
   plugin.syncPageStateMap.clear();

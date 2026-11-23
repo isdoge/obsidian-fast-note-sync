@@ -82,6 +82,15 @@ export default class FastSync extends Plugin {
   /** 同步会话运行时状态 / Sync-session runtime state */
   readonly syncState = new SyncState()
 
+  /**
+   * 本轮同步入口时的只读快照，供轮次内的接收端门禁与实时设置做 fail-closed 取或。
+   * 每轮开始时覆盖，轮次结束（SyncEnd/完成判定）、中止、出错时清除。
+   * Read-only snapshot captured at this round's entry, OR-ed fail-closed with the live
+   * setting by receive-side gates. Overwritten at each round start; cleared when the round
+   * ends (SyncEnd/completion), is cancelled, or fails.
+   */
+  syncRoundReadonly = false
+
   // ─── Sync page state tracking ───────────────────────────────────────────────
   /**
    * 追踪每个同步类型的当前下载分页状态

@@ -125,6 +125,7 @@ function makePlugin({
       vault: "v1", cloudPreviewEnabled: false, cloudPreviewTypeRestricted: true,
     },
     isSyncing: false, isSyncRequesting: false, currentSyncType: "incremental", syncTypeCompleteCount: 0,
+    syncRoundReadonly: false,
     expectedSyncCount: 3, totalFilesToDownload: 0, downloadedFilesCount: 0, totalChunksToDownload: 0,
     downloadedChunksCount: 0, totalChunksToUpload: 0, uploadedChunksCount: 0,
     noteSyncTasks: tasks(), fileSyncTasks: tasks(), folderSyncTasks: tasks(), configSyncTasks: tasks(),
@@ -142,6 +143,7 @@ function makePlugin({
     progressTracker: {
       reset: noop, recordHashProgress: noop, recordUploadComplete: noop,
       isTypeFullyDone: () => true, getOverallPct: () => 100, getDetailText: () => "", forceComplete: noop,
+      getActiveTypes: () => [],
     },
     localStorageManager: {
       getMetadata: (k) => meta.get(k) ?? 0, setMetadata: (k, v) => meta.set(k, v),
@@ -169,7 +171,7 @@ function makePlugin({
       isReady: () => false, getMtime: () => undefined, getAllPaths: () => [],
       isBaselineConfirmed: () => false, setFolderMtimes: noop, removeFolders: noop, flush: noop,
     },
-    retryQueue: { drainBeforeSync: async () => undefined, shouldSkipScanDelete: () => false, getRecoveryPaths: () => [] },
+    retryQueue: { drainBeforeSync: async () => undefined, shouldSkipScanDelete: () => false, getRecoveryPaths: () => [], completeScan: noop },
     isSyncBaselineModeEnabled: () => false,
     websocket: {
       ws: { readyState: 1, bufferedAmount: 0 }, isOpen: true,
@@ -316,6 +318,23 @@ const payloadFor = (sent, action) => sent.find((entry) => entry.action === actio
   assert.equal(notices.filter((n) => n.includes("ui.notice.mass_delete_guard")).length, 1, "the user is still warned");
   assert.equal(plugin.syncState.truncatedSyncFields.has("lastNoteSyncTime"), true, "note cursor is held");
   assert.equal(plugin.syncState.truncatedSyncFields.has("lastFileSyncTime"), true, "file cursor is held");
+}
+
+// ── 7. Round snapshot lifecycle: published at entry, cleared when the round ends ──
+{
+  let pluginRef;
+  const observed = [];
+  const made = makePlugin({
+    readonly: true, offlineDelete: true,
+    onSend: () => observed.push(pluginRef.syncRoundReadonly),
+  });
+  pluginRef = made.plugin;
+  await operator.handleSync(made.plugin, true);
+  assert.ok(observed.length > 0, "at least one sync type was sent");
+  assert.ok(observed.every((v) => v === true), "the send phase sees the entry read-only snapshot");
+  assert.equal(made.plugin.syncRoundReadonly, true, "snapshot stays published while the round is active");
+  operator.checkSyncCompletion(made.plugin);
+  assert.equal(made.plugin.syncRoundReadonly, false, "round completion clears the snapshot");
 }
 
 console.log("read-only note/file/config sync tests passed");

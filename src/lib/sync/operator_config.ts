@@ -473,9 +473,12 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
 
 export const receiveConfigUpload = async function (data: ReceivePathMessage, plugin: FastSync) {
     if (plugin.settings.configSyncEnabled == false) return;
-    // 只读端不响应服务端的配置上传请求，与笔记/附件一致（#275）
-    // A read-only device ignores the server's config upload requests, same as notes/attachments (#275)
-    if (plugin.settings.readonlySyncEnabled) {
+    // 只读端不响应服务端的配置上传请求，与笔记/附件一致（#275）；本轮入口快照与实时设置
+    // fail-closed 取或，轮次中途刚打开只读也要拦住。
+    // A read-only device ignores the server's config upload requests, same as notes/attachments
+    // (#275); OR the round's entry snapshot with the live setting fail-closed so read-only
+    // enabled mid-round still blocks.
+    if (plugin.syncRoundReadonly || plugin.settings.readonlySyncEnabled) {
         dump(`Read-only mode: Intercepted config upload request for ${data.path}`)
         plugin.recordSyncCompleted('setting', data.pageIndex)
         return
