@@ -29,6 +29,13 @@ interface VaultScopedRetryQueue {
   clear?(): void
 }
 
+interface VaultScopedEvictionJournal {
+  /** 当前远端作用域指纹 / Current remote-scope fingerprint */
+  currentScope?(): string
+  /** 按作用域清理本地驱逐记录 / Clear device-local eviction records for a scope */
+  clearScope?(scope?: string): void | Promise<void>
+}
+
 interface VaultScopedSyncState {
   conflictedPaths?: Set<string>
   newConflictedPathsThisRound?: Set<string>
@@ -49,6 +56,8 @@ export interface VaultNameSettingsOwner {
   configHashManager?: VaultScopedHashManager
   folderSnapshotManager?: VaultScopedHashManager
   retryQueue?: VaultScopedRetryQueue
+  /** 设备本地「云附件已驱逐」日志 / Device-local cloud-attachment eviction journal */
+  cloudAttachmentEviction?: VaultScopedEvictionJournal
   syncState?: VaultScopedSyncState
   pendingNoteModifies?: Map<string, string>
   pendingUploadHashes?: Map<string, string>
@@ -138,14 +147,22 @@ export async function clearVaultScopedSyncState(plugin: VaultNameSettingsOwner):
 
   // 旧库遗留的冲突/待对齐备份文件
   await plugin.clearVaultConflictBackups?.()
+
+  // 旧库的设备本地驱逐记录：按作用域清理，绝不把旧库附件状态带到新库
+  // Device-local eviction records of the old vault: clear by scope, never carry them into a new vault
+  await plugin.cloudAttachmentEviction?.clearScope?.()
 }
 
 export async function updateVaultName(plugin: VaultNameSettingsOwner, value: string): Promise<void> {
   if (value === plugin.settings.vault) return
 
+  // 切库前先记下旧作用域，用于清理该库的设备本地驱逐记录
+  // Capture the old scope before switching so its eviction records can be cleared
+  const previousEvictionScope = plugin.cloudAttachmentEviction?.currentScope?.()
   plugin.wsSettingChange = true
   plugin.settings.vault = value
   // 先清干净旧库状态，再重连；新库会走一次干净的首次同步，本地笔记与附件直接上传
+  if (previousEvictionScope) await plugin.cloudAttachmentEviction?.clearScope?.(previousEvictionScope)
   await clearVaultScopedSyncState(plugin)
   await plugin.saveAndReloadServices()
 }

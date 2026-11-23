@@ -13,6 +13,7 @@ import { ConfigHashManager } from "./lib/storage/config_hash_manager";
 import { RecycleBinModal } from "./views/recycle-bin-modal";
 import { FileCloudPreview } from "./lib/storage/file_cloud_preview";
 import { FileHashManager } from "./lib/storage/file_hash_manager";
+import { CloudAttachmentEviction } from "./lib/storage/cloud_attachment_eviction";
 import { DebugLogManager } from "./lib/utils/debug_log_manager";
 import { SyncLogManager } from "./lib/sync/sync_log_manager";
 import { DebugLogModal } from "./views/debug-log-modal";
@@ -68,6 +69,7 @@ export default class FastSync extends Plugin {
   localStorageManager: LocalStorageManager        // 本地存储管理器
   fileCloudPreview: FileCloudPreview              // 云端文件预览管理器
   folderSnapshotManager: FolderSnapshotManager    // 文件夹快照管理器
+  cloudAttachmentEviction: CloudAttachmentEviction // 设备本地云附件驱逐日志 / Device-local eviction journal
   statusBarManager: StatusBarManager              // 状态栏管理器
   idleSyncScheduler: IdleAutoSyncScheduler        // 空闲连接定时兜底同步 / Idle-connection fallback sync
   readonly progressTracker = new SyncProgressTracker() // 进度追踪器
@@ -611,12 +613,14 @@ export default class FastSync extends Plugin {
       this.fileHashManager = new FileHashManager(this)
       this.configHashManager = new ConfigHashManager(this)
       this.folderSnapshotManager = new FolderSnapshotManager(this)
+      this.cloudAttachmentEviction = new CloudAttachmentEviction(this)
       this.configManager = new ConfigManager(this)
 
       // 5. 并行初始化哈希和快照 (耗时任务)
       const initPromises: Promise<void>[] = [
         this.fileHashManager.initialize(),
-        this.folderSnapshotManager.initialize()
+        this.folderSnapshotManager.initialize(),
+        this.cloudAttachmentEviction.initialize()
       ]
       if (this.settings.configSyncEnabled) {
         initPromises.push(this.configHashManager.initialize())
