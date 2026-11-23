@@ -254,6 +254,30 @@ export class RetryQueue {
         return hash === e.baselineHash;
     }
 
+    /**
+     * 2.6.4–2.6.9 在离线期间落盘的条目没有版本令牌。重连确认基线模式后、发送前从管理器补一次；
+     * 只有管理器记录的内容哈希与条目基线一致时才采用，查不到则保持原样（随后由队列清理兜底）。
+     * Entries persisted offline by 2.6.4–2.6.9 carry no revision token. Once the connection confirms
+     * baseline mode, fill it from the manager before sending, but only when the manager's hash still
+     * matches the entry's recorded baseline; otherwise leave the entry unchanged.
+     */
+    private refillBaselineToken(e: RetryQueueEntry): void {
+        if (e.baselineRevision || this.plugin.isSyncBaselineModeEnabled?.() !== true) return;
+        const key = e.oldPath || e.path;
+        if (e.objectType === "folder") {
+            const revision = this.plugin.folderSnapshotManager?.getBaselineRevision?.(key) ?? "";
+            if (!revision) return;
+            e.baselineRevision = revision;
+            e.baselineMissing = false;
+        } else {
+            const confirmed = this.plugin.fileHashManager?.getConfirmedBaseline?.(key, null);
+            if (!confirmed || confirmed.hash !== e.baselineHash) return;
+            e.baselineRevision = confirmed.revision;
+            e.baselineMissing = false;
+        }
+        this.persist();
+    }
+
     private async safe(e: RetryQueueEntry): Promise<boolean> {
         if (!await this.localValid(e)) return false;
         if (this.excluded(e.objectType, e.path) || (e.oldPath && this.excluded(e.objectType, e.oldPath))) return false;
@@ -430,6 +454,7 @@ export class RetryQueue {
             // Recheck local state after HTTP yields. The send guard also checks identity after drain.
             if (!await this.localValid(e)) { this.remove(e); this.persist(); return; }
             if (generation !== this.generation || !this.connected() || !this.entries.includes(e)) return;
+            this.refillBaselineToken(e);
             if (this.active === e && e.attempts > 0) {
                 const action = `${e.objectType[0].toUpperCase() + e.objectType.slice(1)}${e.operation === "delete" ? "Delete" : "Rename"}`;
                 const guard = this.sendGuard(action, { path: e.path, oldPath: e.oldPath });
