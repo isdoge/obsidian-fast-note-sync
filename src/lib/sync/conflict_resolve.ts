@@ -23,7 +23,27 @@ export type ConflictResolveMode = "local" | "remote" | "both";
 export interface ConflictResolveResult {
   path: string;
   ok: boolean;
-  reason?: "new_edit" | "missing_local" | "missing_remote" | "unsupported" | "error";
+  reason?: "new_edit" | "missing_local" | "missing_remote" | "unsupported" | "readonly" | "error";
+}
+
+/**
+ * 冲突解决里的上行动作（条件删除 / 重推 / 条件提交）在只读模式下整体不执行。
+ * 判断口径 fail-closed：本轮入口快照或实时设置任一为只读即拦截（轮次外快照为 false，退化为实时设置）。
+ * 拦截必须发生在任何本地副作用之前，避免「本地已删除/已覆盖/冲突状态已清、远端却没发」的半截状态。
+ * 只在本地落远端内容、不改远端的动作（例如采用远端墓碑）不走这个判断。
+ *
+ * Uplink resolution actions (conditional delete / re-push / conditional submit) never run in
+ * read-only mode. The gate is fail-closed: either the round entry snapshot or the live setting
+ * blocks it (outside a round the snapshot is false and the live setting decides). It must fire
+ * before any local side effect so the local copy and conflict state can never diverge from the
+ * remote. Local-only actions that never change the remote are not gated.
+ */
+export function readonlyResolutionBlocked(plugin: FastSync): boolean {
+  return !!(plugin.syncRoundReadonly || plugin.settings.readonlySyncEnabled);
+}
+
+function readonlyResult(path: string): ConflictResolveResult {
+  return { path, ok: false, reason: "readonly" };
 }
 
 async function pickVisibleCopyPath(plugin: FastSync, path: string, suffix: string): Promise<string> {
@@ -104,6 +124,11 @@ async function resolveNote(plugin: FastSync, path: string, mode: ConflictResolve
       clearConflictState(plugin, path);
       return { path, ok: true };
     }
+    // 条件删除远端属于上行动作：只读下整体不执行（先于仓库操作与冲突状态清理）
+    // Conditional remote delete is an uplink: never run it in read-only mode (before any vault
+    // operation or conflict-state cleanup)
+    if (readonlyResolutionBlocked(plugin)) return readonlyResult(path);
+
     // 本地已删除：以本地为准 = 条件删除远端。基线必须用用户刚刚确认的远端状态
     // （serverHash/serverRevision），服务端据此原子核对后删除；沿用旧 baseHash 会 530 死循环。
     // Local deleted, keep local => conditionally delete the remote. The baseline must be the remote
@@ -146,6 +171,12 @@ async function resolveNote(plugin: FastSync, path: string, mode: ConflictResolve
     clearConflictState(plugin, path, { keepBackup: true });
     return { path, ok: true };
   }
+
+  // “保留双份 / 采用本地”都会条件提交本地内容到远端：只读下整体不执行，
+  // 拦截放在生成本地副本之前，避免留下副本却发不出去的半截状态。
+  // "Keep both / use local" both conditionally submit the local body to the remote: never run
+  // in read-only mode, and gate before creating the local copy so no half state is left behind.
+  if (readonlyResolutionBlocked(plugin)) return readonlyResult(path);
 
   if (mode === "both") {
     const remote = await loadRemoteNoteBody(plugin, path, meta);
@@ -259,6 +290,11 @@ async function resolveSetting(plugin: FastSync, path: string, mode: ConflictReso
     // 避免沿用旧 baseHash 造成 530 死循环。
     // Local deleted => conditionally delete the remote using the confirmed remote state, so the
     // stale baseHash cannot loop on 530.
+    // 条件删除远端配置属于上行动作：只读下整体不执行（先于 pending/冲突状态等本地副作用）
+    // Conditional remote setting delete is an uplink: never run in read-only mode (before the
+    // pending baseline / pending ack / conflict-state side effects)
+    if (readonlyResolutionBlocked(plugin)) return readonlyResult(path);
+
     if (isVirtual) {
       plugin.configHashManager?.recordPendingDeleteBaseline?.(path);
     }
@@ -303,6 +339,12 @@ async function resolveSetting(plugin: FastSync, path: string, mode: ConflictReso
     return { path, ok: true };
   }
 
+  // “保留双份 / 采用本地”都会条件提交配置到远端：只读下整体不执行，
+  // 拦截放在写本地副本之前。
+  // "Keep both / use local" both conditionally submit the setting to the remote: never run in
+  // read-only mode, and gate before writing the local copy.
+  if (readonlyResolutionBlocked(plugin)) return readonlyResult(path);
+
   if (mode === "both") {
     const remote = await loadRemoteSettingBody(plugin, path, meta);
     if (remote) {
@@ -337,6 +379,11 @@ async function resolveFile(plugin: FastSync, path: string, mode: ConflictResolve
   const file = plugin.app.vault.getFileByPath(fullPath);
 
   if (!file) {
+    // 该分支两条路都是上行动作（请求重推 / 条件删除远端），只读下整体不执行，
+    // 拦截先于冲突状态清理。
+    // Both paths here are uplinks (re-push request / conditional remote delete): never run in
+    // read-only mode, and gate before the conflict state is cleared.
+    if (readonlyResolutionBlocked(plugin)) return readonlyResult(path);
     if (mode === "remote") {
       // 远端版本通过既有下载流程取得；清除暂停状态后触发重推
       // The remote version is fetched through the normal download path; clear the pause and re-push
@@ -362,14 +409,23 @@ async function resolveFile(plugin: FastSync, path: string, mode: ConflictResolve
   }
 
   if (mode === "remote") {
-    const bytes = await adapter.readBinary(fullPath);
-    await adapter.writeBinary(localBackupPath, bytes);
     if (meta.serverDeleted) {
+      // 远端已是墓碑、只删本地：不动远端，属于纯本地动作，只读下照常允许
+      // Remote is already a tombstone and only the local copy is removed: local-only, so it
+      // stays allowed in read-only mode
+      const bytes = await adapter.readBinary(fullPath);
+      await adapter.writeBinary(localBackupPath, bytes);
       await plugin.app.fileManager.trashFile(file);
       plugin.fileHashManager?.removeFileHash?.(path);
       clearConflictState(plugin, path, { keepBackup: true });
       return { path, ok: true };
     }
+    // 采用远端要先删本地再请求服务端重推：只读下整体不执行，拦截放在备份/删除本地之前
+    // "Use remote" deletes the local copy then requests a remote re-push: never run in
+    // read-only mode, and gate before the local backup/delete
+    if (readonlyResolutionBlocked(plugin)) return readonlyResult(path);
+    const bytes = await adapter.readBinary(fullPath);
+    await adapter.writeBinary(localBackupPath, bytes);
     // 删除本地后触发远端重推，由下载流程绑定 serverRevision 落盘
     // Remove the local copy and re-push; the download path binds serverRevision when it lands
     await plugin.app.fileManager.trashFile(file);
@@ -377,6 +433,11 @@ async function resolveFile(plugin: FastSync, path: string, mode: ConflictResolve
     void plugin.websocket.SendMessage("FileRePush", { vault: plugin.settings.vault, path, pathHash: hashContent(path) });
     return { path, ok: true };
   }
+
+  // 双份/本地都会条件提交附件到远端：只读下整体不执行，拦截放在生成本地副本之前
+  // "both"/"local" conditionally submit the attachment to the remote: never run in read-only
+  // mode, and gate before creating the local copy
+  if (readonlyResolutionBlocked(plugin)) return readonlyResult(path);
 
   if (mode === "both") {
     const bytes = await adapter.readBinary(fullPath);
@@ -405,6 +466,10 @@ async function resolveFolder(plugin: FastSync, folderPath: string, mode: Conflic
   //   remote still exists; when the remote is a tombstone only the snapshot is dropped.
   if (!folder) {
     if (mode === "local") {
+      // 条件删除远端目录属于上行动作：只读下整体不执行（先于快照与冲突状态清理）
+      // Conditional remote folder delete is an uplink: never run in read-only mode (before the
+      // snapshot / conflict-state side effects)
+      if (readonlyResolutionBlocked(plugin)) return readonlyResult(folderPath);
       // 目录没有内容哈希：只要拿到检测时的 serverRevision 就必须保留它，
       // 不能用恒为空的 serverHash 把 revision 一起丢掉。
       // Folders have no content hash: whenever the detection-time serverRevision is known it must
@@ -465,6 +530,12 @@ async function resolveFolder(plugin: FastSync, folderPath: string, mode: Conflic
     clearConflictState(plugin, folderPath);
     return { path: folderPath, ok: true };
   }
+  // “保留双份 / 采用本地”都会条件提交目录到远端：只读下整体不执行，
+  // 拦截放在建回本地目录与冲突状态清理之前。
+  // "Keep both / use local" conditionally submit the folder to the remote: never run in
+  // read-only mode, and gate before recreating the local folder and clearing the state.
+  if (readonlyResolutionBlocked(plugin)) return readonlyResult(folderPath);
+
   let target: ReturnType<typeof plugin.app.vault.getAbstractFileByPath> = folder;
   if (!target) {
     try {

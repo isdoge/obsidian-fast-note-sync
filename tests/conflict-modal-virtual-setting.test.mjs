@@ -65,6 +65,9 @@ const { ConflictResolveModal } = loadModule("src/views/conflict-resolve-modal.ts
   if (id === "../lib/sync/operator_config") {
     return { configModify: async (...args) => { configModifyCalls.push(args); } };
   }
+  if (id === "../lib/sync/conflict_resolve") {
+    return { readonlyResolutionBlocked: () => false };
+  }
   if (id === "../main") return {};
   throw new Error(`Unexpected require in conflict-resolve-modal: ${id}`);
 });

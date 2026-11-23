@@ -617,6 +617,7 @@ export default {
   "ui.conflict.final_title": "Resolved Conflict Content",
   "ui.conflict.use_local": "Use Local ->",
   "ui.conflict.use_remote": "Use Remote ->",
+  "ui.conflict.readonly_blocked": "Read-only Sync Mode is on, so conflict actions that change the remote are not performed. Turn off Read-only Sync Mode first.",
   "ui.conflict.diff_skipped": "This file is large, so the line-by-line diff was skipped. Use the buttons above to take the local/remote version, or edit directly in the right-hand editor.",
   "ui.conflict.round_summary": "This round recorded ${count} conflict(s). Automatic uploads for the affected paths are paused; open the conflict and alignment panel to resolve them.",
   "ui.conflict.kind_note": "Note",

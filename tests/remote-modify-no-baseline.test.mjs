@@ -67,6 +67,7 @@ const conflictAlign = loadModule("src/lib/sync/conflict_align.ts", (id) => {
   if (id === "obsidian") return { normalizePath: (p) => p, TFile };
   if (id === "../utils/helpers") return helpers;
   if (id === "./operator_note") return ops;
+  if (id === "./conflict_resolve") return { readonlyResolutionBlocked: () => false };
   if (id === "../../main") return {};
   throw new Error(`Unexpected require in conflict_align: ${id}`);
 });

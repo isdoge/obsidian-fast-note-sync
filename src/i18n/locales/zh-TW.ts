@@ -617,6 +617,7 @@ export default {
   "ui.conflict.final_title": "解決衝突內容",
   "ui.conflict.use_local": "使用本地->",
   "ui.conflict.use_remote": "使用遠端->",
+  "ui.conflict.readonly_blocked": "目前已開啟「唯讀同步模式」，涉及遠端的衝突操作不會執行。請先關閉唯讀同步模式後再操作。",
   "ui.log.action.NoteManualMergeConflict": "筆記內容衝突",
   "ui.about.plugin_version": "外掛版本",
   "ui.about.server_version": "伺服器版本",

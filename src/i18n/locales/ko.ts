@@ -617,6 +617,7 @@ export default {
   "ui.conflict.final_title": "충돌 해결 내용",
   "ui.conflict.use_local": "로컬 사용->",
   "ui.conflict.use_remote": "원격 사용->",
+  "ui.conflict.readonly_blocked": "「읽기 전용 동기화 모드」가 켜져 있어 원격을 변경하는 충돌 작업이 실행되지 않습니다. 먼저 읽기 전용 동기화 모드를 끄세요.",
   "ui.log.action.NoteManualMergeConflict": "노트 내용 충돌",
   "ui.about.plugin_version": "플러그인 버전",
   "ui.about.server_version": "서버 버전",
