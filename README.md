@@ -1,9 +1,9 @@
-[简体中文](https://github.com/isdoge/obsidian-fast-note-sync/blob/master/docs/README.zh-CN.md) / [English](https://github.com/isdoge/obsidian-fast-note-sync/blob/master/README.md) / [日本語](https://github.com/isdoge/obsidian-fast-note-sync/blob/master/docs/README.ja.md) / [한국어](https://github.com/isdoge/obsidian-fast-note-sync/blob/master/docs/README.ko.md) / [繁體中文](https://github.com/isdoge/obsidian-fast-note-sync/blob/master/docs/README.zh-TW.md)
+[简体中文](https://github.com/isdoge/obsidian-fast-note-sync/blob/master/README.md) / [English](https://github.com/isdoge/obsidian-fast-note-sync/blob/master/docs/README.en.md) / [日本語](https://github.com/isdoge/obsidian-fast-note-sync/blob/master/docs/README.ja.md) / [한국어](https://github.com/isdoge/obsidian-fast-note-sync/blob/master/docs/README.ko.md) / [繁體中文](https://github.com/isdoge/obsidian-fast-note-sync/blob/master/docs/README.zh-TW.md)
 
 > [!IMPORTANT]
-> **This repository is an independently maintained fix edition.** Upstream [haierkeys/obsidian-fast-note-sync](https://github.com/haierkeys/obsidian-fast-note-sync) has not been updated since August 2026. Forked by [isdoge](https://github.com/isdoge) from upstream v2.4.0, this repository merges backlogged upstream PRs and fixes known issues, and evolves independently from here on—its version numbers no longer track upstream. **Do not install or update this plugin through the Obsidian Community Plugins store**, which only serves the upstream release. See "About This Repository" below for details.
+> **本仓库是独立维护的修复版。** 上游 [haierkeys/obsidian-fast-note-sync](https://github.com/haierkeys/obsidian-fast-note-sync) 自 2026 年 8 月起没有再更新。本仓库由 [isdoge](https://github.com/isdoge) 从上游 v2.4.0 分出，合并了上游积压的 PR 并修复已知问题，此后独立演进，版本号不再跟随上游。**请不要通过 Obsidian 社区插件商店安装或更新**，商店里是上游版本。详见下文「关于本仓库」。
 
-If you have questions or feature requests, please open an [issue](https://github.com/isdoge/obsidian-fast-note-sync/issues/new) in this repository.
+有问题或需求，请在本仓库新建 [issue](https://github.com/isdoge/obsidian-fast-note-sync/issues/new)。
 
 
 
@@ -20,13 +20,13 @@ If you have questions or feature requests, please open an [issue](https://github
 
 
 <p align="center">
-  <strong>Fast multi-device sync, automatic backup, trackable version history, and shareable collaboration note sync plugin for Obsidian</strong>
+  <strong>快速多端同步、自动备份、版本可追溯，可分享协作的 Obsidian 笔记同步插件</strong>
   <br>
-  <em>Sync your notes in real-time across multiple devices (PC, mobile, web) anytime, anywhere. One-click generation of sharing links to share with friends, easily trace modification history or restore trash bin contents; also supports backup, mirroring, and Git synchronization. With the REST/MCP services of Fast Note Sync Service, you can quickly build your own personal knowledge base.</em>
+  <em>随时随地，多端实时同步你的笔记（电脑、手机、网页）。一键生成分享链接与好友共用，轻松回溯修改历史或恢复回收站内容；还支持备份、镜像与 Git 同步。借助 Fast Note Sync Service 的 REST/MCP 服务，你可以快速搭建属于自己的个人知识库。</em>
 </p>
 
 <p align="center">
-  Requires a standalone server: <a href="https://github.com/isdoge/fast-note-sync-service">Fast Note Sync Service</a>
+  需配合独立服务端使用：<a href="https://github.com/isdoge/fast-note-sync-service">Fast Note Sync Service</a>
 </p>
 
 <div align="center">
@@ -34,124 +34,118 @@ If you have questions or feature requests, please open an [issue](https://github
 </div>
 
 
-## 📌 About This Repository
+## 📌 关于本仓库
 
-This repository is an independently maintained edition of [haierkeys/obsidian-fast-note-sync](https://github.com/haierkeys/obsidian-fast-note-sync), maintained by [isdoge](https://github.com/isdoge). Thanks to the original author HaierKeys for creating this project.
+本仓库是 [haierkeys/obsidian-fast-note-sync](https://github.com/haierkeys/obsidian-fast-note-sync) 的独立维护版本，维护者 [isdoge](https://github.com/isdoge)。感谢原作者 HaierKeys 创建了这个项目。
 
-- **Origin**: Forked from upstream v2.4.0 with 18 pending upstream PRs merged and a batch of known bugs fixed. See the [changelog (Chinese)](/docs/CHANGELOG.zh-CN.md) for the full list.
-- **Versioning**: Incremented independently starting from v2.5.0 and no longer tracks upstream.
-- **Plugin ID Unchanged**: Remains `fast-note-sync`. Overwrite the files in `.obsidian/plugins/fast-note-sync` with the releases from this repository and all existing settings and sync state will carry over—no reconfiguration needed.
-- **Installation & Updates**: Distributed exclusively via [GitHub Releases](https://github.com/isdoge/obsidian-fast-note-sync/releases) in this repository and not listed on the Obsidian Community Plugins store. One-click upgrades inside the plugin download from this repository's Releases; new-version notifications are pushed by the connected server and point to this repository when paired with this repository's server. Obsidian's built-in "Check for updates" checks the upstream version in the store—do not use it to update this plugin.
-- **Companion Server**: Use alongside the independently maintained [isdoge/fast-note-sync-service](https://github.com/isdoge/fast-note-sync-service). Basic sync requires server v3.7.0 or later; the full sync-baseline protocol requires v3.8.4 or later; the Firefly blog auto-publish assistant requires v3.8.5 or later. Some fixes take effect only when both the plugin and the server are updated.
-- **Preserved**: Original author credits and sponsorship links remain unchanged.
-- **Feedback**: Please report issues and feature requests in this repository's [Issues](https://github.com/isdoge/obsidian-fast-note-sync/issues), not in the upstream repository.
+- **来源**：从上游 v2.4.0 分出，合并了上游当时未处理的 18 个 PR，并修复了一批已知问题。完整清单见[更新日志](/docs/CHANGELOG.zh-CN.md)。
+- **版本号**：自 v2.5.0 起独立递增，不再跟随上游。
+- **插件 ID 不变**：仍是 `fast-note-sync`。把本仓库发布的文件覆盖到 `.obsidian/plugins/fast-note-sync` 即可，原有设置和同步记录都会沿用，不需要重新配置。
+- **安装与更新**：只在本仓库的 [GitHub Releases](https://github.com/isdoge/obsidian-fast-note-sync/releases) 发布，不上架 Obsidian 社区插件商店。插件内的一键升级从本仓库的 Releases 下载；新版本提示由所连接的服务端下发，搭配本仓库的服务端时指向本仓库。Obsidian 自带的「检查更新」查的是商店里的上游版本，请不要用它来更新本插件。
+- **配套服务端**：请搭配同样独立维护的 [isdoge/fast-note-sync-service](https://github.com/isdoge/fast-note-sync-service)。基础同步需服务端 v3.7.0 及以上；完整同步基线协议需 v3.8.4 及以上；Firefly 博客自动发布需 v3.8.5 及以上。部分修复需要插件和服务端都升级才生效。
+- **保持不变**：原作者的版权署名与赞助信息。
+- **反馈**：问题和需求请提到本仓库的 [Issues](https://github.com/isdoge/obsidian-fast-note-sync/issues)，不要提到上游仓库。
 
-### What Has Been Removed
+### 已移除的内容
 
-The following items have been removed in this independently maintained edition. **If you rely on any of them, please [open an issue](https://github.com/isdoge/obsidian-fast-note-sync/issues/new) to let me know** your use case, and I'll consider bringing it back.
+下面这些在独立维护版里已经移除。**如果你需要其中某一项，请[提 issue](https://github.com/isdoge/obsidian-fast-note-sync/issues/new) 告诉我**，说明使用场景，我会评估是否恢复。
 
-| Removed | Notes | What to Use Instead |
+| 已移除 | 说明 | 现在请用 |
 | --- | --- | --- |
-| Installing via the Obsidian Community Plugins store | This edition is not listed on the store; the store carries the upstream version (stopped at v2.4.0) | Download from this repository's Releases to overwrite-install, then use the plugin's built-in upgrade |
-| Tencent `cnb.cool` mirror repo and download source | No longer synced to cnb; only GitHub remains under "Plugin Update Source" in settings, and legacy cnb values automatically fall back to GitHub | GitHub Releases |
+| 通过 Obsidian 社区插件商店安装 | 本仓库不上架商店；商店里是上游版本（停在 v2.4.0） | 从本仓库 Releases 下载后覆盖安装，之后用插件内的升级功能 |
+| 腾讯 `cnb.cool` 镜像仓库与下载源 | 不再同步到 cnb；设置里的「插件更新源」只保留 GitHub，旧设置中的 cnb 取值自动按 GitHub 处理 | GitHub Releases |
 
-### Upgrading from Upstream
+### 从上游版本升级
 
-- Download `main.js`, `manifest.json`, and `styles.css` (or the zip archive) from this repository's Releases, overwrite the matching files in `.obsidian/plugins/fast-note-sync`, then restart Obsidian or toggle the plugin off and on. Your settings require no changes.
-- Upgrading the server to [isdoge/fast-note-sync-service](https://github.com/isdoge/fast-note-sync-service) v3.7.0 or later at the same time is recommended.
-- **Behavior Changes**:
-  - Files deleted on other devices now follow Obsidian's deleted-file handling setting (system trash / Obsidian trash `.trash` / permanent deletion). When set to permanent deletion, remote deletions permanently delete the file.
-  - Read-only devices no longer report local directories to the server.
-  - Setting "Hash calculation limit" to `0` means no limit.
-  - File modification times already showing 1970 prior to upgrading are not corrected retroactively; this only affects display, and timestamps return to normal on the next modification. Do not try to fix this by deleting local files and re-pulling—deletions in Obsidian sync to the server and other devices.
+- 从本仓库 Releases 下载 `main.js`、`manifest.json`、`styles.css`（或 zip 包），覆盖 `.obsidian/plugins/fast-note-sync` 里的同名文件，然后重启 Obsidian 或重新启用插件。设置不用改。
+- 建议服务端同时升级到 [isdoge/fast-note-sync-service](https://github.com/isdoge/fast-note-sync-service) v3.7.0 及以上。
+- **行为变化**：
+  - 其它设备删除的文件，现在按 Obsidian 里设置的删除文件处理方式执行（系统回收站 / Obsidian 回收站 `.trash` / 永久删除）。设为永久删除时，远端删除就是永久删除。
+  - 只读设备不再向服务端上报本地目录。
+  - 「哈希计算数量限制」填 `0` 表示不限制。
+  - 升级前已经显示为 1970 年的文件修改时间不会自动更正，只影响显示，文件下次修改后恢复正常。不要用「删除本地文件再重新拉取」来更正：在 Obsidian 里删除会同步到服务端和其它设备。
 
 
-## ✨ Features
+## ✨ 插件功能
 
-- 🚀 **Minimalist Configuration**:
-    - No tedious setup required, just paste the remote service configuration to start using it out of the box.
-    - Can also use one-click import on the desktop app to automatically complete authorization.
-    - Explains the cause when pasting configuration fails on mobile, and allows pasting JSON manually.
-- 📗 **Real-time Note Sync**:
-    - Automatically monitors and syncs the creation, update, and deletion of all notes inside the Vault (repository).
-    - Files deleted on other devices follow Obsidian's deleted-file handling setting (system trash / Obsidian trash `.trash` / permanent deletion) instead of being permanently deleted directly.
-- 🖼️ **Full Attachment Support**:
-    - Syncs images, videos, audio, and all other non-configuration files in real-time.
-    > ⚠️ **Note**: Requires v1.0+, Server v0.9+. Please manage attachment file sizes; large files may cause synchronization delays.
-- ⚙️ **Configuration Sync**:
-    - Provides configuration sync, supporting config synchronization across multiple devices. Say goodbye to the pain of manually copying configuration files to multiple devices.
-    - Supports syncing text assets in plugin subdirectories (such as dictionary files).
-    > ⚠️ **Note**: Requires v1.4+, Server v1.0+. Currently in the testing phase, please use with caution.
-- 🛂 **Sync Exclusions & Whitelist**:
-    - Provides sync exclusion and whitelist functions, allowing you to customize your own sync strategies.
-- 🔄 **Multi-device Sync**:
-    - Supports Mac, Windows, Android, iOS, and other platforms.
-    - Sync state has a file mirror, allowing it to be restored if the system clears mobile local storage, without falling back to a full sync.
-    - Deletions and renames not delivered before a disconnect or restart are retried after reconnection; server content is checked before retrying, and the operation is abandoned if it does not match to avoid deleting newer content from other devices.
-- 📝 **Note History**:
-    - Provides note history functionality, letting you view detailed historical modification records of your notes.
-    - You can restore notes to historical versions.
-- 🛡️ **Offline Note Editing Auto-Merge**:
-    - Automatically merges note modifications made on offline devices when reconnecting to the server, avoiding data loss caused by keeping only the latest update.
-- 🚫 **Offline Deletion Sync & Completion**:
-    - Deletions of notes, attachments, and configurations during offline periods will be automatically synced to the server or completed from the server upon the next connection.
-- 🔍 **Version Detection**:
-    - Provides version detection functionality, allowing you to quickly get the latest version info of the plugin and the server for easy upgrading.
-    - One-click upgrades download from this repository's GitHub Releases.
-- ☁️ **Cloud Preview of Attachments**:
-    - Provides online attachment preview, meaning attachments do not need to be synced to the local device, thereby saving local storage space.
-    > Combined with the plugin's exclusion settings, you can directly use a third-party repository (like WebDav) for certain types of attachments without uploading via the server.
-- 🗒️ **Sync Logs**:
-    - Provides sync log functionality, making it easy to view detailed information for each synchronization.
-- 🌐 **Astro Firefly Blog Writing & Auto-Publish Assistant**:
-    - Validates post frontmatter, converges images into the note's `./assets/` and rewrites references, runs pre-publish checks, and triggers the server-side Git/Firefly build with a live build receipt.
-    > ⚠️ **Note**: Requires server v3.8.5+ for auto-publish, and a Firefly Git-sync target configured on the server.
-- 🧬 **Sync Baseline Protocol, Conflict Alignment & Batch Handling**:
-    - Every write is verified against a server-issued revision token. Conflicts carry the exact remote version, are listed in one panel, and can be resolved in bulk (local / remote / keep both); binary settings and attachments are transferred and restored byte-exactly.
-    > ⚠️ **Note**: The full baseline protocol requires server v3.8.4+; older servers fall back to compatibility mode automatically.
-- **Cloud Backup**: Provides cloud backup functionality to protect your note data from being lost.
+- 🚀 **极简配置**：
+    - 无需繁琐设置，只需粘贴远端服务配置即可开箱即用。
+    - 也可以在桌面端使用一键导入，自动完成授权。
+    - 移动端粘贴配置失败时会说明原因，并可以手动粘贴 JSON。
+- 📗 **笔记实时同步**：
+    - 自动监听并同步 Vault (仓库) 内所有笔记的创建、更新与删除操作。
+    - 其它设备删除的文件按 Obsidian 里设置的删除文件处理方式执行（系统回收站 / Obsidian 回收站 `.trash` / 永久删除），不再直接永久删除。
+- 🖼️ **附件全面支持**：
+    - 实时同步图片、视频、音频等各类非设置文件。
+    > ⚠️ **注意**：需要 v1.0+，服务端 v0.9+。请控制附件文件大小，大文件可能会导致同步延迟。
+- ⚙️ **配置同步**：
+    - 提供配置同步功能，支持多台设备的配置同步, 告别手动给多端设备拷贝配置文件的痛苦。
+    - 支持同步插件子目录中的文本资源（如字典文件）。
+    > ⚠️ **注意**：需要 v1.4+，服务端 v1.0+。目前还在测试阶段，请谨慎使用。
+- 🛂 **同步排除与白名单**：
+    - 提供同步排除与白名单功能，您针同步指定属于你的同步策略。
+- 🔄 **多端同步**：
+    - 支持 Mac、Windows、Android、iOS 等平台。
+    - 同步状态保存文件镜像，移动端本地存储被系统清理后可以从镜像恢复，不会退化成全量同步。
+    - 断线或重启前没送达的删除、改名会在重新连接后补发；补发前核对服务端内容，对不上就放弃，避免误删其它设备上的新内容。
+- 📝 **笔记历史**：
+    - 提供笔记历史功能，您可以查看笔记的所有历史修改详情。
+    - 您可以恢复笔记到历史版本。
+- 🛡️ **离线笔记编辑自动合并**：
+    - 对离线设备的笔记修改，在重新连接服务端时自动合并，避免因只保留最新更新，导致的笔记内容丢失。
+- 🚫 **离线删除同步与补全**：
+    - 离线期间 笔记、附件、配置 的删除操作，下次连接时将自动同步到服务端或自动从服务端补全。
+- 🔍 **版本检测**：
+    - 提供版本检测功能，你可以快速的获取 插件端/服务端 最新的版本信息，方便快速升级。
+    - 一键升级从本仓库的 GitHub Releases 下载。
+- ☁️ **附件云预览**：
+    - 提供附件在线预览功能，附件无需同步到本地设备，从而节省本地存储空间。
+    > 配合插件的排除设置，可对某类附件直接使用第三方资源库(例如 WebDav)而不通过服务端上传。
+- 🗒️ **同步日志**：
+    - 提供同步日志功能，便于查看每次同步的详细信息。
+- 🌐 **Astro Firefly 博客写作与自动发布助手**：
+    - 校验文章 frontmatter、把图片汇聚并规范到笔记同目录的 `./assets/` 并改写引用、发布前合规检查，并可一键触发服务端 Git/Firefly 构建、实时展示构建回执。
+    > ⚠️ **注意**：自动发布需服务端 v3.8.5+，且服务端已配置 Firefly 的 Git 同步目标。
+- 🧬 **同步基线协议、冲突对齐与批量处理**：
+    - 每次写入都带服务端签发的版本令牌核对；冲突会附带准确的远端版本，在统一面板中列出并支持批量解决（本地 / 远端 / 保留双份），二进制配置与附件逐字节零损传输和恢复。
+    > ⚠️ **注意**：完整基线协议需服务端 v3.8.4+；旧服务端会自动退回兼容模式。
+- **云存储备份**：提供云存储备份功能，保护您的笔记数据不丢失。
 
-### Recovery of remotely deleted files
+## 🗺️ 路线图 (Roadmap)
 
-Server-requested deletions of notes, attachments and empty folders, and existing targets displaced by a remote rename, follow Obsidian's "Deleted files" preference (system trash, the vault's `.trash` folder, or permanent deletion). Configuration files are not vault items and always go to the vault's local `.trash` directory. If moving an item to trash fails, the operation reports an error and does not fall back to permanent deletion.
+路线图沿用原作者的规划。独立维护版会按这份清单逐项推进，完成一项勾选一项。
+- [ ] **端到端加密**：提供端到端加密功能，保证您的笔记数据在任何地方保存都是安全的。
+- [ ] **AI笔记**：探索 AI+ 笔记相关的创新玩法， 等待您提供宝贵的建议。
 
-The `.trash` directory is excluded from synchronization, including whitelist rules. Recovery copies remain local to that device; restore them manually with your file manager. This does not change temporary-chunk cleanup or the optional cloud-preview feature that removes local attachments after upload.
+> **如果您有改进建议或新想法，欢迎通过提交 issue 与我们分享——我们会认真评估并采纳合适的建议。**
 
-## 🗺️ Roadmap
+## 💖 赞助与支持
 
-The roadmap follows the original author's plan. This independently maintained edition will work through this list item by item, checking off each as it is completed.
-- [ ] **End-to-End Encryption**: Provide end-to-end encryption to ensure your note data is safe wherever it is stored.
-- [ ] **AI Notes**: Explore innovative ways to use AI with notes, awaiting your valuable suggestions.
+- 本项目由 HaierKeys 创建。如果它对你有帮助，可以通过以下方式支持原作者（款项归原作者，与本仓库的维护无关）：
 
-> **If you have improvement suggestions or new ideas, feel free to share them with us by submitting an issue — we will carefully evaluate and adopt suitable suggestions.**
-
-## 💖 Sponsorship & Support
-
-- This project was created by HaierKeys. If you find it helpful, you can support the original author through the channels below (all proceeds go to the original author and are unrelated to the maintenance of this repository):
-
-  | Ko-fi *Non-China Region*                                                                         |    | WeChat Pay *China Region*                      |
+  | Ko-fi *非中国地区*                                                                               |    | 微信扫码打赏 *中国地区*                        |
   |--------------------------------------------------------------------------------------------------|----|------------------------------------------------|
-  | [<img src="/docs/images/kofi.png" alt="BuyMeACoffee" height="150">](https://ko-fi.com/haierkeys) | or | <img src="/docs/images/wxds.png" height="150"> |
+  | [<img src="/docs/images/kofi.png" alt="BuyMeACoffee" height="150">](https://ko-fi.com/haierkeys) | 或 | <img src="/docs/images/wxds.png" height="150"> |
 
-- Supported List:
-  - <a href="https://github.com/isdoge/fast-note-sync-service/blob/master/docs/Support.en.md">Support.en.md</a>
+- 已支持名单：
+  - <a href="https://github.com/isdoge/fast-note-sync-service/blob/master/docs/Support.zh-CN.md">Support.zh-CN.md</a>
 
 
-## 🚀 Quick Start
+## 🚀 快速开始
 
-**Step 1: Get the Plugin**
+**第一步：获取插件**
 
-* **Manual Installation:** Download `main.js`, `styles.css`, and `manifest.json` from the [GitHub Releases Page](https://github.com/isdoge/obsidian-fast-note-sync/releases), place them in the `.obsidian/plugins/fast-note-sync` folder, and enable the plugin in Obsidian's Community Plugins list.
-* **Already on Upstream:** Overwrite the existing files with the three files above; your settings will carry over.
-* This plugin is not listed on the Obsidian Community Plugins store—please do not install it from the store.
+* **手动安装：** 从 [GitHub 发布页](https://github.com/isdoge/obsidian-fast-note-sync/releases) 获取 `main.js`, `styles.css`, `manifest.json`，放入 `.obsidian/plugins/fast-note-sync` 文件夹中，然后在 Obsidian 的社区插件列表里启用。
+* **已安装上游版本：** 直接用上面三个文件覆盖同名文件即可，设置会沿用。
+* 本插件不在 Obsidian 社区插件商店上架，请不要从商店安装。
 
-**Step 2: Authorize Sync**
+**第二步：授权同步**
 
-1. Access the Web interface of your deployed **[Fast Note Sync Service](https://github.com/isdoge/fast-note-sync-service)**.
-2. Select **"Note Vaults"** from the left navigation bar.
-3. Click **"One-click Authorization for Obsidian"**. The system will automatically wake up Obsidian and complete the transfer of authorization information. Of course, you can also manually copy the authorization information into the plugin.
+1. 访问您搭建的 **[Fast Note Sync Service](https://github.com/isdoge/fast-note-sync-service)** Web 界面。
+2. 在左侧导航栏中选择 **「笔记库」**。
+3. 点击 **「一键授权 Obsidian」**，系统会自动唤起 Obsidian 并自动完成传递授权信息，当然你也可以手动复制授权到插件内。
 
-## 📦 Server Deployment
+## 📦 服务端部署
 
-For backend service settings, please refer to:
+后端服务设置，请参考：
 - <a href="https://github.com/isdoge/fast-note-sync-service">Fast Note Sync Service</a>
