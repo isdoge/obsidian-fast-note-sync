@@ -5551,6 +5551,9 @@ export namespace proto {
             /** FileSyncDownloadMessage size. */
             size: (number|Long);
 
+            /** FileSyncDownloadMessage revision. */
+            revision: string;
+
             /**
              * Creates a new FileSyncDownloadMessage instance using the specified properties.
              * @param [properties] Properties to set
@@ -5658,6 +5661,9 @@ export namespace proto {
 
                 /** FileSyncDownloadMessage size */
                 size?: (number|Long|null);
+
+                /** FileSyncDownloadMessage revision */
+                revision?: (string|null);
 
                 /** Unknown fields preserved while decoding when enabled */
                 $unknowns?: Uint8Array[];

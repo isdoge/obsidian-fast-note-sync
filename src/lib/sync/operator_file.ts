@@ -1498,7 +1498,14 @@ export const receiveFileSyncChunkDownload = async function (data: FileSyncChunkD
     commitGuard: tempSession.commitGuard,
     path: data.path,
     contentHash: data.contentHash,
-    revision: data.revision,
+    // 就绪消息可能不带 revision（旧服务端/服务端未下发就绪字段）；Protobuf 映射在字段缺省时
+    // 会给出空串而不是 undefined，所以这里按空值回退，沿用 FileSyncUpdate 建临时会话时拿到的
+    // 令牌，否则下载完成后会退化成只写哈希、建不起已确认基线。
+    // The ready message may omit revision (legacy server / field only added later). Protobuf
+    // mapping yields an empty string instead of undefined for a missing field, so treat empty as
+    // absent and keep the token captured from FileSyncUpdate; otherwise the commit degrades to a
+    // plain hash with no confirmed baseline.
+    revision: data.revision || tempSession.revision,
     ctime: normalizeServerTimestamp(data.ctime),
     mtime: normalizeServerTimestamp(data.mtime),
     lastTime: tempSession.lastTime,
