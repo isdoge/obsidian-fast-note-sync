@@ -297,7 +297,9 @@ function loadScanModule(relPath, extra = {}) {
   return module.exports;
 }
 const { SyncState } = loadScanModule('src/lib/sync/sync_state.ts');
+const { evaluateMassDeleteGuard } = loadScanModule('src/lib/sync/mass_delete_guard.ts');
 const scanModules = {
+  './mass_delete_guard': { evaluateMassDeleteGuard },
   './websocket_action': new Proxy({}, { get: (_, key) => (typeof key === 'string' ? key : undefined) }),
   './operator_note': { receiveNoteSyncEnd: async () => undefined, receiveNoteUpload: async () => undefined, receiveNoteModifyAck: async () => undefined, receiveNoteRenameAck: async () => undefined, receiveNoteDeleteAck: async () => undefined, conflictBackupPaths: () => ({ baseBackupPath: 'b', remoteBackupPath: 'r', metaPath: 'm', localBackupPath: 'l' }) },
   './operator_file': { sweepStalledDownloadSessions: async () => 0, invalidateFileDownloads: noop },
