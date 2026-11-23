@@ -556,14 +556,20 @@ export class WebSocketManager {
       // the conflict panel.
       if (!isProtobufDecodeError && data.code !== ERROR_SYNC_CONFLICT && !data.context && errorPath
         && this.plugin.retryQueue?.ownsPendingPath(errorPath)) return;
-      // 带错误码的回执留一条 SyncLog error（protobuf 解码失败分支与 530 冲突各有自己的日志，不重复写）
-      // Keep one SyncLog error per error-code reply (the protobuf-decode branch and 530 conflicts
-      // already log their own, so they are skipped)
-      if (!isProtobufDecodeError && data.code !== ERROR_SYNC_CONFLICT) {
-        const diagPath = errorPath || (!msgAction ? onlyRequest?.path : undefined);
-        const detail = [data.message || "", data.details ? `details=${data.details}` : ""].filter(Boolean).join(" ");
+      const diagPath = errorPath || (!msgAction ? onlyRequest?.path : undefined);
+      const detail = [data.message || "", data.details ? `details=${data.details}` : ""].filter(Boolean).join(" ");
+      const diagMessage = `Code=${data.code}${detail ? ` ${detail}` : ""}`;
+      // 463 带 sessionID 会走自动重传，耗尽时已有 FileUpload error：只进诊断缓冲，不记成失败
+      // 463 with a sessionID is auto-retried, and exhaustion already writes a FileUpload error:
+      // buffer only, never counted as a failure
+      if (data.code === 463 && typeof data.data?.sessionID === "string") {
+        syncDiagnostics.recordDiagBufferOnly?.("warn", errorAction || msgAction || "ErrorReply", diagMessage, diagPath);
+      } else if (!isProtobufDecodeError && data.code !== ERROR_SYNC_CONFLICT) {
+        // 带错误码的回执留一条 SyncLog error（protobuf 解码失败分支与 530 冲突各有自己的日志，不重复写）
+        // Keep one SyncLog error per error-code reply (the protobuf-decode branch and 530 conflicts
+        // already log their own, so they are skipped)
         SyncLogManager.getInstance().addLog('receive', errorAction || msgAction || 'ErrorReply',
-          `Code=${data.code}${detail ? ` ${detail}` : ""}`, 'error', diagPath);
+          diagMessage, 'error', diagPath);
       }
       // 处理冲突相关错误码
       if (data.code === ERROR_SYNC_CONFLICT) {

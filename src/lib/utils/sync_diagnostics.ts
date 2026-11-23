@@ -247,6 +247,15 @@ export function recordDiag(level: DiagLevel, kind: string, message: unknown, pat
 }
 
 /**
+ * 只进诊断缓冲（并 dump），不写 SyncLog。用于可自动恢复、不希望计入失败的场景。
+ * Buffer + dump only, never a SyncLog entry: for recoverable cases that must not count as failures.
+ */
+export function recordDiagBufferOnly(level: DiagLevel, kind: string, message: unknown, path?: string): void {
+    append(level, kind, message, path);
+    dump(`[Diagnostics] ${level} ${kind}: ${clean(message)}${path ? ` (${clean(path)})` : ""}`);
+}
+
+/**
  * 启动状态（调用一次，在 reloadServices 之前）。
  * Startup state (called once, before reloadServices).
  */

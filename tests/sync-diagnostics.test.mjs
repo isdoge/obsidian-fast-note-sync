@@ -164,4 +164,82 @@ function lastPayload(adapter) {
   assert.equal(payload.entries[0].kind, 'After');
 }
 
+// 5. Overflow evicts the oldest info first; warn/error survive while any info remains
+{
+  const adapter = makeAdapter();
+  const mod = await newDiagnostics(adapter);
+  for (let i = 0; i < 299; i++) mod.recordDiag('error', `E${i}`, `error ${i}`);
+  mod.recordDiag('info', 'I0', 'first info');
+  mod.recordDiag('info', 'I1', 'second info');
+  await mod.flushSyncDiagnostics();
+  const entries = lastPayload(adapter).entries;
+  assert.equal(entries.length, 300);
+  assert.equal(entries.filter(e => e.kind === 'I0').length, 0, 'oldest info is evicted');
+  assert.equal(entries.filter(e => e.kind === 'I1').length, 1);
+  assert.equal(entries.filter(e => e.kind.startsWith('E')).length, 299, 'all errors retained');
+  assert.equal(entries[0].kind, 'E0', 'no error was evicted');
+}
+{
+  const adapter = makeAdapter();
+  const mod = await newDiagnostics(adapter);
+  for (let i = 0; i < 300; i++) mod.recordDiag('error', `E${i}`, `error ${i}`);
+  mod.recordDiag('info', 'N', 'new info');
+  await mod.flushSyncDiagnostics();
+  const entries = lastPayload(adapter).entries;
+  assert.equal(entries.length, 300);
+  assert.equal(entries.filter(e => e.kind === 'E0').length, 1, 'errors are not displaced by info');
+  assert.equal(entries.filter(e => e.kind === 'N').length, 0, 'the only info (the new one) is evicted');
+  assert.equal(entries[0].kind, 'E0');
+  assert.equal(entries.at(-1).kind, 'E299');
+}
+
+// 6. Read-only skipped uploads: count every entry, write at most 100 pathed entries per round
+{
+  const adapter = makeAdapter();
+  const mod = await newDiagnostics(adapter);
+  mod.beginSyncRound('full', true, false);
+  for (let i = 0; i < 150; i++) mod.recordUploadSkippedReadOnly(`ro/a${i}.md`);
+  await mod.flushSyncDiagnostics();
+  let entries = lastPayload(adapter).entries;
+  let skipped = entries.filter(e => e.kind === 'UploadSkippedReadOnly');
+  assert.equal(skipped.length, 100, 'pathed entries are capped per round');
+  assert.equal(skipped[0].path, 'ro/a0.md');
+  assert.equal(skipped[99].path, 'ro/a99.md');
+
+  mod.recordRoundSummary({ failed: 0, conflicts: 0, unaligned: 0, hashTimeouts: 0 });
+  await mod.flushSyncDiagnostics();
+  entries = lastPayload(adapter).entries;
+  const summaryEntry = entries.filter(e => e.kind === 'SyncRoundSummary').at(-1);
+  assert.equal(JSON.parse(summaryEntry.message).uploadSkippedReadOnly, 150, 'the round total is not capped');
+
+  mod.beginSyncRound('full', true, false);
+  mod.recordUploadSkippedReadOnly('ro/second.md');
+  await mod.flushSyncDiagnostics();
+  entries = lastPayload(adapter).entries;
+  skipped = entries.filter(e => e.kind === 'UploadSkippedReadOnly');
+  assert.equal(skipped.length, 101, 'a new round resets the cap');
+  assert.equal(skipped.at(-1).path, 'ro/second.md');
+}
+{
+  const adapter = makeAdapter();
+  const mod = await newDiagnostics(adapter);
+  for (let i = 0; i < 120; i++) mod.recordUploadSkippedReadOnly(`no-round/b${i}.md`);
+  await mod.flushSyncDiagnostics();
+  const skipped = lastPayload(adapter).entries.filter(e => e.kind === 'UploadSkippedReadOnly');
+  assert.equal(skipped.length, 100, 'the same cap applies when no round is active');
+}
+
+// 7. Buffer-only records never write a SyncLog entry, even when a writer is bound
+{
+  const adapter = makeAdapter();
+  const mod = await newDiagnostics(adapter);
+  const written = [];
+  mod.bindSyncLogWriter((...args) => written.push(args));
+  mod.recordDiagBufferOnly('warn', 'BufferOnly', 'recoverable, not a failure', 'x.md');
+  assert.equal(written.length, 0, 'buffer-only never reaches the sync log');
+  await mod.flushSyncDiagnostics();
+  const entries = lastPayload(adapter).entries;
+  assert.equal(entries.filter(e => e.kind === 'BufferOnly' && e.level === 'warn').length, 1);
+}
+
 console.log('sync-diagnostics: all checks passed');
