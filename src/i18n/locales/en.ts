@@ -204,6 +204,7 @@ export default {
   "setting.support.debug_desc": "Debug info has been copied to the clipboard; sensitive information has been desensitized.",
   "setting.support.copy_diagnostics": "Copy sync diagnostics",
   "setting.support.copy_diagnostics_desc": "Copy recent sync summaries and failure records for troubleshooting. Includes file paths; excludes the server address and token.",
+  "setting.support.copy_diagnostics_failed": "Failed to copy sync diagnostics. Please try again.",
   "setting.support.issue": "Report Issue",
   "setting.support.issue_notice": "Debug info has been automatically copied. When reporting an issue, please paste the <b>Debug Info</b> to facilitate quick analysis.",
   "setting.support.feature": "Feature Request",

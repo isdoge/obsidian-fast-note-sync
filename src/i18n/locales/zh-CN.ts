@@ -204,6 +204,7 @@ export default {
   "setting.support.debug_desc": "Debug 信息已复制到剪贴板, 敏感信息已脱敏处理",
   "setting.support.copy_diagnostics": "复制同步诊断",
   "setting.support.copy_diagnostics_desc": "复制最近的同步摘要与失败记录，用于排查问题。内容包含文件路径，不含服务器地址与令牌。",
+  "setting.support.copy_diagnostics_failed": "复制同步诊断失败，请重试。",
   "setting.support.issue": "反馈问题",
   "setting.support.issue_notice": "Debug 信息已自动复制，反馈问题时请粘贴 <b>Debug 信息</b>，方便快速分析问题",
   "setting.support.feature": "功能建议",

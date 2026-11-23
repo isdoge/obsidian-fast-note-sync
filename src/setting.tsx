@@ -788,14 +788,8 @@ export class SettingTab extends PluginSettingTab {
     diagButton.setText($("setting.support.copy_diagnostics"))
     diagButton.setAttribute("title", $("setting.support.copy_diagnostics_desc"))
     diagButton.onclick = async () => {
-      try {
-        const ok = await copySyncDiagnostics(this.plugin)
-        if (ok) showSyncNotice($("ui.history.copied"))
-      } catch (e) {
-        console.error("[fast-note-sync] copy sync diagnostics failed:", e)
-        // TODO(i18n): replace with localized key, e.g. $("setting.support.copy_diagnostics_failed")
-        showSyncNotice("Failed to copy sync diagnostics.")
-      }
+      const ok = await copySyncDiagnostics(this.plugin)
+      showSyncNotice(ok ? $("ui.history.copied") : $("setting.support.copy_diagnostics_failed"))
     }
 
     if (isHomePage) {

@@ -653,7 +653,7 @@ export default class FastSync extends Plugin {
         name: $("setting.support.copy_diagnostics"),
         callback: () => {
           void copySyncDiagnostics(this).then(ok => {
-            if (ok) showSyncNotice($("ui.history.copied"))
+            showSyncNotice(ok ? $("ui.history.copied") : $("setting.support.copy_diagnostics_failed"))
           })
         },
       });
