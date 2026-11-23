@@ -15,6 +15,7 @@ import { FileCloudPreview } from "./lib/storage/file_cloud_preview";
 import { FileHashManager } from "./lib/storage/file_hash_manager";
 import { CloudAttachmentEviction } from "./lib/storage/cloud_attachment_eviction";
 import { DebugLogManager } from "./lib/utils/debug_log_manager";
+import { setDiagnosticRedactionContext } from "./lib/utils/redact_log";
 import { SyncLogManager } from "./lib/sync/sync_log_manager";
 import { DebugLogModal } from "./views/debug-log-modal";
 import { VersionManager } from "./lib/utils/version_manager";
@@ -477,6 +478,28 @@ export default class FastSync extends Plugin {
 
     await this.loadSettings()
 
+    // 诊断日志脱敏上下文：每次脱敏时现取，用户中途改设置也能按新值遮住。
+    // 库路径桌面端从 adapter 取；移动端没有 getBasePath，留空跳过。
+    // Diagnostic-log redaction context, read on every redaction so mid-session setting
+    // changes are honoured. The vault base path is unavailable on mobile and stays empty.
+    setDiagnosticRedactionContext(() => {
+      let vaultPath = "";
+      try {
+        const adapter = this.app.vault.adapter as unknown as { getBasePath?: () => string };
+        vaultPath = typeof adapter.getBasePath === "function" ? adapter.getBasePath() : "";
+      } catch {
+        vaultPath = "";
+      }
+      const debugRemoteUrls = typeof this.settings?.debugRemoteUrls === "string"
+        ? this.settings.debugRemoteUrls.split(/\r?\n/)
+        : [];
+      return {
+        vaultPath,
+        vaultName: this.settings?.vault || this.app.vault.getName(),
+        serverHosts: [this.settings?.api || "", this.runApi || "", this.runWsApi || "", ...debugRemoteUrls],
+      };
+    });
+
     // 空闲连接定时兜底同步（服务端 #503）：只负责调度，能否触发由连接/队列/可见性共同决定
     // Idle-connection periodic fallback sync (server #503): scheduling only; the host predicates
     // decide whether a tick may actually fire
@@ -756,6 +779,8 @@ export default class FastSync extends Plugin {
   }
 
   onunload() {
+    // 清除脱敏上下文，避免卸载后继续持有插件引用
+    setDiagnosticRedactionContext(null)
     // 取消当前正在进行的同步，重置运行时状态
     this.retryQueue?.stop()
     cancelSync(this)
