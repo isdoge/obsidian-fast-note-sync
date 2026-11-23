@@ -1804,6 +1804,9 @@ export class SettingTab extends PluginSettingTab {
       toggle.setValue(this.plugin.settings.manualSyncEnabled).onChange(async (value) => {
         if (value != this.plugin.settings.manualSyncEnabled) {
           this.plugin.settings.manualSyncEnabled = value
+          // 与菜单/命令共用同一设置字段，切完立即刷新状态栏与菜单指示
+          // Shares the same settings field as the menu/commands; refresh indicators right away
+          this.plugin.menuManager?.refreshModeIndicators()
           await this.plugin.saveAndReloadServices()
         }
       }),
@@ -1814,6 +1817,7 @@ export class SettingTab extends PluginSettingTab {
       toggle.setValue(this.plugin.settings.readonlySyncEnabled).onChange(async (value) => {
         if (value != this.plugin.settings.readonlySyncEnabled) {
           this.plugin.settings.readonlySyncEnabled = value
+          this.plugin.menuManager?.refreshModeIndicators()
           await this.plugin.saveAndReloadServices()
         }
       }),

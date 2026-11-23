@@ -242,6 +242,28 @@ export default {
   "ui.history.load_failed": "Load failed, please retry",
 
   // --- ui.menu ---
+  // --- ui.mode (read-only / manual sync mode toggles, token capability hints) ---
+  "ui.mode.cmd_toggle_readonly": "Toggle read-only sync mode",
+  "ui.mode.cmd_toggle_manual": "Toggle manual sync mode",
+  "ui.mode.readonly_menu": "Read-only sync mode",
+  "ui.mode.readonly_menu_desc": "Receive remote updates only; never upload local edits or deletions. Affects this device only and does not change server-side token permissions.",
+  "ui.mode.manual_menu": "Manual sync mode",
+  "ui.mode.manual_menu_desc": "Pause automatic watching and scheduled triggers; sync only when you start it manually.",
+  "ui.mode.readonly_on": "Read-only sync mode enabled: remote updates are received, local edits and deletions are not uploaded (server token permissions unchanged).",
+  "ui.mode.readonly_off": "Read-only sync mode disabled: local edits and deletions will be uploaded again.",
+  "ui.mode.manual_on": "Manual sync mode enabled: automatic watching and scheduled triggers are paused; sync only when started manually.",
+  "ui.mode.manual_off": "Manual sync mode disabled: automatic watching and scheduled triggers are restored.",
+  "ui.mode.status_readonly": "Read-only",
+  "ui.mode.status_manual": "Manual",
+  "ui.mode.status_token_readonly": "Token read-only",
+  "ui.mode.status_vault_blocked": "Vault not allowed",
+  "ui.mode.token_readonly_banner": "Current token is read-only: the server will reject uploads",
+  "ui.mode.token_readonly_desc": "The server token lacks write permissions, so uploads from this device will be rejected. Switch to a token with write access, or turn on read-only sync mode.",
+  "ui.mode.token_missing_write": "Current token lacks write permissions: ${perms}",
+  "ui.mode.token_vault_blocked": "Current vault \"${vault}\" is not in the token's allowed vaults",
+  "ui.mode.token_vault_blocked_desc": "The token restricts which vaults it can access and the current remote vault name is not among them, so sync will fail. Change the vault name under Remote Settings to one the token allows.",
+
+  // --- ui.menu ---
   "ui.menu.ribbon_title": "FNS Menu",
   "ui.menu.default_sync": "Default Sync",
   "ui.menu.default_sync_desc": "Check incremental updates since the last sync",
@@ -527,6 +549,9 @@ export default {
   "ui.system.wsClientName": "Client",
   "ui.system.websocketClients": "Connected Clients",
   "ui.system.wsNoClients": "No clients connected",
+  "ui.system.wsNoPermission": "Only administrators can view all connected devices",
+  "ui.system.wsNoPermissionDesc": "Your account is not an administrator, so other connected devices cannot be listed. This does not mean no other devices are online.",
+  "ui.system.wsLoadFailed": "Failed to load connected devices, please try again later",
   "ui.system.wsStartTime": "Connection Time",
   "ui.status.case_conflict.title": "⚠️ File system case conflict detected!\n【${type} sync failed】\nServer expected path: ${expectedPath}\nLocal actual existing path: ${actualPath}\nSince the current file system is case-insensitive, this conflicting item cannot be created. Please resolve this issue manually.",
   "ui.status.case_conflict.log": "File system case conflict detected! Local actual existing path: ${actualPath}",

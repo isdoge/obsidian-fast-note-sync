@@ -33,6 +33,8 @@ import { $ } from "./i18n/lang";
 import { SsoImportModal } from "./views/sso-import-modal";
 import { StatusBarManager } from "./lib/ui/status_bar_manager";
 import { SyncProgressTracker } from "./lib/sync/sync_progress_tracker";
+import { TokenCapabilitiesManager } from "./lib/api/token_capabilities_manager";
+import { toggleSyncMode, syncModeNoticeKey, effectiveIdleSyncMinutes, type SyncModeKind } from "./lib/sync/sync_mode_control";
 
 
 
@@ -70,6 +72,7 @@ export default class FastSync extends Plugin {
   folderSnapshotManager: FolderSnapshotManager    // 文件夹快照管理器
   statusBarManager: StatusBarManager              // 状态栏管理器
   idleSyncScheduler: IdleAutoSyncScheduler        // 空闲连接定时兜底同步 / Idle-connection fallback sync
+  tokenCapabilities: TokenCapabilitiesManager     // 当前令牌实际权限缓存 / Current token capabilities cache
   readonly progressTracker = new SyncProgressTracker() // 进度追踪器
   private menuManagerInitialized = false          // 防止 onLayoutReady 重复初始化 / Guard against duplicate onLayoutReady init
 
@@ -323,6 +326,23 @@ export default class FastSync extends Plugin {
 
   // ─── Delegated helpers (keep API surface unchanged) ──────────────────────────
 
+  /**
+   * 切换只读 / 手动同步模式并即时生效：改设置、落盘、刷新菜单与状态栏，弹出说明当前模式的提示。
+   * 不需要重连，也不触碰服务端令牌权限。
+   * Toggle the read-only / manual sync mode with immediate effect: update settings, persist,
+   * refresh the menu and status bar, and show a notice explaining the current mode. No
+   * reconnect is needed and server-side token permissions are untouched.
+   */
+  async toggleSyncMode(kind: SyncModeKind): Promise<boolean> {
+    const enabled = toggleSyncMode(this.settings, kind)
+    await this.saveSettings()
+    this.menuManager?.refreshModeIndicators()
+    // 手动同步模式会关闭空闲兜底定时触发 / Manual mode disables the idle fallback timer
+    this.idleSyncScheduler?.applySettings()
+    showSyncNotice($(syncModeNoticeKey(kind, enabled)), 6000)
+    return enabled
+  }
+
   /** 重置所有任务统计 / Reset all per-session task statistics */
   resetSyncTasks() {
     this.syncState.resetSession()
@@ -441,6 +461,7 @@ export default class FastSync extends Plugin {
     this.setupProgressTracker();
     this.localStorageManager = new LocalStorageManager(this)
     this.api = new HttpApiService(this)
+    this.tokenCapabilities = new TokenCapabilitiesManager(this)
     this.websocket = new WebSocketManager(this)
 
     await this.loadSettings()
@@ -449,7 +470,8 @@ export default class FastSync extends Plugin {
     // Idle-connection periodic fallback sync (server #503): scheduling only; the host predicates
     // decide whether a tick may actually fire
     this.idleSyncScheduler = new IdleAutoSyncScheduler({
-      getIntervalMinutes: () => this.settings.autoIdleSyncIntervalMinutes ?? DEFAULT_IDLE_SYNC_INTERVAL_MINUTES,
+      // 手动同步模式下返回 0，等于关闭定时兜底触发 / Manual mode yields 0, disabling the timer
+      getIntervalMinutes: () => effectiveIdleSyncMinutes(this.settings, this.settings.autoIdleSyncIntervalMinutes ?? DEFAULT_IDLE_SYNC_INTERVAL_MINUTES),
       isConnected: () => !!this.websocket?.isConnected?.() && !!this.websocket?.isAuth,
       isBusy: () => this.hasPendingSyncWork(),
       isVisible: () => typeof activeDocument === "undefined" || activeDocument.visibilityState === "visible",
@@ -590,6 +612,15 @@ export default class FastSync extends Plugin {
       this.websocket.addStatusListener((status: boolean) => {
         this.updateRibbonIcon(status)
         this.idleSyncScheduler?.setConnected(status)
+        // 鉴权成功时顺手拉取一次令牌能力（旧服务端会静默降级为 null）；断开时清缓存
+        // On auth success fetch token capabilities once (old servers degrade to null);
+        // clear the cache on disconnect
+        if (status) {
+          void this.tokenCapabilities?.refresh().then(() => this.menuManager?.refreshModeIndicators())
+        } else {
+          this.tokenCapabilities?.clear()
+          this.menuManager?.refreshModeIndicators()
+        }
       })
 
       // 注册 WebSocket 数据传输活动监听 — 任何数据收发时显示同步指示器 / Register data transfer activity listener
@@ -994,6 +1025,9 @@ export default class FastSync extends Plugin {
       this.runApi = this.settings.api;
       this.runWsApi = this.settings.api ? this.settings.api.replace(/^http/, "ws") : "";
     }
+    // 地址或令牌变化后令牌能力缓存必须失效（切令牌/换服务器）
+    // Invalidate the capabilities cache when the address or token changed
+    this.tokenCapabilities?.invalidateIfConnectionChanged()
 
     if (forceRegister && (setItem === "configSyncOtherDirs" || setItem === "configSyncEnabled")) {
       void this.configManager?.reloadCustomDirs()

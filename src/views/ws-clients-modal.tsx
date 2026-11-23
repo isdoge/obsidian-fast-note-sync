@@ -6,6 +6,7 @@ import type FastSync from "../main";
 import { $ } from "../i18n/lang";
 import { LucideIcon } from "./note-history/lucide-icon";
 import { WSClient } from "../lib/api/http_api_service";
+import type { WSClientsFailure } from "../lib/api/token_capabilities";
 import { dumpError } from "../lib/utils/helpers";
 
 export class WSClientsModal extends Modal {
@@ -41,6 +42,7 @@ export class WSClientsModal extends Modal {
 const WSClientsView = ({ plugin }: { plugin: FastSync }) => {
     const [clients, setClients] = React.useState<WSClient[]>([]);
     const [isLoading, setIsLoading] = React.useState(true);
+    const [failure, setFailure] = React.useState<WSClientsFailure | null>(null);
     const isMounted = React.useRef(true);
 
     React.useEffect(() => {
@@ -59,11 +61,13 @@ const WSClientsView = ({ plugin }: { plugin: FastSync }) => {
         }
         setIsLoading(true);
         try {
-            const data = await plugin.api.getWSClients();
+            const result = await plugin.api.getWSClientsDetailed();
             if (!isMounted.current) return;
-            setClients(data || []);
+            setClients((result.clients || []) as WSClient[]);
+            setFailure(result.failure);
         } catch (err) {
             dumpError("Failed to load WS clients:", err);
+            if (isMounted.current) setFailure("error");
         } finally {
             if (isMounted.current) {
                 setIsLoading(false);
@@ -115,6 +119,25 @@ const WSClientsView = ({ plugin }: { plugin: FastSync }) => {
                             <div className="fns-ws-clients-loading-indicator">
                                 <LucideIcon icon="loader-2" className="is-spinning" size={16} />
                                 <span>{$("ui.history.loading")}</span>
+                            </div>
+                        ) : failure === "no_admin" ? (
+                            // 无管理员权限：明确说明，绝不默默显示空表
+                            // No admin permission: say so explicitly, never fake an empty list
+                            <div className="fns-empty-state fns-padding-60 fns-text-center fns-muted-text">
+                                <div className="fns-margin-b-15 fns-opacity-6">
+                                    <LucideIcon icon="shield-off" size={48} />
+                                </div>
+                                <div className="fns-font-lg fns-margin-b-8">{$("ui.system.wsNoPermission")}</div>
+                                <div className="fns-opacity-6">
+                                    {$("ui.system.wsNoPermissionDesc")}
+                                </div>
+                            </div>
+                        ) : failure === "error" ? (
+                            <div className="fns-empty-state fns-padding-60 fns-text-center fns-muted-text">
+                                <div className="fns-margin-b-15 fns-opacity-6">
+                                    <LucideIcon icon="alert-triangle" size={48} />
+                                </div>
+                                <div className="fns-font-lg">{$("ui.system.wsLoadFailed")}</div>
                             </div>
                         ) : (
                             $("ui.system.wsNoClients")

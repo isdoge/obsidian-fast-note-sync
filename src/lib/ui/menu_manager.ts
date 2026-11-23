@@ -13,6 +13,8 @@ import { StatusBarManager } from './status_bar_manager';
 import { SyncLogManager } from '../sync/sync_log_manager';
 import { conflictBackupPaths, readConflictMeta } from '../sync/operator_note';
 import { FireflyPostModal, CreateFireflyPostModal, CheckFireflyPostModal, activeMarkdownFile, triggerFireflyPublish } from '../../views/firefly-post-modal';
+import { readSyncModes } from '../sync/sync_mode_control';
+import { describeTokenWriteLimits, isVaultAllowedByToken, type TokenCapabilities } from '../api/token_capabilities';
 
 
 
@@ -210,6 +212,20 @@ export class MenuManager {
       },
     })
 
+    // 只读 / 手动同步模式快捷切换命令（即时生效，不需要重连，也不改服务端令牌权限）
+    // Quick toggles for read-only / manual sync mode (immediate, no reconnect, no token change)
+    this.plugin.addCommand({
+      id: "toggle-readonly-sync",
+      name: $("ui.mode.cmd_toggle_readonly"),
+      callback: () => { void this.plugin.toggleSyncMode("readonly") },
+    })
+
+    this.plugin.addCommand({
+      id: "toggle-manual-sync",
+      name: $("ui.mode.cmd_toggle_manual"),
+      callback: () => { void this.plugin.toggleSyncMode("manual") },
+    })
+
     this.registerFireflyCommands()
   }
 
@@ -275,11 +291,7 @@ export class MenuManager {
     // 如果存在预期的 SVG 图标，且我们自己的红点没被 Obsidian 重排时清理掉，说明状态依然是对的，无需重绘
     const hasCorrectIcon = this.ribbonIcon.querySelector(`.lucide-${iconId}`);
     if (hasCorrectIcon && this.badgeEl && this.badgeEl.parentElement === this.ribbonIcon) {
-      if (status) {
-        this.ribbonIcon.setAttribute("aria-label", $("ui.menu.ribbon_title") + " (" + $("setting.remote.connected") + ")");
-      } else {
-        this.ribbonIcon.setAttribute("aria-label", $("ui.menu.ribbon_title") + " (" + $("setting.remote.disconnected") + ")");
-      }
+      this.ribbonIcon.setAttribute("aria-label", this.ribbonAriaLabel(status));
       return;
     }
 
@@ -295,11 +307,7 @@ export class MenuManager {
     // 重新创建红点 / Re-create badge
     this.badgeEl = this.ribbonIcon.createDiv("fns-ribbon-badge");
 
-    if (status) {
-      this.ribbonIcon.setAttribute("aria-label", $("ui.menu.ribbon_title") + " (" + $("setting.remote.connected") + ")");
-    } else {
-      this.ribbonIcon.setAttribute("aria-label", $("ui.menu.ribbon_title") + " (" + $("setting.remote.disconnected") + ")");
-    }
+    this.ribbonIcon.setAttribute("aria-label", this.ribbonAriaLabel(status));
     this.refreshUpgradeBadge();
   }
 
@@ -507,6 +515,30 @@ export class MenuManager {
       return;
     }
 
+    this.buildRibbonMenu(event, this.plugin.tokenCapabilities?.get() ?? null);
+
+    // 打开菜单时轻量刷新令牌能力：有缓存直接渲染，无缓存则拉取后重建一次菜单
+    // Lightly refresh token capabilities on open: render from cache, or rebuild once the
+    // first fetch lands.
+    if (this.plugin.websocket.isAuth && this.plugin.tokenCapabilities) {
+      const before = this.plugin.tokenCapabilities.get();
+      void this.plugin.tokenCapabilities.refresh().then((caps) => {
+        this.refreshModeIndicators();
+        if (!before && caps && this.activeMenu) {
+          const menu = this.activeMenu;
+          menu.hide();
+          this.buildRibbonMenu(undefined, caps);
+        }
+      });
+    }
+  }
+
+  /**
+   * 构建并显示同步菜单（供首次渲染与令牌能力到达后重建复用）。
+   * Build and show the sync menu (shared by the first render and the rebuild after token
+   * capabilities arrive).
+   */
+  private buildRibbonMenu(event: MouseEvent | undefined, caps: TokenCapabilities | null) {
     const menu = new Menu();
     this.activeMenu = menu;
 
@@ -515,9 +547,15 @@ export class MenuManager {
       (Object.getPrototypeOf(menuWithHide) as { hide: () => void }).hide.call(menuWithHide);
     };
     menuWithHide.hide = () => {
-      this.activeMenu = null;
+      if (this.activeMenu === menu) this.activeMenu = null;
       originalHide();
     };
+
+    // 菜单顶部：令牌实际权限提示（只读令牌 / 缺少写权限 / 库不在允许列表）
+    // Top of the menu: token capability warnings (read-only, missing write, vault not allowed)
+    this.renderTokenCapabilityBanner(menu, caps);
+
+    this.addModeMenuItems(menu);
 
     if (this.plugin.websocket.isRegister) {
       menu.addItem((item: MenuItem) => {
@@ -815,6 +853,107 @@ export class MenuManager {
     } else {
       menu.showAtPosition({ x: 0, y: 0 });
     }
+  }
+
+  /**
+   * 在菜单顶部渲染令牌权限提示；无可提示内容时不加任何条目。
+   * Render token capability warnings at the top of the menu; add nothing when there is no warning.
+   */
+  private renderTokenCapabilityBanner(menu: Menu, caps: TokenCapabilities | null): void {
+    if (!caps) return;
+
+    const limits = describeTokenWriteLimits(caps);
+    const vault = this.plugin.settings.vault || "";
+    const vaultBlocked = !isVaultAllowedByToken(caps, vault);
+
+    if (limits.readOnly) {
+      menu.addItem((item: MenuItem) => {
+        const title = limits.missingWrite.length > 0 && !caps.readOnly
+          ? $("ui.mode.token_missing_write", { perms: limits.missingWrite.join(", ") })
+          : $("ui.mode.token_readonly_banner");
+        item.setIcon("lock").setTitle(title);
+        (item as unknown as MenuItemWithDom).dom.setAttribute("aria-label", $("ui.mode.token_readonly_desc"));
+        item.onClick(() => this.openSettingsTab());
+      });
+      menu.addSeparator();
+    }
+
+    if (vaultBlocked) {
+      menu.addItem((item: MenuItem) => {
+        item.setIcon("alert-triangle").setTitle($("ui.mode.token_vault_blocked", { vault }));
+        (item as unknown as MenuItemWithDom).dom.setAttribute("aria-label", $("ui.mode.token_vault_blocked_desc"));
+        item.onClick(() => this.openSettingsTab());
+      });
+      menu.addSeparator();
+    }
+  }
+
+  /**
+   * 只读 / 手动同步模式的菜单快捷项：勾选显示当前状态，点击即时切换。
+   * Menu quick toggles for read-only / manual sync mode: the check mark shows the current
+   * state and a click switches it immediately.
+   */
+  private addModeMenuItems(menu: Menu): void {
+    const modes = readSyncModes(this.plugin.settings);
+
+    menu.addItem((item: MenuItem) => {
+      item
+        .setIcon("book-open")
+        .setTitle($("ui.mode.readonly_menu"))
+        .setChecked(modes.readonly)
+        .onClick(() => { void this.plugin.toggleSyncMode("readonly") });
+      (item as unknown as MenuItemWithDom).dom.setAttribute("aria-label", $("ui.mode.readonly_menu_desc"));
+    });
+
+    menu.addItem((item: MenuItem) => {
+      item
+        .setIcon("hand")
+        .setTitle($("ui.mode.manual_menu"))
+        .setChecked(modes.manual)
+        .onClick(() => { void this.plugin.toggleSyncMode("manual") });
+      (item as unknown as MenuItemWithDom).dom.setAttribute("aria-label", $("ui.mode.manual_menu_desc"));
+    });
+
+    menu.addSeparator();
+  }
+
+  /** 打开本插件设置面板 / Open this plugin's settings tab. */
+  private openSettingsTab(): void {
+    const app = this.plugin.app as AppWithInternal;
+    app.setting?.open();
+    app.setting?.openTabById(this.plugin.manifest.id);
+  }
+
+  /**
+   * 刷新菜单/状态栏上的模式与令牌权限指示（切换模式、鉴权状态变化、能力刷新后调用）。
+   * Refresh the mode and token-capability indicators after toggles, auth changes or capability
+   * refreshes.
+   */
+  refreshModeIndicators(): void {
+    this.statusBarManager?.renderModeIndicators?.();
+    this.updateRibbonModeBadge();
+  }
+
+  /**
+   * Ribbon 图标 aria-label 上追加当前模式说明，便于悬停时确认当前状态。
+   * Append the current mode description to the ribbon icon's aria-label for a hover check.
+   */
+  private updateRibbonModeBadge(): void {
+    if (!this.ribbonIcon) return;
+    this.ribbonIcon.setAttribute("aria-label", this.ribbonAriaLabel(this.ribbonIconStatus));
+  }
+
+  /**
+   * Ribbon 图标的 aria-label：连接状态 + 当前开启的模式，便于悬停确认。
+   * Ribbon aria-label: connection state plus any enabled modes, for a quick hover check.
+   */
+  private ribbonAriaLabel(status: boolean): string {
+    const base = $("ui.menu.ribbon_title") + " (" + (status ? $("setting.remote.connected") : $("setting.remote.disconnected")) + ")";
+    const modes = readSyncModes(this.plugin.settings);
+    const labels: string[] = [];
+    if (modes.readonly) labels.push($("ui.mode.readonly_menu"));
+    if (modes.manual) labels.push($("ui.mode.manual_menu"));
+    return labels.length > 0 ? `${base} · ${labels.join(" · ")}` : base;
   }
 
   /**
