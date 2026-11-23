@@ -602,7 +602,9 @@ export class WebSocketManager {
       }
     } else {
       if (typeof data === "object" && "vault" in data && data.vault != null && data.vault !== "" && data.vault !== this.plugin.settings.vault) {
-        dump("Service vault " + data.vault + " not match " + this.plugin.settings.vault);
+        // 两个库名都放进结构化字段，诊断日志按键名整体脱敏（服务端回来的库名和本机配置的不同，整词规则遮不到）
+        // Both vault names go into keyed fields so the diagnostic log redacts them by key
+        dump("Service vault not match", { remoteVault: data.vault, localVault: this.plugin.settings.vault });
         return;
       }
 

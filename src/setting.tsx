@@ -709,6 +709,8 @@ export class SettingTab extends PluginSettingTab {
         ...this.plugin.settings,
         api: maskValue(this.plugin.settings.api),
         apiToken: this.plugin.settings.apiToken ? "***HIDDEN***" : "",
+        // 库名与诊断日志口径一致，不随 Debug 信息带出 / Vault name is hidden, same as the diagnostic log
+        vault: this.plugin.settings.vault ? "[vault]" : "",
       },
       runtimeInfo: {
         runApi: maskValue(this.plugin.runApi),
