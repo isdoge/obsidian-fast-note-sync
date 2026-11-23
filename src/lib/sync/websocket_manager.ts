@@ -550,7 +550,11 @@ export class WebSocketManager {
         this.sentRequests?.delete(`${errorAction.replace(/Ack$/, "")}:${errorPath || onlyRequest?.path || ""}`);
         return;
       }
-      if (!isProtobufDecodeError && !data.context && errorPath && this.plugin.retryQueue?.ownsPendingPath(errorPath)) return;
+      // 冲突（530）不在这里吞掉：队列未认领的冲突（如改名目标路径）必须交给冲突面板。
+      // Never swallow a conflict (530) here: an unclaimed one (e.g. a rename target) must reach
+      // the conflict panel.
+      if (!isProtobufDecodeError && data.code !== ERROR_SYNC_CONFLICT && !data.context && errorPath
+        && this.plugin.retryQueue?.ownsPendingPath(errorPath)) return;
       // 处理冲突相关错误码
       if (data.code === ERROR_SYNC_CONFLICT) {
         void this.handleConflictError(data);

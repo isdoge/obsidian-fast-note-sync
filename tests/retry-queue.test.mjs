@@ -26,20 +26,31 @@ const helpers = {
   LocalStateFileMirror: Mirror, computeMirrorDigest: s => `digest:${s}`, generateUUID: () => `id-${++uid}`,
   dump: (...args) => logs.push(args), isPathExcluded: () => false, isFolderSyncPathExcluded: () => false,
   hashContentAsync: async s => s, hashFileAsync: async (app, path) => app.vault.getAbstractFileByPath(path)?.hash,
+  showSyncNotice: message => logs.push(['notice', message]),
 };
 const sends = [];
+// 与 baseline_scope.ts 的 baselineFieldsFromDeleteRecord 相同的线上字段。
+function wireDelete(explicit) {
+  if (!explicit) return {};
+  if (explicit.hashMissing || explicit.revision === "") return { baseHashMissing: true };
+  return { baseHash: explicit.hash, baseHashMissing: false, baseRevision: explicit.revision };
+}
 const ops = {};
 for (const kind of ['Note', 'File', 'Folder']) {
-  ops[`${kind.toLowerCase()}DeleteByPath`] = async (path, p) => {
+  ops[`${kind.toLowerCase()}DeleteByPath`] = async (path, p, guard, explicit) => {
     await p.lockManager.withLock(path, async () => {
+      if (guard && !guard()) return;
       await p.concurrencyLimiter.waitForSlot(path);
-      await p.websocket.SendMessage(`${kind}Delete`, { path });
+      await p.websocket.SendMessage(`${kind}Delete`, { path, ...wireDelete(explicit) });
     });
   };
-  ops[`${kind.toLowerCase()}Rename`] = async (f, oldPath, p) => {
+  ops[`${kind.toLowerCase()}Rename`] = async (f, oldPath, p, enter, guard, hash, revision) => {
     await p.lockManager.withLock(f.path, async () => {
+      if (guard && !guard()) return;
       await p.concurrencyLimiter.waitForSlot(f.path);
-      await p.websocket.SendMessage(`${kind}Rename`, { path: f.path, oldPath });
+      await p.websocket.SendMessage(`${kind}Rename`, {
+        path: f.path, oldPath, ...(hash !== undefined ? { oldPathHash: hash } : {}), ...(revision ? { baseRevision: revision } : {}),
+      });
     });
   };
 }
@@ -59,7 +70,14 @@ function make({ reset = true } = {}) {
   const p = {
     settings: { api: 'https://s', vault: 'v', apiToken: 't', syncEnabled: true },
     isIgnoredFile: () => false, lastSyncPathDeleted: new Set(), lastSyncPathRenamed: new Set(),
-    fileHashManager: { getPathHash: path => baseline.get(path) ?? null },
+    baselineMode: false, revisions: new Map(), confirmed: new Map(), folderRevisions: new Map(),
+    isSyncBaselineModeEnabled: () => p.baselineMode === true,
+    fileHashManager: {
+      getPathHash: path => baseline.get(path) ?? null,
+      getBaselineRevision: path => p.revisions.get(path) ?? null,
+      getConfirmedBaseline: path => p.confirmed.get(path) ?? null,
+    },
+    folderSnapshotManager: { getBaselineRevision: path => p.folderRevisions.get(path) ?? null },
     app: { vault: { getAbstractFileByPath: path => local.get(path) ?? null, read: async f => f.hash } },
     remote, local, baseline,
     lockManager: { async withLock(path, fn) { if (p.lockBusy) return null; return fn(); } },
@@ -262,5 +280,117 @@ for (const field of ['readonlySyncEnabled', 'manualSyncEnabled', 'syncEnabled'])
   p.eventManager = { resumeQueuedRename: () => { throw new Error('in-flight rename edit must not be deferred'); } };
   p.retryQueue.observe('note', 'rename', 'c.md', 'b.md');
   assert.equal(p.retryQueue.entries.length, 2); p.retryQueue.stop();
+}
+// 离线时 observe 仍记录管理器里已确认的令牌；重连后删除带 {baseHash, baseRevision}。
+{
+  const p = make(); await init(p); seed(p);
+  p.revisions.set('a.md', 'rev-1'); p.confirmed.set('a.md', { hash: 'h', revision: 'rev-1' });
+  p.baselineMode = false; // 离线：本次连接尚未确认基线能力
+  p.retryQueue.observe('note', 'delete', 'a.md'); await settle();
+  const entry = p.retryQueue.entries[0];
+  assert.equal(entry.baselineRevision, 'rev-1');
+  assert.equal(entry.baselineMissing, false);
+  p.baselineMode = true;
+  await auth(p);
+  assert.equal(sends.length, 1); assert.equal(sends[0].action, 'NoteDelete');
+  assert.equal(sends[0].baseHash, 'h'); assert.equal(sends[0].baseRevision, 'rev-1');
+  assert.equal(sends[0].baseHashMissing, false);
+  p.retryQueue.stop();
+}
+// 老服务端没有令牌：线上字段与修改前一致（只有 baseHashMissing）。
+{
+  const p = make(); await init(p); seed(p); p.baselineMode = false;
+  p.retryQueue.observe('note', 'delete', 'a.md'); await settle();
+  assert.equal(p.retryQueue.entries[0].baselineMissing, true);
+  assert.equal('baselineRevision' in p.retryQueue.entries[0], false);
+  await auth(p); assert.equal(sends.length, 1);
+  assert.equal(sends[0].baseHash, undefined); assert.equal(sends[0].baseRevision, undefined);
+  assert.equal(sends[0].baseHashMissing, true);
+  p.retryQueue.stop();
+}
+// 旧格式条目（无 baselineRevision）：发送前补令牌，管理器哈希不一致则不补。
+const legacyEntry = over => ({ id: 'old', objectType: 'note', operation: 'delete', path: 'a.md',
+  createdAt: now, attempts: 0, baselineHash: 'h', ...over });
+const legacyScope = 'digest:https://s\0v\0t';
+{
+  const p = make();
+  disk.set('retryQueue.json', JSON.stringify({ version: 1, scope: legacyScope, entries: [legacyEntry()] }));
+  p.remote.set('a.md', { path: 'a.md', contentHash: 'h' });
+  p.baselineMode = true; p.revisions.set('a.md', 'rev-2'); p.confirmed.set('a.md', { hash: 'h', revision: 'rev-2' });
+  await init(p); await auth(p);
+  assert.equal(sends.length, 1); assert.equal(sends[0].baseRevision, 'rev-2');
+  assert.equal(sends[0].baseHashMissing, false);
+  p.retryQueue.stop();
+}
+{
+  const p = make();
+  disk.set('retryQueue.json', JSON.stringify({ version: 1, scope: legacyScope, entries: [legacyEntry()] }));
+  p.remote.set('a.md', { path: 'a.md', contentHash: 'h' });
+  p.baselineMode = true; p.revisions.set('a.md', 'rev-3'); p.confirmed.set('a.md', { hash: 'other', revision: 'rev-3' });
+  await init(p); await auth(p);
+  assert.equal(sends.length, 1); assert.equal(sends[0].baseRevision, undefined);
+  assert.equal(sends[0].baseHashMissing, true);
+  p.retryQueue.stop();
+}
+// 目录旧条目按 revision 补令牌。
+{
+  const p = make();
+  disk.set('retryQueue.json', JSON.stringify({ version: 1, scope: legacyScope, entries: [{ id: 'f1', objectType: 'folder',
+    operation: 'delete', path: 'dir', createdAt: now, attempts: 0, baselineHash: '' }] }));
+  p.baselineMode = true; p.folderRevisions.set('dir', 'rev-dir');
+  await init(p); p.retryQueue.liveFolders.add('f1'); await auth(p);
+  assert.equal(sends.length, 1); assert.equal(sends[0].action, 'FolderDelete');
+  assert.equal(sends[0].baseRevision, 'rev-dir'); assert.equal(sends[0].baseHashMissing, false);
+  p.retryQueue.stop();
+}
+// 队列自己发出的删除收到 530 + SyncConflict：终态丢弃、路径进 recoveryPaths，drainBeforeSync 得以返回。
+{
+  const p = make(); await init(p); seed(p); await auth(p);
+  p.retryQueue.observe('note', 'delete', 'a.md'); await settle(); assert.equal(sends.length, 1);
+  let resolved = false; void p.retryQueue.drainBeforeSync().then(() => { resolved = true; });
+  assert.equal(p.retryQueue.reject('SyncConflict', 'a.md', 530, 'conflict'), true);
+  await settle();
+  assert.equal(resolved, true);
+  assert.equal(p.retryQueue.entries.length, 0);
+  assert.deepEqual([...p.retryQueue.getRecoveryPaths('note')], ['a.md']);
+  assert.ok(logs.some(parts => parts[1] === 'RetryQueueDiscard'));
+  p.retryQueue.stop();
+}
+// 改名：源路径 530 认领并终止；目标路径 530 交给冲突面板。
+{
+  const p = make(); await init(p); seed(p); p.local.set('b.md', { path: 'b.md', hash: 'h' }); await auth(p);
+  p.retryQueue.observe('note', 'rename', 'b.md', 'a.md'); await settle();
+  assert.equal(sends.length, 1); assert.equal(sends[0].action, 'NoteRename');
+  assert.equal(p.retryQueue.reject('SyncConflict', 'b.md', 530, 'target'), false);
+  assert.equal(p.retryQueue.entries.length, 1);
+  assert.equal(p.retryQueue.reject('SyncConflict', 'a.md', 530, 'source'), true);
+  assert.equal(p.retryQueue.entries.length, 0);
+  assert.deepEqual([...p.retryQueue.getRecoveryPaths('note')], ['a.md']);
+  p.retryQueue.stop();
+}
+// 基线模式改名不发 NoteRename（attempts 为 0）时，源路径 530 同样认领。
+{
+  const p = make(); await init(p); seed(p); p.local.set('b.md', { path: 'b.md', hash: 'h' });
+  p.retryQueue.observe('note', 'rename', 'b.md', 'a.md'); await settle();
+  assert.equal(p.retryQueue.entries[0].attempts, 0);
+  p.retryQueue.active = p.retryQueue.entries[0];
+  assert.equal(p.retryQueue.reject('SyncConflict', 'a.md', 530, 'source'), true);
+  assert.equal(p.retryQueue.entries.length, 0);
+  p.retryQueue.stop();
+}
+// 非确定性错误码：前 5 次拒绝保留条目，第 6 次发送后的拒绝成为终态。
+{
+  const p = make(); await init(p); seed(p); await auth(p);
+  p.retryQueue.observe('note', 'delete', 'a.md'); await settle(); assert.equal(sends.length, 1);
+  for (let i = 0; i < 5; i++) {
+    assert.equal(p.retryQueue.reject('NoteDelete', 'a.md', 500, 'retry'), true);
+    assert.equal(p.retryQueue.entries.length, 1);
+    await advance(60000);
+  }
+  assert.equal(p.retryQueue.entries[0].attempts, 6);
+  assert.equal(p.retryQueue.reject('NoteDelete', 'a.md', 500, 'retry'), true);
+  assert.equal(p.retryQueue.entries.length, 0);
+  assert.deepEqual([...p.retryQueue.getRecoveryPaths('note')], ['a.md']);
+  p.retryQueue.stop();
 }
 console.log('retry-queue.test.mjs: all scenarios passed');
