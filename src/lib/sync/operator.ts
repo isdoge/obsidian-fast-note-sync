@@ -14,6 +14,7 @@ import { $ } from "../../i18n/lang";
 import { SyncType } from "./sync_progress_tracker";
 import { ConfirmModal } from "../../views/confirm-modal";
 import { buildBaselineFields, buildDeleteBaselineFields } from "../storage/baseline_scope";
+import { evaluateMassDeleteGuard } from "./mass_delete_guard";
 import { conflictKindToSyncType, normalizeConflict, storeSyncConflict } from "./conflict_store";
 
 // C9: 离线超墓碑期保护 — 默认与服务端 soft-delete-retention-time 默认值对应（90 天），
@@ -937,6 +938,16 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     const delNotes: PathHashFile[] = [], delFiles: PathHashFile[] = [], delConfigs: PathHashFile[] = [], delFolders: PathHashFile[] = [];
     const missingNotes: PathHashFile[] = [], missingFiles: PathHashFile[] = [], missingConfigs: PathHashFile[] = [], missingFolders: PathHashFile[] = [];
 
+    // 大批消失护栏计数：已确认基线总数，以及其中被扫描推断为本地缺失、准备上报删除的数量。
+    // 只在 offlineDeleteSyncEnabled 的扫描循环里累加；首次同步/空基线时保持 0，护栏不会触发。
+    // Mass-disappearance guard counters: confirmed baseline entries and how many of them the scan
+    // inferred missing and queued for remote deletion. Only accumulated in the offline-delete scan
+    // loop; first sync / empty baseline keeps them at 0, so the guard cannot trigger.
+    let confirmedBaselineTotal = 0;
+    let confirmedMissingCount = 0;
+    let confirmedFolderBaselineTotal = 0;
+    let confirmedFolderMissingCount = 0;
+
     // 预先标记未参与本次同步的模块为已结束，避免 checkSyncCompletion 永远等待它们
     // Pre-mark modules not participating in this sync as ended to prevent checkSyncCompletion from waiting forever
     if (!(plugin.settings.syncEnabled && shouldSyncNotes)) {
@@ -1208,7 +1219,12 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
           if (isPathExcluded(path, plugin) || plugin.retryQueue?.shouldSkipScanDelete(path)) continue;
           // 冲突冻结的路径不由批量扫描替用户决定删除 / Frozen conflicted paths are never batch-deleted
           if (plugin.syncState.conflictedPaths.has(path)) continue;
+          // 只把服务端确认过的基线计入大批消失护栏；旧版未确认缓存不计入。
+          // Only server-confirmed baselines count toward the guard; legacy unconfirmed caches don't.
+          const baselineConfirmed = plugin.fileHashManager.getBaselineProvenance?.(path, null) === "confirmed";
+          if (baselineConfirmed) confirmedBaselineTotal++;
           if (!localPathsSet.has(path)) {
+            if (baselineConfirmed) confirmedMissingCount++;
             const item = { path: path, pathHash: hashContent(path) };
             if (path.endsWith(".md")) {
               delNotes.push({ ...item, ...buildDeleteBaselineFields(plugin, "note", path) });
@@ -1227,10 +1243,54 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
             if (++folderCount % 100 === 0) await yieldToMain();
             if (isFolderSyncPathExcluded(path, plugin) || plugin.retryQueue?.shouldSkipScanDelete(path)) continue;
             if (plugin.syncState.conflictedPaths.has(path)) continue;
+            const folderBaselineConfirmed = plugin.folderSnapshotManager.isBaselineConfirmed?.(path) === true;
+            if (folderBaselineConfirmed) confirmedFolderBaselineTotal++;
             if (!localFolderPathsSet.has(path)) {
+              if (folderBaselineConfirmed) confirmedFolderMissingCount++;
               delFolders.push({ path: path, pathHash: hashContent(path), ...buildDeleteBaselineFields(plugin, "folder", path) });
             }
           }
+        }
+
+        // 大批消失护栏（Fail-Closed）：扫描推断出的批量离线删除在发送前统一判定。
+        // 只在"已确认基线 >= 100 且缺失占比 > 80%"时中止；小库、首次同步、空基线不会误触发。
+        // 用户逐条触发的删除事件不经过这里，因此不受影响。
+        // Mass-disappearance guard (fail-closed): decide on scan-inferred batch offline deletes right
+        // before sending. Aborts only when confirmed baseline >= 100 AND the missing ratio > 80%;
+        // small vaults, first sync and empty baselines never trigger. User-triggered per-item
+        // deletes don't go through this path, so they are never blocked.
+        const fileGuard = evaluateMassDeleteGuard({
+          confirmedBaselineCount: confirmedBaselineTotal,
+          pendingDeleteCount: confirmedMissingCount,
+        });
+        const folderGuard = evaluateMassDeleteGuard({
+          confirmedBaselineCount: confirmedFolderBaselineTotal,
+          pendingDeleteCount: confirmedFolderMissingCount,
+        });
+        if (fileGuard.triggered || folderGuard.triggered) {
+          let blockedDeleteCount = 0;
+          let judgedBaselineCount = 0;
+          if (fileGuard.triggered) {
+            blockedDeleteCount += delNotes.length + delFiles.length;
+            judgedBaselineCount += fileGuard.confirmedBaselineCount;
+            delNotes.length = 0;
+            delFiles.length = 0;
+            plugin.syncState.truncatedSyncFields?.add("lastNoteSyncTime");
+            plugin.syncState.truncatedSyncFields?.add("lastFileSyncTime");
+          }
+          if (folderGuard.triggered) {
+            blockedDeleteCount += delFolders.length;
+            judgedBaselineCount += folderGuard.confirmedBaselineCount;
+            delFolders.length = 0;
+            plugin.syncState.truncatedSyncFields?.add("lastFolderSyncTime");
+          }
+          const msg = $("ui.notice.mass_delete_guard", {
+            deleted: String(blockedDeleteCount),
+            total: String(judgedBaselineCount),
+          });
+          dump(`[MassDeleteGuard] Blocked ${blockedDeleteCount}/${judgedBaselineCount} scan-inferred deletes (file=${fileGuard.triggered}, folder=${folderGuard.triggered}); delete upload aborted, cursors held`);
+          SyncLogManager.getInstance().addLog("error", "MassDeleteGuard", msg, "error");
+          showSyncNotice(msg, 10000);
         }
       } else if (isLoadLastTime) {
         // 增量同步且未开启离线删除同步：检测缺失的文件（哈希表中有但本地不存在）

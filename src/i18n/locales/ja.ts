@@ -647,6 +647,7 @@ export default {
   "ui.notice.protobuf_fallback": "Protobuf メッセージのデコードに失敗したため、このセッションでは JSON に切り替えました。保存済みの Protobuf 設定は変更されていません。",
   "ui.notice.hash_limit_exceeded": "1回のハッシュ計算上限 (${limit}) に達したため、今回は ${skipped} 件のファイルをスキップしました。次回の同期で処理を続行します。上限を引き上げるか制限を無効にすることもできます。",
   "ui.notice.hash_timeout": "ハッシュ計算がタイムアウトしたため、${count} 件のファイルをスキップしました。該当する種類の同期時刻を保持し、次回の同期で再試行します。",
+  "ui.notice.mass_delete_guard": "ローカルスキャンの異常を検出しました：ベースラインの ${deleted}/${total} 件のファイルが同時に消失しました。リモートデータの誤削除を防ぐため、今回の削除同期を中止しました。意図した削除の場合は、分割して削除するか同期ベースラインをリセットしてください。",
   "ui.conflict.list_count": "${count} 件の競合ファイル",
   "ui.conflict.list_empty": "現在競合しているノートはありません",
   "ui.conflict.unaligned_tag": "整列待ち：ローカルに内容あり・共通ベースなし",
