@@ -55,6 +55,7 @@ const noteOps = loadModule("src/lib/sync/operator_note.ts", (id) => {
   if (id === "./sync_log_manager") return { SyncLogManager: { getInstance: () => ({ addLog: noop, addOrUpdateLog: noop }) } };
   if (id === "./sync_state") return { advanceLiveSyncTime: noop };
   if (id === "../../i18n/lang") return { $: (k) => k };
+  if (id === "../utils/sync_diagnostics") return {};
   throw new Error(`Unexpected require in operator_note: ${id}`);
 });
 
@@ -185,6 +186,7 @@ const operator = loadModule("src/lib/sync/operator.ts", (id) => {
   // Mass-delete guard is not the subject of this test; keep it inert.
   if (id === "./mass_delete_guard") return { evaluateMassDeleteGuard: () => ({ triggered: false, confirmedBaselineCount: 0, pendingDeleteCount: 0, missingRatio: 0, minBaselineCount: 100, ratioThreshold: 0.8 }) };
   if (id === "../../main") return {};
+  if (id === "../utils/sync_diagnostics") return {};
   throw new Error(`Unexpected require in operator: ${id}`);
 });
 

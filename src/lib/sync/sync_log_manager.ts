@@ -5,6 +5,7 @@ const safeMoment = moment as unknown as (inp?: unknown) => { format(format: stri
 import FastSync from "../../main";
 import { dumpError } from "../utils/helpers";
 import { $ } from "../../i18n/lang";
+import { bindSyncLogWriter, mirrorSyncLog } from "../utils/sync_diagnostics";
 
 
 // 常见错误码 -> i18n 人话文案键映射表（覆盖客户端已知的鉴权/冲突/上传会话等高频错误码，
@@ -123,6 +124,12 @@ export class SyncLogManager {
 
     public init(plugin: FastSync) {
         this.plugin = plugin;
+        // 显式诊断记录写回同步日志的通道（诊断模块不反向依赖本模块，避免循环导入）
+        // Channel for explicit diagnostics to write a sync log (no reverse import, avoids a cycle)
+        bindSyncLogWriter((level, action, message, path) => {
+            this.addLog(level === "error" ? "error" : "info", action, message,
+                level === "error" ? "error" : "success", path);
+        });
     }
 
     private getCategory(action: string): LogCategory {
@@ -171,6 +178,9 @@ export class SyncLogManager {
 
             if (statusChanged) {
                 this.onStatusTransition(existingLog.status, targetStatus);
+                // error / cancelled 的条目自动转存诊断缓冲（诊断模块不回写 SyncLog）
+                // error / cancelled entries are mirrored into the diagnostics buffer (never written back)
+                mirrorSyncLog(updatedLog);
             }
 
             // 仅在状态从 pending 变为 success/error 时记录到文件，避免进度更新刷屏
@@ -195,6 +205,7 @@ export class SyncLogManager {
             if (newLog.status === 'error') {
                 this.onStatusTransition(undefined, 'error');
             }
+            mirrorSyncLog(newLog);
 
             if (this.logs.size > this.MAX_LOGS) {
                 // 淘汰最早插入的一条非失败记录（失败项不受总量上限淘汰，见 enforceFailedCap）

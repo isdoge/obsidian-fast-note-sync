@@ -10,6 +10,7 @@ import { FireflyPostModal, CheckFireflyPostModal, CreateFireflyPostModal, trigge
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
 import { SyncLogManager } from "../sync/sync_log_manager";
+import * as syncDiagnostics from "./sync_diagnostics";
 
 
 export class EventManager {
@@ -195,6 +196,8 @@ export class EventManager {
   private retryWhenAuthed(eventName: string, file: TAbstractFile, handler: (f: TAbstractFile) => void, attempt: number) {
     if (attempt >= 600) {
       dump(`EventManager: ${eventName} dropped after ${attempt} retries (websocket not authed): ${file.path}`)
+      syncDiagnostics.recordDiag?.("error", "LocalEventDropped",
+        `${eventName} dropped after ${attempt} retries (websocket not authed)`, file.path)
       return
     }
     this.scheduleRetry(() => {
@@ -477,6 +480,8 @@ export class EventManager {
             this.scheduleRetry(() => this.runWithDelay(key, task, delayset, lockRequeue + 1), 1000)
           } else {
             dump(`EventManager: task dropped after ${lockRequeue} lock requeues: ${key}`)
+            syncDiagnostics.recordDiag?.("error", "LocalEventDropped",
+              `task dropped after ${lockRequeue} lock requeues`, key)
           }
         }
       })

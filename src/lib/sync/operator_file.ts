@@ -10,6 +10,7 @@ import { advanceLiveSyncTime } from "./sync_state";
 import { HttpApiService } from "../api/http_api_service";
 import type FastSync from "../../main";
 import { BaselineDeleteRecord, baselineFieldsFromDeleteRecord, buildBaselineFields, buildDeleteBaselineFields } from "../storage/baseline_scope";
+import * as syncDiagnostics from "../utils/sync_diagnostics";
 
 
 // Download commit guard. A download may only overwrite the local path if, at commit time, it is
@@ -916,6 +917,9 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
   // same reasoning as the note upload entry
   if (plugin.syncRoundReadonly || plugin.settings.readonlySyncEnabled) {
     dump(`Read-only mode: Intercepted file upload request for ${data.path}`)
+    // 留一份带路径的清单，用户可以只开只读跑一轮看清“本机有、服务端没有”的条目
+    // Keep a per-path list so a read-only round shows what exists locally but not on the server
+    syncDiagnostics.recordUploadSkippedReadOnly?.(data.path)
     if (!outsideRound) plugin.recordSyncCompleted('file', data.pageIndex)
     return
   }
@@ -1588,6 +1592,9 @@ export const receiveFileSyncEnd = async function (data: unknown, plugin: FastSyn
   plugin.fileSyncTasks.needModify = syncData.needModifyCount || 0
   plugin.fileSyncTasks.needSyncMtime = syncData.needSyncMtimeCount || 0
   plugin.fileSyncTasks.needDelete = syncData.needDeleteCount || 0
+  // 本轮服务端计数留档，供每轮摘要使用（不改变任何处理行为）
+  // Keep this round's server counts for the round summary (no behavior change)
+  syncDiagnostics.recordSyncEndCounts?.("file", syncData)
 
   // End 先于明细到达：暂存 lastTime，待本类型全部完成且无失败时由 settleSyncTimes 落盘
   // End arrives before the details: stash lastTime; settleSyncTimes persists it once the type finished without failures

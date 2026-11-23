@@ -53,6 +53,7 @@ const noteOps = loadModule("src/lib/sync/operator_note.ts", (id) => {
   if (id === "./sync_log_manager") return { SyncLogManager: { getInstance: () => ({ addLog: noop, addOrUpdateLog: noop }) } };
   if (id === "./sync_state") return { advanceLiveSyncTime: noop };
   if (id === "../../i18n/lang") return { $: (k) => k };
+  if (id === "../utils/sync_diagnostics") return {};
   throw new Error(`Unexpected require in operator_note: ${id}`);
 });
 

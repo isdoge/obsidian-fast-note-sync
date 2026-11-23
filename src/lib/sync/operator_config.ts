@@ -8,6 +8,7 @@ import { ReceiveMessage, ReceiveMtimeMessage, ReceivePathMessage, SyncEndData } 
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
 import { buildBaselineFields, buildDeleteBaselineFields } from "../storage/baseline_scope";
+import * as syncDiagnostics from "../utils/sync_diagnostics";
 
 
 /**
@@ -736,6 +737,9 @@ export const receiveConfigSyncEnd = async function (data: unknown, plugin: FastS
     plugin.configSyncTasks.needModify = syncData.needModifyCount || 0
     plugin.configSyncTasks.needSyncMtime = syncData.needSyncMtimeCount || 0
     plugin.configSyncTasks.needDelete = syncData.needDeleteCount || 0
+    // 本轮服务端计数留档，供每轮摘要使用（不改变任何处理行为）
+    // Keep this round's server counts for the round summary (no behavior change)
+    syncDiagnostics.recordSyncEndCounts?.("config", syncData)
 
     // 与 note/file/folder 三类一致：无条件暂存（service#101）。服务端 SettingSyncEnd 的
     // lastTime 同样取查询开始时刻（ws_setting.go syncStartTime），无下行更新时也有效；

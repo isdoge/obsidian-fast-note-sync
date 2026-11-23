@@ -5,6 +5,8 @@ import { SyncLogManager } from "./sync_log_manager";
 import { noteDeleteByPath, noteRename } from "./operator_note";
 import { fileDeleteByPath, fileRename } from "./operator_file";
 import { folderDeleteByPath, folderRename } from "./operator_folder";
+import * as i18n from "../../i18n/lang";
+import * as syncDiagnostics from "../utils/sync_diagnostics";
 
 export const RETRY_QUEUE_MAX_ENTRIES = 2000;
 export const RETRY_QUEUE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -57,6 +59,10 @@ export class RetryQueue {
     private retiredAckKeys = new Set<string>();
     private reconnectRequested = false;
     private waiters: (() => void)[] = [];
+    // 卡住提示：每个连接只报一次；定时器在等待结束/断线时清理
+    // Stall report: once per connection; timers cleared when the wait ends or the link drops
+    private stallReported = false;
+    private stallTimers: Set<number> = new Set();
 
     constructor(private plugin: FastSync) {
         this.scope = this.getScope();
@@ -532,6 +538,28 @@ export class RetryQueue {
         if (!this.connected() || !this.enabled() || !this.entries.length) return;
         const wait = new Promise<void>(resolve => this.waiters.push(resolve));
         this.kick();
+        // 等待超过 30 秒仍未清空：记录一次并提示，但不改变等待行为（不超时返回）
+        // After 30s with entries still queued: record and notify once, without changing the wait
+        // (never return early on a timeout)
+        if (!this.stallReported) {
+            const timer = window.setTimeout(() => {
+                this.stallTimers.delete(timer);
+                if (this.stallReported || !this.entries.length) return;
+                this.stallReported = true;
+                const head = this.entries[0];
+                syncDiagnostics.recordDiag?.("error", "RetryQueueStalled",
+                    `head=${head.objectType}/${head.operation} attempts=${head.attempts} remaining=${this.entries.length}${head.oldPath ? ` oldPath=${head.oldPath}` : ""}`,
+                    head.path);
+                if (this.plugin.settings.isShowNotice) {
+                    showSyncNotice(i18n.$?.("ui.notice.retry_queue_stalled", { count: String(this.entries.length) }), 12000);
+                }
+            }, 30000);
+            this.stallTimers.add(timer);
+            void wait.then(() => {
+                window.clearTimeout(timer);
+                this.stallTimers.delete(timer);
+            });
+        }
         await wait;
     }
 
@@ -541,6 +569,11 @@ export class RetryQueue {
 
     onDisconnected(): void {
         this.generation++;
+        // 每个连接只提示一次：新连接重新计数并清掉未触发的卡住定时器
+        // Once per connection: a new connection resets the flag and clears pending stall timers
+        this.stallReported = false;
+        this.stallTimers.forEach(timer => window.clearTimeout(timer));
+        this.stallTimers.clear();
         if (this.timer !== null) window.clearTimeout(this.timer);
         this.timer = null;
         if (this.active) this.release(this.active);

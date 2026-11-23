@@ -9,6 +9,7 @@ import { SyncLogManager } from "./sync_log_manager";
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
 import { BaselineDeleteRecord, baselineFieldsFromDeleteRecord, buildBaselineFields, buildDeleteBaselineFields } from "../storage/baseline_scope";
+import * as syncDiagnostics from "../utils/sync_diagnostics";
 
 // 同一插件会话中每条失败路径只通知一次；重试仍逐次保留同步错误日志。
 const notifiedNoteFailures = new WeakMap<FastSync, Set<string>>();
@@ -764,6 +765,9 @@ export const receiveNoteUpload = async function (data: ReceivePathMessage, plugi
   // still block the server's upload request.
   if (plugin.syncRoundReadonly || plugin.settings.readonlySyncEnabled) {
     dump(`Read-only mode: Intercepted note upload request for ${data.path}`)
+    // 留一份带路径的清单，用户可以只开只读跑一轮看清“本机有、服务端没有”的条目
+    // Keep a per-path list so a read-only round shows what exists locally but not on the server
+    syncDiagnostics.recordUploadSkippedReadOnly?.(data.path)
     plugin.recordSyncCompleted('note', data.pageIndex)
     return
   }
@@ -1073,6 +1077,9 @@ export const receiveNoteSyncEnd = async function (data: unknown, plugin: FastSyn
   plugin.noteSyncTasks.needModify = syncData.needModifyCount || 0
   plugin.noteSyncTasks.needSyncMtime = syncData.needSyncMtimeCount || 0
   plugin.noteSyncTasks.needDelete = syncData.needDeleteCount || 0
+  // 本轮服务端计数留档，供每轮摘要使用（不改变任何处理行为）
+  // Keep this round's server counts for the round summary (no behavior change)
+  syncDiagnostics.recordSyncEndCounts?.("note", syncData)
 
   // End 先于明细到达：暂存 lastTime，待本类型全部完成且无失败时由 settleSyncTimes 落盘
   // End arrives before the details: stash lastTime; settleSyncTimes persists it once the type finished without failures

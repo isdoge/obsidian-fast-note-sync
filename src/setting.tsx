@@ -3,6 +3,7 @@ import { createRoot, Root } from "react-dom/client";
 import { unzipSync } from "fflate";
 
 import { parseRules, SyncRule, getPluginDir, debounce, showSyncNotice, dump, dumpError } from "./lib/utils/helpers";
+import { copySyncDiagnostics } from "./lib/utils/sync_diagnostics";
 import { resetSettingSyncTime, rebuildAllHashes, clearAllHashes } from "./lib/sync/operator";
 import { SettingsView, SupportView } from "./views/settings-view";
 import { RuleEditorModal } from "./views/rule-editor-modal";
@@ -780,6 +781,20 @@ export class SettingTab extends PluginSettingTab {
         console.error("[fast-note-sync] copy debug info failed:", e)
         // TODO(i18n): replace with localized key, e.g. $("setting.support.debug_copy_failed")
         showSyncNotice("Failed to copy debug info.")
+      }
+    }
+
+    const diagButton = debugDiv.createEl("button")
+    diagButton.setText($("setting.support.copy_diagnostics"))
+    diagButton.setAttribute("title", $("setting.support.copy_diagnostics_desc"))
+    diagButton.onclick = async () => {
+      try {
+        const ok = await copySyncDiagnostics(this.plugin)
+        if (ok) showSyncNotice($("ui.history.copied"))
+      } catch (e) {
+        console.error("[fast-note-sync] copy sync diagnostics failed:", e)
+        // TODO(i18n): replace with localized key, e.g. $("setting.support.copy_diagnostics_failed")
+        showSyncNotice("Failed to copy sync diagnostics.")
       }
     }
 

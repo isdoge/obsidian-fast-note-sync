@@ -122,6 +122,7 @@ class HttpApiService {
   }
 }
 const helperModule = runModule('src/lib/sync/operator_file.ts', {
+  '../utils/sync_diagnostics': {},
   './remote_path_guard': { blockAliasedRemoteMutation: () => false },
   './remote_delete_guard': { firstKeepWithoutBaseline: () => false },
   'obsidian': {

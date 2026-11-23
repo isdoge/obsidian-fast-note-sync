@@ -7,6 +7,7 @@ import { hashContent, dump, dumpError, isFolderSyncPathExcluded, waitForFolderEm
 import { SyncLogManager } from "./sync_log_manager";
 import type FastSync from "../../main";
 import { BaselineDeleteRecord, buildBaselineFields, buildDeleteBaselineFields } from "../storage/baseline_scope";
+import * as syncDiagnostics from "../utils/sync_diagnostics";
 
 
 /**
@@ -470,6 +471,9 @@ export const receiveFolderSyncEnd = async function (data: unknown, plugin: FastS
     plugin.folderSyncTasks.needModify = syncData.needModifyCount || 0
     plugin.folderSyncTasks.needSyncMtime = syncData.needSyncMtimeCount || 0
     plugin.folderSyncTasks.needDelete = syncData.needDeleteCount || 0
+    // 本轮服务端计数留档，供每轮摘要使用（不改变任何处理行为）
+    // Keep this round's server counts for the round summary (no behavior change)
+    syncDiagnostics.recordSyncEndCounts?.("folder", syncData)
 
     // End 先于明细到达：暂存 lastTime，待本类型全部完成且无失败时由 settleSyncTimes 落盘
     // End arrives before the details: stash lastTime; settleSyncTimes persists it once the type finished without failures

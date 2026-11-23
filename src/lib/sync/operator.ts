@@ -5,6 +5,9 @@ import { hashContent, hashContentAsync, dump, dumpError, isPathExcluded, isFolde
 import { receiveConfigSyncModify, receiveConfigUpload, receiveConfigSyncMtime, receiveConfigSyncDelete, receiveConfigSyncEnd, configAllPaths, receiveConfigSyncClear, receiveConfigModifyAck, receiveConfigDeleteAck } from "./operator_config";
 import { receiveNoteSyncModify, receiveNoteUpload, receiveNoteSyncMtime, receiveNoteSyncDelete, receiveNoteSyncEnd, receiveNoteSyncRename, receiveNoteModifyAck, receiveNoteRenameAck, receiveNoteDeleteAck, conflictBackupPaths, probeEmptyNoteInsteadOfUpload } from "./operator_note";
 import { SyncMode, SnapFile, SnapFolder, SyncEndData, PathHashFile, NoteSyncData, FileSyncData, ConfigSyncData, FolderSyncData } from "../utils/types";
+// 诊断通道：测试会以最小 stub 注入本模块，调用处统一用可选调用，缺失时静默跳过
+// Diagnostics channel: tests inject minimal stubs, so calls are optional and silently skipped when absent
+import * as syncDiagnostics from "../utils/sync_diagnostics";
 import { receiveFolderSyncModify, receiveFolderSyncDelete, receiveFolderSyncRename, receiveFolderSyncEnd, receiveFolderModifyAck, receiveFolderDeleteAckWithRevision, receiveFolderRenameAckWithRevision } from "./operator_folder";
 import { FileCloudPreview } from "../storage/file_cloud_preview";
 import { SyncLogManager } from "./sync_log_manager";
@@ -360,6 +363,25 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, _sync
     if (hashTimeoutCount > 0) {
       showSyncNotice($("ui.notice.hash_timeout", { count: String(hashTimeoutCount) }), 10000);
       plugin.syncState.hasSyncedThisConnection = false;
+    }
+
+    // 诊断摘要与“首次同步上传较多”提示：都在本轮状态被清空前取数
+    // Diagnostic summary and the first-sync upload notice: read round state before it is cleared
+    const diagConflicts = Array.from(plugin.syncState.conflictCountsThisRound?.values() ?? [])
+      .reduce((sum, count) => sum + count, 0);
+    const diagUnaligned = plugin.syncState.newUnalignedPathsThisRound?.size ?? 0;
+    const roundUploadTotals = syncDiagnostics.getRoundUploadTotals?.();
+    syncDiagnostics.recordRoundSummary?.({
+      failed: totalFailed,
+      conflicts: diagConflicts,
+      unaligned: diagUnaligned,
+      hashTimeouts: hashTimeoutCount,
+    });
+    if (roundUploadTotals && !roundUploadTotals.readonly && !roundUploadTotals.initSync) {
+      const firstSyncUploadCount = roundUploadTotals.notes + roundUploadTotals.files;
+      if (firstSyncUploadCount >= 20 && plugin.settings.isShowNotice) {
+        showSyncNotice($("ui.notice.first_sync_uploaded", { count: String(firstSyncUploadCount) }), 15000);
+      }
     }
     // 未参与完成判定的类型（如本轮中途关闭了同步）仍有暂存时间时回到基线
     // Types left unsettled (e.g. sync disabled mid-round) fall back to their baseline
@@ -872,6 +894,9 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     plugin.currentSyncType = isLoadLastTime ? 'incremental' : 'full';
     plugin.syncTypeCompleteCount = 0;
     plugin.resetSyncTasks();
+    // 本轮诊断统计从这里开始（isInitSync 取本轮开始前的值）
+    // Per-round diagnostics start here (isInitSync is the value before this round)
+    syncDiagnostics.beginSyncRound?.(plugin.currentSyncType, readonlyThisRound, !!plugin.localStorageManager.getMetadata("isInitSync"));
 
     const shouldSyncNotes = syncMode === "auto" || syncMode === "note";
     const shouldSyncConfigs = syncMode === "auto" || syncMode === "config";
@@ -1147,6 +1172,9 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                   } catch (error) {
                     // 超时单独计数，受影响类型保留游标供下轮重试。 / Count timeouts separately and retry the type next round.
                     if (error instanceof Error && error.name === "HashTimeoutError") timedOutNoteCount++;
+                    // 超时已在摘要的 hashTimeouts 单列，不再计入扫描错误
+                    // Timeouts are reported as hashTimeouts; they are not counted as scan errors
+                    else syncDiagnostics.recordScanFileError?.(notePath, error);
                   }
                 });
               }
@@ -1211,12 +1239,18 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                   } catch (error) {
                     // 超时单独计数，受影响类型保留游标供下轮重试。 / Count timeouts separately and retry the type next round.
                     if (error instanceof Error && error.name === "HashTimeoutError") timedOutFileCount++;
+                    // 超时已在摘要的 hashTimeouts 单列，不再计入扫描错误
+                    // Timeouts are reported as hashTimeouts; they are not counted as scan errors
+                    else syncDiagnostics.recordScanFileError?.(attPath, error);
                   }
                 });
               }
             }
           }
-        } catch {
+        } catch (error) {
+          // 单文件扫描异常：计数并记录前 10 个路径，继续处理下一个（行为不变）
+          // Per-file scan error: count, log the first 10 paths, keep going (behavior unchanged)
+          syncDiagnostics.recordScanFileError?.(file.path, error);
           continue;
         }
       }
@@ -1570,6 +1604,17 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     // 分批发送方案替代原截断方案：不再对 sync 数组截断，所有数据通过 sendInBatches 分批发送
     // Replaced truncation with batch-send: arrays are no longer capped; sendInBatches handles chunking
     dump(`[Sync] Arrays ready: notes=${notes.length}, files=${files.length}, folders=${folders.length}, configs=${configs.length}`);
+    // 扫描上报条数与其中无基线的条数（只统计已有字段，不改变扫描行为）
+    // Reported scan counts and their no-baseline subset (existing fields only; scan behavior unchanged)
+    syncDiagnostics.recordScanReport?.({
+      notes: notes.length,
+      files: files.length,
+      configs: configs.length,
+      folders: folders.length,
+      noBaselineNotes: notes.filter(n => n.baseHashMissing === true).length,
+      noBaselineFiles: files.filter(f => f.baseHashMissing === true).length,
+      noBaselineConfigs: configs.filter(c => c.baseHashMissing === true).length,
+    });
 
     const noteData: NoteSyncData = { lastTime: noteTime, notes, delNotes, missingNotes };
     const fileData: FileSyncData = { lastTime: fileTime, files, delFiles, missingFiles };

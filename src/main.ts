@@ -16,6 +16,7 @@ import { FileHashManager } from "./lib/storage/file_hash_manager";
 import { CloudAttachmentEviction } from "./lib/storage/cloud_attachment_eviction";
 import { DebugLogManager } from "./lib/utils/debug_log_manager";
 import { setDiagnosticRedactionContext } from "./lib/utils/redact_log";
+import { initSyncDiagnostics, recordStartupState, flushSyncDiagnostics, copySyncDiagnostics } from "./lib/utils/sync_diagnostics";
 import { SyncLogManager } from "./lib/sync/sync_log_manager";
 import { DebugLogModal } from "./views/debug-log-modal";
 import { VersionManager } from "./lib/utils/version_manager";
@@ -645,6 +646,18 @@ export default class FastSync extends Plugin {
         },
       });
 
+      // 复制同步诊断（启动状态 / 协商 / 最近 5 轮摘要 / 失败记录）
+      // Copy sync diagnostics (startup state / negotiation / last 5 rounds / failures)
+      this.addCommand({
+        id: "copy-sync-diagnostics",
+        name: $("setting.support.copy_diagnostics"),
+        callback: () => {
+          void copySyncDiagnostics(this).then(ok => {
+            if (ok) showSyncNotice($("ui.history.copied"))
+          })
+        },
+      });
+
       // 3. 初始化 UI 管理器（ribbon 已在 onLayoutReady 之前创建，这里只完成其余初始化）
       // UI manager: ribbon was already created before onLayoutReady; finish the rest here
       this.menuManager.init()
@@ -768,6 +781,12 @@ export default class FastSync extends Plugin {
         void this.eventManager.registerEvents()
       }
 
+      // 6.1 诊断缓冲：读回上次落盘内容并记录本次启动状态（不依赖调试日志开关）
+      // Diagnostics: restore the previous file and record the startup state (independent of the
+      // debug log toggle)
+      await initSyncDiagnostics(this, `${getPluginDir(this)}/diagnostics.json`)
+      recordStartupState(this)
+
       // 7. 刷新运行时设置 (包含网络探测，不阻塞主流程)
       void this.reloadServices()
 
@@ -804,6 +823,8 @@ export default class FastSync extends Plugin {
     this.configHashManager?.flush()
     this.folderSnapshotManager?.flush()
     this.localStorageManager?.flushSyncStateMirror()
+    // 卸载前落盘诊断缓冲（2 秒节流里的尾部记录不丢）/ Flush the throttled diagnostics tail
+    void flushSyncDiagnostics()
     // 取消注册文件事件
     void this.reloadServices(false)
     // reloadServices 末尾会重新评估空闲定时器，卸载时必须最后再清一次，避免留下定时器
