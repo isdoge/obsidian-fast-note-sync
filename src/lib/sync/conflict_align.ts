@@ -8,6 +8,7 @@ import {
   noteModify,
   CONFLICT_REASON_UNALIGNED,
 } from "./operator_note";
+import { readonlyResolutionBlocked } from "./conflict_resolve";
 import type FastSync from "../../main";
 
 /**
@@ -19,7 +20,7 @@ export type ConflictAlignMode = "local" | "remote" | "both";
 export interface ConflictAlignResult {
   path: string;
   ok: boolean;
-  reason?: "new_edit" | "missing_local" | "missing_remote" | "error";
+  reason?: "new_edit" | "missing_local" | "missing_remote" | "readonly" | "error";
 }
 
 function clearConflictedPath(plugin: FastSync, path: string): void {
@@ -85,6 +86,10 @@ export async function alignConflictEntry(
 
     try {
       if (mode === "local") {
+        // 保留本地会主动上传：只读下整体不执行，拦截放在清理备份/状态之前
+        // "Keep local" uploads: never run it in read-only mode, and gate before clearing the
+        // backups / conflict state
+        if (readonlyResolutionBlocked(plugin)) return { path, ok: false, reason: "readonly" as const };
         // 保留本地：清理内部备份与待对齐状态，然后主动上传本地版本
         // Keep local: drop internal backups/state, then upload the local version
         clearConflictedPath(plugin, path);
@@ -108,6 +113,10 @@ export async function alignConflictEntry(
         return { path, ok: true };
       }
 
+      // 保留双份会创建副本并主动上传：只读下整体不执行，拦截放在生成本地副本之前
+      // "Keep both" creates a copy and uploads: never run it in read-only mode, and gate before
+      // the local copy is created
+      if (readonlyResolutionBlocked(plugin)) return { path, ok: false, reason: "readonly" as const };
       // 保留双份：本地原文件不动，远端版本另存为可见的 .remote.md 副本，再上传本地版本
       // Keep both: leave the local note alone, save the remote version as a visible .remote.md
       // copy, then upload the local version

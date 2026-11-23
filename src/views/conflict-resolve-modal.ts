@@ -4,6 +4,7 @@ import { $ } from "../i18n/lang";
 import { hashContent, hashContentAsync } from "../lib/utils/helpers";
 import { removeConflictBackups } from "../lib/sync/operator_note";
 import { configModify } from "../lib/sync/operator_config";
+import { readonlyResolutionBlocked } from "../lib/sync/conflict_resolve";
 
 /**
  * ConflictResolveModal provides a 3-column diff view for manual note conflict resolution.
@@ -386,6 +387,13 @@ export class ConflictResolveModal extends Modal {
       cls: "mod-cta"
     });
     resolveBtn.onClickEvent(async () => {
+      // 只读模式下冲突处置会上传/改远端：整体拒绝，先于任何本地覆盖（含配置写回与备份清理）
+      // In read-only mode conflict resolution would upload / change the remote: reject it before
+      // any local overwrite (including the config write-back and backup cleanup)
+      if (readonlyResolutionBlocked(this.plugin)) {
+        new Notice($("ui.conflict.readonly_blocked") || "只读同步模式已开启，请先关闭后再处理冲突");
+        return;
+      }
       this.resolved = true;
       resolveBtn.disabled = true;
       cancelBtn.disabled = true;

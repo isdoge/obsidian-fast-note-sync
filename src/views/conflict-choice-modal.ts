@@ -1,7 +1,7 @@
 import { App, Modal, Notice } from "obsidian";
 
 import { $ } from "../i18n/lang";
-import { ConflictResolveMode, resolveConflictEntry } from "../lib/sync/conflict_resolve";
+import { ConflictResolveMode, readonlyResolutionBlocked, resolveConflictEntry } from "../lib/sync/conflict_resolve";
 import { conflictKindLabel, conflictReasonLabel, readUnifiedConflictMeta } from "../lib/sync/conflict_store";
 import type FastSync from "../main";
 
@@ -36,10 +36,21 @@ export class ConflictChoiceModal extends Modal {
 
     const actions = containerEl.createDiv({ cls: "conflict-resolve-actions" });
     const run = async (mode: ConflictResolveMode) => {
+      // “保留本地 / 保留双份”必然上传：只读下先提示并保持弹窗打开，任何本地改动都不执行。
+      // “采用远端”可能是纯本地动作（如远端已是墓碑），交给 resolver 逐条判断，不在这里一刀切。
+      // "Keep local / keep both" always upload: in read-only mode warn and keep the modal open
+      // with no local change. "Use remote" can be local-only (e.g. remote tombstone), so it is
+      // left to the resolver instead of being blocked outright here.
+      if (mode !== "remote" && readonlyResolutionBlocked(this.plugin)) {
+        new Notice($("ui.conflict.readonly_blocked") || "只读同步模式已开启，请先关闭后再处理冲突");
+        return;
+      }
       this.close();
       const result = await resolveConflictEntry(this.plugin, this.path, mode);
       if (result.ok) {
         new Notice($("ui.conflict.resolved_notice") || "冲突已解决");
+      } else if (result.reason === "readonly") {
+        new Notice($("ui.conflict.readonly_blocked") || "只读同步模式已开启，请先关闭后再处理冲突");
       } else if (result.reason === "new_edit") {
         new Notice($("ui.conflict.batch_skipped_new_edit", { count: "1", paths: this.path }) || "条目在待处理期间已被编辑，请重新打开核对");
       } else if (result.reason === "missing_remote") {

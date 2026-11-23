@@ -617,6 +617,7 @@ export default {
   "ui.conflict.final_title": "競合解決コンテンツ",
   "ui.conflict.use_local": "ローカルを使用->",
   "ui.conflict.use_remote": "リモートを使用->",
+  "ui.conflict.readonly_blocked": "「読み取り専用同期モード」が有効なため、リモートを変更する競合操作は実行されません。先に読み取り専用同期モードを無効にしてください。",
   "ui.log.action.NoteManualMergeConflict": "ノート内容の競合",
   "ui.about.plugin_version": "プラグインバージョン",
   "ui.about.server_version": "サーバーバージョン",

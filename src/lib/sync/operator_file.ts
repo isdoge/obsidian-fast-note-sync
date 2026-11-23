@@ -902,7 +902,10 @@ export async function maybeAutoDeleteUploadedAttachment(plugin: FastSync, file: 
 export const receiveFileUpload = async function (data: FileUploadMessage, plugin: FastSync, outsideRound = false) {
   if (plugin.settings.syncEnabled == false) return
 
-  if (plugin.settings.readonlySyncEnabled) {
+  // 只读门禁：本轮入口快照与实时设置取或（fail-closed），理由同笔记上传入口
+  // Read-only gate: OR the round's entry snapshot with the live setting (fail-closed);
+  // same reasoning as the note upload entry
+  if (plugin.syncRoundReadonly || plugin.settings.readonlySyncEnabled) {
     dump(`Read-only mode: Intercepted file upload request for ${data.path}`)
     if (!outsideRound) plugin.recordSyncCompleted('file', data.pageIndex)
     return
@@ -1315,7 +1318,10 @@ export const receiveFileSyncDelete = async function (data: ReceivePathMessage, p
       // 超大附件不读内容，统计信息与已同步记录不符即视为有改动
       // Unsynced local edits win over a remote delete: keep the file and upload it again (#277).
       // A read-only device still deletes; large attachments are not read, a stat mismatch counts as changed
-      if (!plugin.settings.readonlySyncEnabled) {
+      // 轮次内接收逻辑：快照与实时设置 fail-closed 取或；轮次外快照为 false，退化为实时设置
+      // In-round receive logic: fail-closed snapshot-OR-live; outside a round the snapshot is
+      // false and the live setting decides
+      if (!(plugin.syncRoundReadonly || plugin.settings.readonlySyncEnabled)) {
         const baseHash = plugin.fileHashManager.getPathHash(normalizedPath)
         let changed = plugin.pendingUploadHashes.has(normalizedPath)
         if (!changed && baseHash !== null) {

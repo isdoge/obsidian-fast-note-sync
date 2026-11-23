@@ -748,7 +748,12 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
  */
 export const receiveNoteUpload = async function (data: ReceivePathMessage, plugin: FastSync) {
   if (plugin.settings.syncEnabled == false) return
-  if (plugin.settings.readonlySyncEnabled) {
+  // 只读门禁：本轮入口快照与实时设置取或（fail-closed）。轮次中途刚打开只读时快照仍可写，
+  // 但实时设置已只读，服务端要求的上传必须拦住。
+  // Read-only gate: OR the round's entry snapshot with the live setting (fail-closed). If
+  // read-only is turned on mid-round the snapshot stays writable, but the live setting must
+  // still block the server's upload request.
+  if (plugin.syncRoundReadonly || plugin.settings.readonlySyncEnabled) {
     dump(`Read-only mode: Intercepted note upload request for ${data.path}`)
     plugin.recordSyncCompleted('note', data.pageIndex)
     return
@@ -981,7 +986,10 @@ export const receiveNoteSyncDelete = async function (data: ReceiveMessage, plugi
         // 本地有未同步的改动时不执行远端删除：保留本地并重新上传（#277）。只读端以服务端为准，照常删除
         // Unsynced local edits win over a remote delete: keep the note and upload it again (#277).
         // A read-only device mirrors the server and still deletes
-        if (!plugin.settings.readonlySyncEnabled) {
+        // 本判断属于同步轮次内的接收逻辑，与上传门禁同口径 fail-closed 取或；轮次外快照为 false，退化为实时设置
+        // This runs inside the sync round's receive flow, so it uses the same fail-closed
+        // snapshot-OR-live gate; outside a round the snapshot is false and the live setting decides
+        if (!(plugin.syncRoundReadonly || plugin.settings.readonlySyncEnabled)) {
           const baseHash = plugin.fileHashManager.getPathHash(normalizedPath)
           let changed = plugin.pendingNoteModifies.has(normalizedPath) || wasEmptyNoteProbing
           if (!changed && baseHash !== null) {
