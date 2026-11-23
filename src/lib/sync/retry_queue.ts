@@ -135,16 +135,21 @@ export class RetryQueue {
         const previous = [...this.entries].reverse().find(e => e.objectType === objectType
             && e.path === (oldPath || path));
         let baselineHash = objectType === "folder" ? "" : p.fileHashManager.getPathHash(oldPath || path) || "";
-        // 源路径删除前的服务端 revision：切换远端目标后管理器已清空旧令牌，这里只取当前作用域的值
+        // 源路径删除前的服务端 revision：切换远端目标后管理器已清空旧令牌，这里只取当前作用域的值。
+        // 管理器只查内存表（已按远端作用域隔离并持久化），离线时同样可读，因此不再以基线模式为前提，
+        // 否则离线期间入队的条目会丢失令牌、重连后被服务端判冲突并无限重发。
         // The source path's server revision before deletion; the manager already dropped tokens of
-        // another remote target, so this is current-scope only
-        const baselineMode = p.isSyncBaselineModeEnabled?.() === true;
-        let baselineRevision = !baselineMode ? ""
-            : objectType === "folder"
-                ? (p.folderSnapshotManager?.getBaselineRevision?.(oldPath || path) ?? "")
-                : (p.fileHashManager?.getBaselineRevision?.(oldPath || path) ?? "");
-        let baselineMissing = baselineMode && (baselineRevision === ""
-            || (objectType !== "folder" && !p.fileHashManager?.getConfirmedBaseline?.(oldPath || path, null)));
+        // another remote target, so this is current-scope only. The manager reads in-memory state
+        // (scoped and persisted), which is available offline, so this must not depend on baseline
+        // mode: otherwise offline entries carry no token and the server rejects them forever.
+        let baselineRevision = objectType === "folder"
+            ? (p.folderSnapshotManager?.getBaselineRevision?.(oldPath || path) ?? "")
+            : (p.fileHashManager?.getBaselineRevision?.(oldPath || path) ?? "");
+        // 老服务端不签发令牌，管理器里也没有令牌，因此仍然按“无基线”发送（与旧行为一致）。
+        // An old server issues no tokens and the manager holds none, so "no baseline" is still
+        // reported, matching the previous wire behaviour.
+        let baselineMissing = baselineRevision === ""
+            || (objectType !== "folder" && !p.fileHashManager?.getConfirmedBaseline?.(oldPath || path, null));
         let createdAt = Date.now();
         if (previous) {
             // Sent operations are immutable until ACK/GET settles them. Keep a successor
@@ -166,7 +171,7 @@ export class RetryQueue {
         }
         const entry: RetryQueueEntry = { id: generateUUID(), objectType, operation, path,
             ...(operation === "rename" ? { oldPath } : {}), createdAt, attempts: 0, baselineHash,
-            ...(baselineRevision ? { baselineRevision } : {}), ...(baselineMode ? { baselineMissing } : {}) };
+            ...(baselineRevision ? { baselineRevision } : {}), baselineMissing };
         this.entries.push(entry);
         // Folders have no queryable content version. Only the current continuous connection
         // may retry its observed events; restored/offline entries are discarded before sync.
