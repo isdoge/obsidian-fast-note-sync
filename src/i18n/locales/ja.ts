@@ -242,6 +242,28 @@ export default {
   "ui.history.load_failed": "読み込みに失敗しました。再試行してください。",
 
   // --- ui.menu ---
+  // --- ui.mode（読み取り専用 / 手動同期モードの切り替え、トークン権限のヒント） ---
+  "ui.mode.cmd_toggle_readonly": "読み取り専用同期モードを切り替え",
+  "ui.mode.cmd_toggle_manual": "手動同期モードを切り替え",
+  "ui.mode.readonly_menu": "読み取り専用同期モード",
+  "ui.mode.readonly_menu_desc": "リモートの更新のみを受信し、ローカルの変更や削除はアップロードしません。この端末にのみ影響し、サーバー側のトークン権限は変更しません。",
+  "ui.mode.manual_menu": "手動同期モード",
+  "ui.mode.manual_menu_desc": "自動監視と定期実行を停止し、手動で同期したときだけ同期します。",
+  "ui.mode.readonly_on": "読み取り専用同期モードを有効にしました：リモートの更新のみ受信し、ローカルの変更・削除はアップロードしません（サーバー側のトークン権限は変更されません）。",
+  "ui.mode.readonly_off": "読み取り専用同期モードを無効にしました：ローカルの変更・削除が再びアップロードされます。",
+  "ui.mode.manual_on": "手動同期モードを有効にしました：自動監視と定期実行を停止し、手動で同期したときだけ同期します。",
+  "ui.mode.manual_off": "手動同期モードを無効にしました：自動監視と定期実行が再開されます。",
+  "ui.mode.status_readonly": "読み取り専用",
+  "ui.mode.status_manual": "手動",
+  "ui.mode.status_token_readonly": "トークン読み取り専用",
+  "ui.mode.status_vault_blocked": "保管庫未許可",
+  "ui.mode.token_readonly_banner": "現在のトークンは読み取り専用です：サーバーはアップロードを拒否します",
+  "ui.mode.token_readonly_desc": "サーバーのトークンに書き込み権限がないため、この端末からのアップロードは拒否されます。書き込み権限のあるトークンに切り替えるか、読み取り専用同期モードを有効にしてください。",
+  "ui.mode.token_missing_write": "現在のトークンに書き込み権限がありません：${perms}",
+  "ui.mode.token_vault_blocked": "現在の保管庫「${vault}」はトークンで許可されていません",
+  "ui.mode.token_vault_blocked_desc": "トークンでアクセス可能な保管庫が制限されており、現在のリモート保管庫名が含まれていないため同期に失敗します。「リモート設定」でトークンが許可する保管庫名に変更してください。",
+
+  // --- ui.menu ---
   "ui.menu.ribbon_title": "FNS メニュー",
   "ui.menu.default_sync": "デフォルト同期",
   "ui.menu.default_sync_desc": "上次同期以降の増分更新を確認します",
@@ -527,6 +549,9 @@ export default {
   "ui.system.wsClientName": "クライアント",
   "ui.system.websocketClients": "オンラインクライアント",
   "ui.system.wsNoClients": "オンラインクライアントはありません",
+  "ui.system.wsNoPermission": "すべてのオンライン端末を表示できるのは管理者のみです",
+  "ui.system.wsNoPermissionDesc": "このアカウントには管理者権限がないため、他のオンライン端末を表示できません。他の端末がオンラインでないという意味ではありません。",
+  "ui.system.wsLoadFailed": "オンライン端末の取得に失敗しました。後でもう一度お試しください",
   "ui.system.wsStartTime": "接続時刻",
   "ui.status.case_conflict.title": "⚠️ ファイルシステムの大文字小文字の競合を検出しました！\n【${type}同期に失敗しました】\nサーバー側の期待パス: ${expectedPath}\nローカルに既に存在するパス: ${actualPath}\n現在のファイルシステムは大文字小文字を区別しないため、この競合項目を作成できません。手動で解決してください。",
   "ui.status.case_conflict.log": "ファイルシステムの大文字小文字の競合を検出しました！ローカルに既に存在するパス: ${actualPath}",

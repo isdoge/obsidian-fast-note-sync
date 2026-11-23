@@ -3561,6 +3561,20 @@ body .suggestion-container {
 .fns-status-bar-progress { display: flex; }
 .fns-status-bar-item { display: flex; align-items: center; }
 
+/* Read-only / manual mode indicator / 只读·手动同步模式指示 */
+.fns-status-bar-mode-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: var(--cursor-link);
+}
+
+.fns-status-bar-mode-item.fns-hidden { display: none; }
+
+.fns-status-bar-mode-icon { display: flex; align-items: center; }
+
+.fns-status-bar-mode-text { font-size: 11px; }
+
 .fns-phase-label {
   font-size: 10px;
   margin-right: 3px;

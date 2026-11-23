@@ -242,6 +242,28 @@ export default {
   "ui.history.load_failed": "로딩 실패, 다시 시도하세요",
 
   // --- ui.menu ---
+  // --- ui.mode (읽기 전용 / 수동 동기화 모드 전환, 토큰 권한 안내) ---
+  "ui.mode.cmd_toggle_readonly": "읽기 전용 동기화 모드 전환",
+  "ui.mode.cmd_toggle_manual": "수동 동기화 모드 전환",
+  "ui.mode.readonly_menu": "읽기 전용 동기화 모드",
+  "ui.mode.readonly_menu_desc": "원격 업데이트만 수신하고 로컬 수정과 삭제는 업로드하지 않습니다. 이 장치에만 적용되며 서버 토큰 권한은 변경하지 않습니다.",
+  "ui.mode.manual_menu": "수동 동기화 모드",
+  "ui.mode.manual_menu_desc": "자동 감시와 예약 실행을 중지하고, 직접 동기화할 때만 동기화합니다.",
+  "ui.mode.readonly_on": "읽기 전용 동기화 모드를 켰습니다: 원격 업데이트만 수신하고 로컬 수정·삭제는 업로드하지 않습니다(서버 토큰 권한은 변경되지 않음).",
+  "ui.mode.readonly_off": "읽기 전용 동기화 모드를 껐습니다: 로컬 수정과 삭제가 다시 업로드됩니다.",
+  "ui.mode.manual_on": "수동 동기화 모드를 켰습니다: 자동 감시와 예약 실행을 중지하고 직접 동기화할 때만 동기화합니다.",
+  "ui.mode.manual_off": "수동 동기화 모드를 껐습니다: 자동 감시와 예약 실행이 복원되었습니다.",
+  "ui.mode.status_readonly": "읽기 전용",
+  "ui.mode.status_manual": "수동",
+  "ui.mode.status_token_readonly": "토큰 읽기 전용",
+  "ui.mode.status_vault_blocked": "보관소 미허용",
+  "ui.mode.token_readonly_banner": "현재 토큰은 읽기 전용입니다: 서버가 업로드를 거부합니다",
+  "ui.mode.token_readonly_desc": "서버 토큰에 쓰기 권한이 없어 이 장치의 업로드가 거부됩니다. 쓰기 권한이 있는 토큰으로 바꾸거나 읽기 전용 동기화 모드를 켜세요.",
+  "ui.mode.token_missing_write": "현재 토큰에 쓰기 권한이 없습니다: ${perms}",
+  "ui.mode.token_vault_blocked": "현재 보관소 \"${vault}\"이(가) 토큰 허용 목록에 없습니다",
+  "ui.mode.token_vault_blocked_desc": "토큰이 접근 가능한 보관소를 제한하고 있으며 현재 원격 보관소 이름이 포함되어 있지 않아 동기화가 실패합니다. '원격 설정'에서 토큰이 허용하는 보관소 이름으로 변경하세요.",
+
+  // --- ui.menu ---
   "ui.menu.ribbon_title": "FNS 메뉴",
   "ui.menu.default_sync": "기본 동기화",
   "ui.menu.default_sync_desc": "마지막 동기화 이후의 증분 업데이트 확인",
@@ -527,6 +549,9 @@ export default {
   "ui.system.wsClientName": "클라이언트",
   "ui.system.websocketClients": "온라인 클라이언트",
   "ui.system.wsNoClients": "현재 온라인 클라이언트가 없습니다",
+  "ui.system.wsNoPermission": "관리자만 모든 온라인 장치 목록을 볼 수 있습니다",
+  "ui.system.wsNoPermissionDesc": "이 계정에는 관리자 권한이 없어 다른 온라인 장치를 볼 수 없습니다. 다른 장치가 온라인이 아니라는 뜻은 아닙니다.",
+  "ui.system.wsLoadFailed": "온라인 장치 목록을 불러오지 못했습니다. 나중에 다시 시도하세요",
   "ui.system.wsStartTime": "연결 시간",
   "ui.status.case_conflict.title": "⚠️ 파일 시스템 대소문자 충돌 감지!\n【${type} 동기화 실패】\n서버에서 기대하는 경로: ${expectedPath}\n로컬에 이미 존재하는 경로: ${actualPath}\n현재 파일 시스템이 대소문자를 구분하지 않아 충돌 항목을 생성할 수 없습니다. 수동으로 해결해 주세요.",
   "ui.status.case_conflict.log": "파일 시스템 대소문자 충돌 감지! 로컬에 이미 존재함: ${actualPath}",

@@ -242,6 +242,28 @@ export default {
   "ui.history.load_failed": "載入失敗，請重試",
 
   // --- ui.menu ---
+  // --- ui.mode（唯讀 / 手動同步模式快捷開關、權杖權限提示） ---
+  "ui.mode.cmd_toggle_readonly": "切換唯讀同步模式",
+  "ui.mode.cmd_toggle_manual": "切換手動同步模式",
+  "ui.mode.readonly_menu": "唯讀同步模式",
+  "ui.mode.readonly_menu_desc": "僅接收遠端更新，不上傳本地修改與刪除。只影響本裝置，不改變伺服端權杖權限。",
+  "ui.mode.manual_menu": "手動同步模式",
+  "ui.mode.manual_menu_desc": "暫停自動監聽與定時觸發，僅在你手動點同步時同步。",
+  "ui.mode.readonly_on": "已開啟唯讀同步模式：僅接收遠端更新，不上傳本地修改與刪除（不改變伺服端權杖權限）。",
+  "ui.mode.readonly_off": "已關閉唯讀同步模式：本地修改與刪除將恢復上傳。",
+  "ui.mode.manual_on": "已開啟手動同步模式：已暫停自動監聽與定時觸發，僅手動點同步時才同步。",
+  "ui.mode.manual_off": "已關閉手動同步模式：已恢復自動監聽與定時觸發。",
+  "ui.mode.status_readonly": "唯讀同步",
+  "ui.mode.status_manual": "手動同步",
+  "ui.mode.status_token_readonly": "權杖唯讀",
+  "ui.mode.status_vault_blocked": "庫未授權",
+  "ui.mode.token_readonly_banner": "目前權杖僅唯讀：伺服端將拒絕上傳修改",
+  "ui.mode.token_readonly_desc": "伺服端權杖缺少寫入權限，本裝置的上傳修改會被拒絕。請改用具備寫入權限的權杖，或先開啟唯讀同步模式。",
+  "ui.mode.token_missing_write": "目前權杖缺少寫入權限：${perms}",
+  "ui.mode.token_vault_blocked": "目前庫「${vault}」不在權杖允許的庫清單中",
+  "ui.mode.token_vault_blocked_desc": "權杖限定了可存取的庫，目前遠端筆記庫名不在其中，同步會失敗。請在「遠端配置」中改成權杖允許的庫名。",
+
+  // --- ui.menu ---
   "ui.menu.ribbon_title": "FNS 選單",
   "ui.menu.default_sync": "預設同步",
   "ui.menu.default_sync_desc": "檢查上次同步以來的增量更新",
@@ -527,6 +549,9 @@ export default {
   "ui.system.wsClientName": "用戶端",
   "ui.system.websocketClients": "線上客戶端",
   "ui.system.wsNoClients": "暫無線上客戶端",
+  "ui.system.wsNoPermission": "僅管理員可查看所有線上裝置清單",
+  "ui.system.wsNoPermissionDesc": "目前帳號沒有管理員權限，無法查看其它線上裝置。這並不代表沒有其它裝置線上。",
+  "ui.system.wsLoadFailed": "取得線上裝置清單失敗，請稍後重試",
   "ui.system.wsStartTime": "連線時間",
   "ui.status.case_conflict.title": "⚠️ 偵測到檔案系統大小寫衝突！\n【${type} 同步失敗】\n伺服器端期望路徑: ${expectedPath}\n本機實際已存在: ${actualPath}\n由於目前檔案系統不區分大小寫，無法建立此衝突項目，需要您手動解決這個問題。",
   "ui.status.case_conflict.log": "偵測到檔案系統大小寫衝突！本機實際存在：${actualPath}",

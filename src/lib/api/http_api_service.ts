@@ -4,6 +4,7 @@ import { requestUrl } from "obsidian";
 import { hashContent, addRandomParam, showSyncNotice, dump, dumpError, nativeFetch, isAllowedRedirect } from "../utils/helpers";
 import { CLIENT_TYPE } from "../utils/types";
 import { $, getLocale } from "../../i18n/lang";
+import { classifyWSClientsResponse, parseTokenCapabilities, type TokenCapabilities, type WSClientsResult } from "./token_capabilities";
 import type FastSync from "../../main";
 
 
@@ -987,20 +988,61 @@ export class HttpApiService {
      * 获取在线客户端列表
      */
     async getWSClients(): Promise<WSClient[]> {
+        return (await this.getWSClientsDetailed()).clients as WSClient[];
+    }
+
+    /**
+     * 获取在线客户端列表并区分失败原因：无管理员权限 / 未连接 / 其它错误 / 确实为空。
+     * Fetch online clients, distinguishing "no admin permission" from "genuinely empty".
+     *
+     * 服务端对非管理员返回 HTTP 200 + 业务码 411，网关也可能直接回 403；这些都不能当成
+     * 「没有其它在线设备」默默显示空表（haierkeys/fast-note-sync-service）。
+     * Non-admins get HTTP 200 + business code 411 (a gateway may answer 403 directly); none of
+     * these may be silently rendered as an empty device list.
+     */
+    async getWSClientsDetailed(): Promise<WSClientsResult> {
         const endpoint = `/api/admin/ws_clients`;
         try {
             const { status, json } = await this.request(endpoint, {
                 method: "GET"
             });
-
-            if (status !== 200 || !this.isSuccess(json)) {
-                return [];
-            }
-            const res = json as ApiResponse<WSClient[]>;
-            return res.data || [];
+            return classifyWSClientsResponse(status, json);
         } catch (e) {
             dumpError("getWSClients error:", e);
-            return [];
+            return { ok: false, clients: [], failure: "error" };
+        }
+    }
+
+    /**
+     * 查询当前令牌的实际权限（服务端 GET /api/user/token-capabilities）。
+     * Fetch the current token's effective capabilities.
+     *
+     * 旧版服务端没有该接口（404）或网络失败时静默返回 null，绝不弹报错、绝不打断同步。
+     * Older servers return 404 and networks may fail: degrade silently to null, never show an
+     * error and never interrupt sync.
+     */
+    async getTokenCapabilities(): Promise<TokenCapabilities | null> {
+        const controller = new AbortController();
+        const timer = window.setTimeout(() => controller.abort(), 8000);
+        try {
+            const { status, json } = await this.request("/api/user/token-capabilities", {
+                method: "GET",
+                signal: controller.signal,
+            });
+            if (status === 404 || status === 405 || status === 501) return null;
+            if (status !== 200 || !this.isSuccess(json)) {
+                dump(`getTokenCapabilities: unavailable (HTTP ${status})`);
+                return null;
+            }
+            const res = json as ApiResponse<unknown>;
+            return parseTokenCapabilities(res?.data);
+        } catch (e) {
+            // 静默降级：旧服务端 404、超时、断网都不应打扰用户
+            // Silent degradation: old-server 404, timeouts and offline all stay quiet
+            dump("getTokenCapabilities skipped:", e);
+            return null;
+        } finally {
+            window.clearTimeout(timer);
         }
     }
 
