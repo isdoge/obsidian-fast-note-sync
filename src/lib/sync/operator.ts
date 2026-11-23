@@ -846,7 +846,12 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       return;
     }
 
-    if (plugin.settings.readonlySyncEnabled) {
+    // 只读模式快照：本轮扫描与发送阶段一律使用入口时的取值，避免同步中途切换开关
+    // 导致同一轮扫描/发送半新半旧（扫描期与发送期原本各自实时读设置）。
+    // Read-only snapshot: the scan and send phases of this round use the value captured at
+    // entry, so flipping the toggle mid-round cannot make one round half-new/half-old.
+    const readonlyThisRound = !!plugin.settings.readonlySyncEnabled;
+    if (readonlyThisRound) {
       dump("Read-only mode: Proceeding with state gathering for remote-to-local sync.");
     }
 
@@ -1032,7 +1037,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
 
         try {
           if (file instanceof TFolder) {
-            if (plugin.settings.readonlySyncEnabled) continue;
+            if (readonlyThisRound) continue;
             if (file.path === "/") continue;
             if (isFolderSyncPathExcluded(file.path, plugin)) continue;
             let mtime = plugin.folderSnapshotManager.getMtime(file.path) || Date.now();
@@ -1257,6 +1262,12 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
             // an unreadable journal means no file deletion is reported at all
             if (!path.endsWith(".md") && eviction && (!evictionUsable || eviction.isEvicted(path))) continue;
             if (baselineConfirmed) confirmedMissingCount++;
+            // 只读模式只接收远端更新，本地删除绝不上报（也不转成 missing 清单把文件拉回来）；
+            // 哈希表保留跟踪，关闭只读后由正常流程处理。护栏计数/判定照旧运行。
+            // Read-only mode only receives remote updates: local deletes are never reported (and
+            // never turned into a missing list that would pull the files back). The hash table
+            // keeps tracking them for the normal flow once read-only is off. Guard counters still run.
+            if (readonlyThisRound) continue;
             const item = { path: path, pathHash: hashContent(path) };
             if (path.endsWith(".md")) {
               delNotes.push({ ...item, ...buildDeleteBaselineFields(plugin, "note", path) });
@@ -1267,7 +1278,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         }
 
         // 检测被删除的文件夹（只读模式下不上传本地删除的目录）
-        if (!plugin.settings.readonlySyncEnabled && plugin.folderSnapshotManager && plugin.folderSnapshotManager.isReady()) {
+        if (!readonlyThisRound && plugin.folderSnapshotManager && plugin.folderSnapshotManager.isReady()) {
           const trackedFolderPaths = plugin.folderSnapshotManager.getAllPaths();
           const localFolderPathsSet = new Set(list.filter(f => f instanceof TFolder).map(f => f.path));
           let folderCount = 0;
@@ -1478,6 +1489,10 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
           if (configIsPathExcluded(path, plugin)) continue;
           if (plugin.syncState.conflictedPaths.has(path)) continue;
           if (!localConfigPathsSet.has(path)) {
+            // 只读模式不上报本地删除，也不转成 missing 清单（理由同笔记/附件扫描）
+            // Read-only mode never reports local deletes and never turns them into a missing
+            // list (same reasoning as the note/attachment scan)
+            if (readonlyThisRound) continue;
             delConfigs.push({ path: path, pathHash: hashContent(path), ...buildDeleteBaselineFields(plugin, "setting", path) });
           }
         }
@@ -1553,7 +1568,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     plugin.isSyncRequesting = true;
 
     try {
-      await handleRequestSend(plugin, syncMode, noteData, fileData, configData, folderData);
+      await handleRequestSend(plugin, syncMode, noteData, fileData, configData, folderData, { readonly: readonlyThisRound });
     } finally {
       plugin.isSyncRequesting = false;
     }
@@ -1954,8 +1969,15 @@ async function sendSyncInBatches<T1, T2, T3>(
  * Send sync requests
  * The four batch types (folder/note/file/setting) are dispatched concurrently (folder barrier removed);
  * concurrent createFolder races are absorbed by each handler's lazy folder-creation fallback (design §6.2)
+ *
+ * opts.readonly 为 handleSync 在入口处取的只读快照（可选；缺省时回落到实时读设置，
+ * 兼容直接调用本函数的测试/恢复路径）。发送阶段的只读判断一律用这个值。
+ * opts.readonly is the read-only snapshot taken at handleSync entry (optional; falls back to the
+ * live setting for tests / recovery paths that call this directly). All send-phase read-only
+ * decisions use this value.
  */
-export const handleRequestSend = async function (plugin: FastSync, syncMode: SyncMode, noteData: NoteSyncData, fileData: FileSyncData, configData: ConfigSyncData, folderData: FolderSyncData) {
+export const handleRequestSend = async function (plugin: FastSync, syncMode: SyncMode, noteData: NoteSyncData, fileData: FileSyncData, configData: ConfigSyncData, folderData: FolderSyncData, opts?: { readonly?: boolean }) {
+  const isReadonly = opts?.readonly ?? !!plugin.settings.readonlySyncEnabled;
   const queue = plugin.retryQueue;
   // 冲突冻结的路径既不上传删除也不参与本轮上行，统一在发送前剔除（扫描侧已跳过，这里再兜一层）
   // Frozen conflicted paths are never uploaded as deletes or as this round's upstream items; the
@@ -1992,7 +2014,6 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
 
     // 并发分批发送 FolderSync / NoteSync / FileSync
     // Concurrently batch-send FolderSync / NoteSync / FileSync
-    const isReadonly = !!plugin.settings.readonlySyncEnabled;
     const foldersToSend = isReadonly ? [] : folderData.folders;
     const delFoldersToSend = !isReadonly && plugin.settings.offlineDeleteSyncEnabled ? folderData.delFolders : [];
     dump(`[Sync] Starting batch send: ${foldersToSend.length} folders, ${noteData.notes.length} notes, ${fileData.files.length} files`);
@@ -2022,13 +2043,18 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
       }
     ));
 
+    // 删除清单：只读时一律为空（与 delFolders 的写法对齐），字段也不随包发送
+    // Delete lists: always empty in read-only mode (aligned with delFolders), and the field is
+    // omitted from the payload entirely
+    const delNotesToSend = !isReadonly && plugin.settings.offlineDeleteSyncEnabled ? noteData.delNotes : [];
+    const delFilesToSend = !isReadonly && plugin.settings.offlineDeleteSyncEnabled ? fileData.delFiles : [];
     jobs.push(sendSyncInBatches(
       plugin,
       "NoteSync",
       "NoteSyncBatchAck",
       noteData.context,
       noteData.notes,
-      plugin.settings.offlineDeleteSyncEnabled ? noteData.delNotes : [],
+      delNotesToSend,
       noteData.missingNotes,
       (mainChunk, delChunk, missingChunk, batchIndex, totalBatches) => ({
         vault: plugin.settings.vault,
@@ -2037,10 +2063,18 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
         context: noteData.context,
         batchIndex,
         totalBatches,
-        ...(plugin.settings.offlineDeleteSyncEnabled ? { delNotes: delChunk } : {}),
+        ...(!isReadonly && plugin.settings.offlineDeleteSyncEnabled ? { delNotes: delChunk } : {}),
         ...(missingChunk.length > 0 ? { missingNotes: missingChunk } : {}),
       }),
       () => {
+        // 只读模式下仍要发元数据清单（服务端据此比对并回 NeedPush），但本地改动的清单不是上传：
+        // 若记进 pendingNoteModifies，SyncEnd 会把从未上传的内容写成已同步基线，关闭只读后
+        // 这条本地修改就再也检测不出来。
+        // Read-only still sends the metadata list (the server diffs it and answers NeedPush), but
+        // that list is not an upload: recording it in pendingNoteModifies would let SyncEnd mark
+        // never-uploaded local content as synced, so the edit could never be detected after
+        // read-only is turned off.
+        if (isReadonly) return;
         for (const note of noteData.notes) {
           plugin.pendingNoteModifies.set(note.path, note.contentHash);
         }
@@ -2057,7 +2091,7 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
         "FileSyncBatchAck",
         fileData.context,
         fileData.files,
-        plugin.settings.offlineDeleteSyncEnabled ? fileData.delFiles : [],
+        delFilesToSend,
         fileData.missingFiles,
         (mainChunk, delChunk, missingChunk, batchIndex, totalBatches) => ({
           vault: plugin.settings.vault,
@@ -2066,7 +2100,7 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
           context: fileData.context,
           batchIndex,
           totalBatches,
-          ...(plugin.settings.offlineDeleteSyncEnabled ? { delFiles: delChunk } : {}),
+          ...(!isReadonly && plugin.settings.offlineDeleteSyncEnabled ? { delFiles: delChunk } : {}),
           ...(missingChunk.length > 0 ? { missingFiles: missingChunk } : {}),
         })
       ));
@@ -2079,13 +2113,14 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
     // 注意：客户端发送字段名为 settings / delSettings / missingSettings（非 configs）
     // Note: client sends field names 'settings' / 'delSettings' / 'missingSettings' (not 'configs')
     const isCover = Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime")) === 0;
+    const delConfigsToSend = !isReadonly && plugin.settings.offlineDeleteSyncEnabled ? configData.delConfigs : [];
     jobs.push(sendSyncInBatches(
       plugin,
       "SettingSync",
       "SettingSyncBatchAck",
       configData.context,
       configData.configs,
-      plugin.settings.offlineDeleteSyncEnabled ? configData.delConfigs : [],
+      delConfigsToSend,
       configData.missingConfigs,
       (mainChunk, delChunk, missingChunk, batchIndex, totalBatches) => ({
         vault: plugin.settings.vault,
@@ -2095,10 +2130,14 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
         context: configData.context,
         batchIndex,
         totalBatches,
-        ...(plugin.settings.offlineDeleteSyncEnabled ? { delSettings: delChunk } : {}),
+        ...(!isReadonly && plugin.settings.offlineDeleteSyncEnabled ? { delSettings: delChunk } : {}),
         ...(missingChunk.length > 0 ? { missingSettings: missingChunk } : {}),
       }),
       () => {
+        // 只读模式同样只发元数据清单，不把本地改动记为基线（理由见 NoteSync 回调）
+        // Read-only likewise only sends the metadata list and never records local edits as a
+        // baseline (see the NoteSync callback for the reasoning)
+        if (isReadonly) return;
         for (const config of configData.configs) {
           plugin.pendingConfigModifies.set(config.path, config.contentHash);
         }
@@ -2113,19 +2152,20 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
   if (plugin.settings.syncEnabled && shouldSyncNotes) {
     // 将已删除路径加入 pending set，等待 SyncEnd 确认服务端已处理后再从 hashManager 移除
     // Populate pending delete sets; remove from hashManager only after SyncEnd confirms server processed
-    if (plugin.settings.offlineDeleteSyncEnabled) {
+    // 只读模式不发送删除，因此也不写 pending 删除集合（哈希表继续跟踪这些路径）
+    // Read-only sends no deletes, so it records no pending delete paths either (the hash table
+    // keeps tracking them)
+    if (plugin.settings.offlineDeleteSyncEnabled && !isReadonly) {
       plugin.pendingDeleteNotePaths = new Set(noteData.delNotes.map(i => i.path));
       plugin.pendingDeleteFilePaths = new Set(fileData.delFiles.map(i => i.path));
-      if (!plugin.settings.readonlySyncEnabled) {
-        plugin.pendingDeleteFolderPaths = new Set(folderData.delFolders.map(i => i.path));
-      }
+      plugin.pendingDeleteFolderPaths = new Set(folderData.delFolders.map(i => i.path));
     }
   }
 
   if (plugin.settings.configSyncEnabled && shouldSyncConfigs) {
     // 将已删除配置路径加入 pending set，等待 SettingSyncEnd 确认服务端已处理后再移除
     // Populate pending config delete set; remove from hashManager only after SettingSyncEnd
-    if (plugin.settings.offlineDeleteSyncEnabled && plugin.configHashManager && plugin.configHashManager.isReady()) {
+    if (plugin.settings.offlineDeleteSyncEnabled && !isReadonly && plugin.configHashManager && plugin.configHashManager.isReady()) {
       plugin.pendingDeleteConfigPaths = new Set(configData.delConfigs.map(i => i.path));
     }
   }
