@@ -304,7 +304,16 @@ export const noteModify = async function (file: TAbstractFile, plugin: FastSync,
   if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
   if (!(file instanceof TFile)) return
   if (!file.path.endsWith(".md")) return
-  if (eventEnter && plugin.isIgnoredFile(file.path)) return
+  if (eventEnter && plugin.isIgnoredFile(file.path)) {
+    // 命中的是祖先目录项时，屏蔽解除后补一次；命中路径自身（远端落盘的自我保护）仍直接丢弃
+    // An ancestor-folder hit is retried after the guard clears; a hit on the path itself
+    // (remote write self-protection) is still dropped as before
+    if (plugin.isIgnoredByAncestor(file.path)) {
+      dump(`Note modify deferred (parent folder guarded): ${file.path}`)
+      plugin.eventManager?.deferGuardedModify(file)
+    }
+    return
+  }
   if (isPathExcluded(file.path, plugin)) return
   // 冲突未解决的路径暂停上传，否则本端旧稿会覆盖其他端的新内容（#276）；解决冲突时由冲突合并窗口自行推送
   // Uploads of an unresolved conflict are paused, or this device's stale copy overwrites newer content

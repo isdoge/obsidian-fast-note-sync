@@ -456,7 +456,16 @@ export const fileModify = async function (file: TAbstractFile, plugin: FastSync,
   if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
   if (!(file instanceof TFile)) return
   if (file.path.endsWith(".md")) return
-  if (eventEnter && plugin.isIgnoredFile(file.path)) return
+  if (eventEnter && plugin.isIgnoredFile(file.path)) {
+    // 命中的是祖先目录项时，屏蔽解除后补一次；命中路径自身（远端落盘的自我保护）仍直接丢弃
+    // An ancestor-folder hit is retried after the guard clears; a hit on the path itself
+    // (remote write self-protection) is still dropped as before
+    if (plugin.isIgnoredByAncestor(file.path)) {
+      dump(`File modify deferred (parent folder guarded): ${file.path}`)
+      plugin.eventManager?.deferGuardedModify(file)
+    }
+    return
+  }
   if (isPathExcluded(file.path, plugin)) return
   // 冲突冻结的附件不响应实时写（已解决的提交除外）
   // A frozen conflicted attachment ignores live writes (resolved submits excepted)

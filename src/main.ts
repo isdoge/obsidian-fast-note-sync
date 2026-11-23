@@ -412,6 +412,15 @@ export default class FastSync extends Plugin {
     return false
   }
 
+  /**
+   * 是否被祖先目录的屏蔽项命中，而非该路径自身
+   * True when the path is ignored through an ancestor entry, not by the path itself
+   */
+  isIgnoredByAncestor(path: string): boolean {
+    if (this.ignoredFiles.has(path)) return false
+    return this.isIgnoredFile(path)
+  }
+
   addIgnoredConfigFile(path: string) {
     this.ignoredConfigFiles.add(path)
   }

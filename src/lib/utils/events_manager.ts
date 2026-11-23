@@ -9,6 +9,7 @@ import { ShareModal } from "../../views/share-modal";
 import { FireflyPostModal, CheckFireflyPostModal, CreateFireflyPostModal, triggerFireflyPublish } from "../../views/firefly-post-modal";
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
+import { SyncLogManager } from "../sync/sync_log_manager";
 
 
 export class EventManager {
@@ -22,6 +23,11 @@ export class EventManager {
   // 注册/认证/抢锁重试定时器，stop()（含插件卸载）时统一清理
   // Registration / auth / lock retry timers; all cleared by stop() (including plugin unload)
   private retryTimers: Set<number> = new Set()
+  // 祖先目录屏蔽期间的修改补传：每个路径只保留一个定时器，并记录连续重排次数
+  // Deferred modify replay while an ancestor folder is guarded: one timer per path plus a
+  // consecutive-reschedule counter
+  private deferredModifyTimers: Map<string, number> = new Map()
+  private deferredModifyAttempts: Map<string, number> = new Map()
 
   constructor(plugin: FastSync) {
     this.plugin = plugin
@@ -88,6 +94,9 @@ export class EventManager {
     this.rawEventTimers.clear()
     this.retryTimers.forEach((timer) => window.clearTimeout(timer))
     this.retryTimers.clear()
+    this.deferredModifyTimers.forEach((timer) => window.clearTimeout(timer))
+    this.deferredModifyTimers.clear()
+    this.deferredModifyAttempts.clear()
     this.pendingRenamePaths.clear()
     this.deferredRenameModifies.clear()
     if (this.blurTimer) {
@@ -222,6 +231,38 @@ export class EventManager {
     }, 0)
   }
 
+  /**
+   * 本地修改被祖先目录的屏蔽项挡住时，屏蔽解除后补一次
+   * 同一路径只保留一个定时器；连续被屏蔽最多重排 5 次，超过则放弃并记录
+   * Replay a local modify that was blocked by an ancestor folder guard. One timer per path;
+   * give up after 5 consecutive reschedules and record the drop.
+   */
+  public deferGuardedModify(file: TAbstractFile) {
+    const path = file.path
+    const attempts = (this.deferredModifyAttempts.get(path) ?? 0) + 1
+    if (attempts > 5) {
+      this.deferredModifyAttempts.delete(path)
+      dump(`Modify deferred dropped after 5 retries (parent folder still guarded): ${path}`)
+      SyncLogManager.getInstance().addLog('send', 'ModifyGuardDropped', 'Modify dropped: parent folder guard persisted after retries', 'error', path)
+      return
+    }
+    this.deferredModifyAttempts.set(path, attempts)
+    const existing = this.deferredModifyTimers.get(path)
+    if (existing) window.clearTimeout(existing)
+    const timer = window.setTimeout(() => {
+      this.deferredModifyTimers.delete(path)
+      // 重新取当前对象：期间可能已被删除或改名 / Re-fetch: it may be gone or renamed meanwhile
+      const current = this.plugin.app.vault.getAbstractFileByPath(path)
+      if (!current) {
+        this.deferredModifyAttempts.delete(path)
+        return
+      }
+      if (!this.plugin.isIgnoredFile(path)) this.deferredModifyAttempts.delete(path)
+      this.watchModify(current)
+    }, 600)
+    this.deferredModifyTimers.set(path, timer)
+  }
+
   private watchModify = (file: TAbstractFile, ctx?: unknown) => {
     // 检查 WebSocket 认证状态
     if (!this.plugin.websocket || !this.plugin.websocket.isAuth) {
@@ -229,6 +270,9 @@ export class EventManager {
       return
     }
     if (this.plugin.settings.manualSyncEnabled || this.plugin.settings.readonlySyncEnabled) return
+    // 屏蔽已解除：清理补传计数，避免后续独立事件继承旧的连续次数
+    // Guard already clear: reset the counter so a later independent event starts from zero
+    if (!this.plugin.isIgnoredFile(file.path)) this.deferredModifyAttempts.delete(file.path)
 
     // 重命名会同时触发 rename 和 modify 事件，但只需要发送 rename 消息即可完成处理，因此跳过 modify 事件
     if (this.plugin.retryQueue?.entries.some(e => e.operation === "rename" && e.path === file.path && e.attempts === 0)) {
