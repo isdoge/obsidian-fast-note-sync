@@ -175,7 +175,7 @@ function emptyNoteConfirmedAbsentSet(plugin: FastSync): Set<string> {
  * genuine create. Server evidence: ws_note.go NoteRePush (NoteSyncModify when present and not
  * deleted, NoteSyncDelete otherwise). Returns true when the upload was intercepted.
  */
-function probeEmptyNoteInsteadOfUpload(plugin: FastSync, path: string, content: string, baseHash: string | null): boolean {
+export function probeEmptyNoteInsteadOfUpload(plugin: FastSync, path: string, content: string, baseHash: string | null): boolean {
   if (content.trim().length !== 0) return false
   if (baseHash !== null) return false
   if (plugin.syncState.conflictedPaths.has(path)) return false

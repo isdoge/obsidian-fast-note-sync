@@ -3,7 +3,7 @@ import { TFolder, TFile, normalizePath } from "obsidian";
 import { receiveFileUpload, receiveFileSyncUpdate, receiveFileSyncDelete, receiveFileSyncMtime, receiveFileSyncChunkDownload, receiveFileSyncEnd, checkAndUploadAttachments, receiveFileSyncRename, receiveFileRenameAck, receiveFileUploadAck, receiveFileDeleteAck, isPluginUnloading, sweepStalledDownloadSessions, invalidateFileDownloads, isAttachmentUploadActive } from "./operator_file";
 import { hashContent, hashContentAsync, dump, dumpError, isPathExcluded, isFolderSyncPathExcluded, configIsPathExcluded, getConfigSyncCustomDirs, generateUUID, showSyncNotice, isLargeBinarySyncRisk, describeBinarySyncLimit, hashFileAsync, formatFileSize, yieldToMain, getPluginDir } from "../utils/helpers";
 import { receiveConfigSyncModify, receiveConfigUpload, receiveConfigSyncMtime, receiveConfigSyncDelete, receiveConfigSyncEnd, configAllPaths, receiveConfigSyncClear, receiveConfigModifyAck, receiveConfigDeleteAck } from "./operator_config";
-import { receiveNoteSyncModify, receiveNoteUpload, receiveNoteSyncMtime, receiveNoteSyncDelete, receiveNoteSyncEnd, receiveNoteSyncRename, receiveNoteModifyAck, receiveNoteRenameAck, receiveNoteDeleteAck, conflictBackupPaths } from "./operator_note";
+import { receiveNoteSyncModify, receiveNoteUpload, receiveNoteSyncMtime, receiveNoteSyncDelete, receiveNoteSyncEnd, receiveNoteSyncRename, receiveNoteModifyAck, receiveNoteRenameAck, receiveNoteDeleteAck, conflictBackupPaths, probeEmptyNoteInsteadOfUpload } from "./operator_note";
 import { SyncMode, SnapFile, SnapFolder, SyncEndData, PathHashFile, NoteSyncData, FileSyncData, ConfigSyncData, FolderSyncData } from "../utils/types";
 import { receiveFolderSyncModify, receiveFolderSyncDelete, receiveFolderSyncRename, receiveFolderSyncEnd, receiveFolderModifyAck, receiveFolderDeleteAckWithRevision, receiveFolderRenameAckWithRevision } from "./operator_folder";
 import { FileCloudPreview } from "../storage/file_cloud_preview";
@@ -1089,6 +1089,26 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
               // Skip excessively large .md files (>noteSyncLimit MB)
               const noteLimit = (plugin.settings.noteSyncLimit ?? 20) * 1024 * 1024;
               if (file.stat.size > noteLimit) continue;
+
+              // #205 扫描路径：0 字节且没有任何同步基线的笔记，如果照常以 baseHashMissing 上报，
+              // 服务端基线决策会把"客户端无基线且内容与服务端不同"判成 no_baseline 冲突，不下发内容，
+              // 新设备上的空白日记永远补不上。与实时路径一致，先 NoteRePush 探测：服务端有内容则
+              // 由 NoteSyncModify 覆盖本地；服务端没有则由 NoteSyncDelete 触发正常新建上传。
+              // 只读模式、仅手动同步模式、兼容模式（旧服务端）与已有基线的有意清空都保持原行为，不进探测。
+              //
+              // #205 scan path: a zero-byte note with no sync baseline reported as baseHashMissing makes
+              // the server's baseline decision a no_baseline conflict (nothing is downloaded), so an
+              // empty daily note on a new device never fills in. Mirror the live path and probe with
+              // NoteRePush first: server has content -> NoteSyncModify overwrites the local empty file;
+              // server doesn't -> NoteSyncDelete re-uploads it as a normal create. Read-only mode,
+              // manual-only mode, compatibility mode (legacy server) and a deliberate clear with an
+              // existing baseline keep the previous behavior and never probe.
+              if (!readonlyThisRound
+                && !plugin.settings.manualSyncEnabled
+                && plugin.isSyncBaselineModeEnabled?.() === true
+                && file.stat.size === 0
+                && plugin.fileHashManager.getPathHash(file.path) === null
+                && probeEmptyNoteInsteadOfUpload(plugin, file.path, "", null)) continue;
 
               const cachedNoteHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size);
               if (cachedNoteHash !== null) {
