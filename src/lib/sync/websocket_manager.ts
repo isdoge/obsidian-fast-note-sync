@@ -1,7 +1,7 @@
 import { moment, Platform, normalizePath } from "obsidian";
 
 import { invalidateFileDownloads, handleFileChunkDownload, BINARY_PREFIX_FILE_SYNC, clearUploadQueue, receiveFileUploadSessionNotFound } from "./operator_file";
-import { clearEmptyNoteProbes, conflictBackupPaths, writeConflictMeta } from "./operator_note";
+import { clearEmptyNoteProbes, conflictBackupPaths, releaseEmptyNoteProbe, writeConflictMeta } from "./operator_note";
 import { dump, addRandomParam, showSyncNotice, safeStringify } from "../utils/helpers";
 import { enSendDTOToProtobuf, deReceivePacket } from "../../pb/protobuf_mapper";
 import { receiveOperators, startupSync, startupFullSync, settleAllBatchSendSessionsOnClose, settleSyncTimes } from "./operator";
@@ -540,6 +540,10 @@ export class WebSocketManager {
     if (data.code <= 0 || data.code >= 300) {
       const isProtobufDecodeError = /(?:^|,\s*)(?:body:\s*)?Protobuf decode failed:/i.test(data.details || "");
       const errorPath = typeof data.data?.path === "string" ? data.data.path : undefined;
+      // 空白笔记探测收到普通错误回复（如 NoteRePush 被拒）：放弃在途登记，下一次扫描可重新查询
+      // An empty-note probe got a plain error reply (e.g. NoteRePush rejected): release the
+      // in-flight registration so the next scan can probe again
+      if (errorPath) releaseEmptyNoteProbe(this.plugin, errorPath);
       // Old validation errors omit both path and action. Only a unique outstanding request
       // can identify one safely; named legacy Ack errors match the serial queue by action.
       const [onlyRequest] = this.sentRequests?.size === 1 ? this.sentRequests.values() : [];

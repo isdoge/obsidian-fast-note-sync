@@ -25,7 +25,7 @@ const { WebSocketManager } = load('src/lib/sync/websocket_manager.ts', {
     register() { return 'reconnected'; }
   } },
   './operator': { settleSyncTimes, settleAllBatchSendSessionsOnClose: () => cleanup.push('batch') },
-  './operator_note': { clearEmptyNoteProbes: () => cleanup.push('probes') },
+  './operator_note': { clearEmptyNoteProbes: () => cleanup.push('probes'), releaseEmptyNoteProbe: () => undefined },
   './operator_file': { invalidateFileDownloads: p => { p.fileDownloadSessions.clear(); cleanup.push('downloads'); },
     clearUploadQueue: () => cleanup.push('uploads') },
 });

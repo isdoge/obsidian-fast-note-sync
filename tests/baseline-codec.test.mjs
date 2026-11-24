@@ -446,7 +446,7 @@ const managerModule = (() => {
         case "../utils/types": return { CLIENT_TYPE: "ObsidianPlugin" };
         case "../../i18n/lang": return { $: (key) => key };
         case "./operator_file": return new Proxy({ BINARY_PREFIX_FILE_SYNC: "fs" }, { get: (t, n) => t[n] ?? noop });
-        case "./operator_note": return { clearEmptyNoteProbes: noop };
+        case "./operator_note": return { clearEmptyNoteProbes: noop, releaseEmptyNoteProbe: noop };
         case "./operator": return {
           receiveOperators: new Map(),
           startupSync: () => { startupRuns++; },

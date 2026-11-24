@@ -39,7 +39,7 @@ const requireStub = (id) => {
         receiveFileUploadSessionNotFound: () => undefined,
       };
     case "./operator_note":
-      return { clearEmptyNoteProbes: () => undefined };
+      return { clearEmptyNoteProbes: () => undefined, releaseEmptyNoteProbe: () => undefined };
     case "../../pb/protobuf_mapper":
       return { enSendDTOToProtobuf: () => undefined, deReceivePacket: () => undefined };
     case "./operator":

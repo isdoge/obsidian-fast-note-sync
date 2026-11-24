@@ -84,7 +84,7 @@ const requireStub = id => {
     case "./operator_file":
       return new Proxy({ BINARY_PREFIX_FILE_SYNC: "fs" }, { get: (target, name) => target[name] ?? noop });
     case "./operator_note":
-      return { clearEmptyNoteProbes: noop };
+      return { clearEmptyNoteProbes: noop, releaseEmptyNoteProbe: noop };
     case "./operator":
       return new Proxy({}, { get: () => noop });
     case "./websocket_action":
