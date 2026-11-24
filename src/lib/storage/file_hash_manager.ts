@@ -405,6 +405,12 @@ export class FileHashManager {
     dump("FileHashManager: remote scope changed; revisions and confirmed provenance cleared");
     this.saveBaselineState();
     this.saveSyncToStorage();
+    // 旧目标的冲突记录不再有意义（路径可能在新目标上不存在）；异步清理，避免循环依赖
+    // Conflict records of the old target are meaningless (and may not exist there); dynamic
+    // import keeps baseline_scope free of a static conflict_store dependency
+    void import("../sync/conflict_store")
+      .then(({ resetConflictRecords }) => resetConflictRecords(this.plugin))
+      .catch(() => undefined);
   }
 
   private async loadBaselineState(): Promise<void> {
@@ -428,6 +434,14 @@ export class FileHashManager {
       dump("FileHashManager: stored baseline belongs to another remote target; tokens discarded");
       this.saveBaselineState();
       this.saveSyncToStorage();
+      // 启动即发现换过目标：先把旧目标的冲突记录清掉，再让主流程读回集合
+      // Target changed since last session: clear the old conflicts before main reads the set
+      try {
+        const { resetConflictRecords } = await import("../sync/conflict_store");
+        await resetConflictRecords(this.plugin);
+      } catch {
+        // Conflict cleanup is best-effort; startup must continue
+      }
     }
   }
 

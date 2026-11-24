@@ -262,6 +262,11 @@ export class ConfigHashManager {
         dump("ConfigHashManager: remote scope changed; revisions and confirmed provenance cleared");
         this.saveBaselineState();
         this.saveSyncToStorage();
+        // 旧目标的冲突记录不再有意义；动态导入避免 baseline_scope 的静态循环依赖
+        // Old-target conflicts are meaningless; a dynamic import avoids a static cycle
+        void import("../sync/conflict_store")
+            .then(({ resetConflictRecords }) => resetConflictRecords(this.plugin))
+            .catch(() => undefined);
     }
 
     private async loadBaselineState(): Promise<void> {
@@ -282,6 +287,14 @@ export class ConfigHashManager {
             dump("ConfigHashManager: stored baseline belongs to another remote target; tokens discarded");
             this.saveBaselineState();
             this.saveSyncToStorage();
+            // 启动即发现换过目标：先清旧目标的冲突记录，再由主流程读回集合
+            // Target changed since last session: clear old conflicts before main reads the set
+            try {
+                const { resetConflictRecords } = await import("../sync/conflict_store");
+                await resetConflictRecords(this.plugin);
+            } catch {
+                // Conflict cleanup is best-effort; initialization must continue
+            }
         }
     }
 

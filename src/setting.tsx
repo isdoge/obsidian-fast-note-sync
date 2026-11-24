@@ -5,6 +5,7 @@ import { unzipSync } from "fflate";
 import { parseRules, SyncRule, getPluginDir, debounce, showSyncNotice, dump, dumpError } from "./lib/utils/helpers";
 import { copySyncDiagnostics } from "./lib/utils/sync_diagnostics";
 import { resetSettingSyncTime, rebuildAllHashes, clearAllHashes } from "./lib/sync/operator";
+import { resetConflictRecords } from "./lib/sync/conflict_store";
 import { SettingsView, SupportView } from "./views/settings-view";
 import { RuleEditorModal } from "./views/rule-editor-modal";
 import { PathSuggestOptions } from "./views/path-suggest";
@@ -1382,6 +1383,9 @@ export class SettingTab extends PluginSettingTab {
               this.plugin.wsSettingChange = true
               this.plugin.settings.api = value
               this.plugin.localStorageManager.clearSyncTime()
+              // 换服务器后旧目标的冲突记录不再适用：路径集合与元数据一并清掉
+              // Conflicts belong to the old target: clear the set and its metadata as well
+              await resetConflictRecords(this.plugin)
               await this.plugin.saveAndReloadServices()
             }
           }),
@@ -1433,6 +1437,9 @@ export class SettingTab extends PluginSettingTab {
               this.plugin.wsSettingChange = true
               this.plugin.settings.apiToken = value
               this.plugin.localStorageManager.clearSyncTime()
+              // 换账号/令牌后旧作用域的冲突记录不再适用
+              // Conflicts belong to the old scope: clear the set and its metadata as well
+              await resetConflictRecords(this.plugin)
               await this.plugin.saveAndReloadServices()
             }
           }),

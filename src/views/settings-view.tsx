@@ -6,6 +6,7 @@ import { setIcon } from "obsidian";
 import FastSync from "src/main";
 
 import { UserDTO, SupportRecord, SupportPager } from "../lib/api/http_api_service";
+import { resetConflictRecords } from "../lib/sync/conflict_store";
 import { LucideIcon } from "./note-history/lucide-icon";
 import { $, getLocale } from "../i18n/lang";
 
@@ -68,6 +69,9 @@ async function applyRemoteConfig(plugin: FastSync, config: RemoteAuthConfig): Pr
   plugin.clipboardReadTip = $("setting.remote.paste_success");
 
   plugin.localStorageManager.clearSyncTime();
+  // 导入的连接配置可能指向另一个服务器/账号：旧目标的冲突记录一并清掉
+  // The imported config may point to another server/account: clear the old target's conflicts
+  await resetConflictRecords(plugin);
   await plugin.saveAndReloadServices();
   plugin.settingTab.refresh();
 

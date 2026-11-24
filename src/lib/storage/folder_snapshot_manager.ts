@@ -212,6 +212,11 @@ export class FolderSnapshotManager {
         this.pendingDeleteBaselines.clear();
         dump("FolderSnapshotManager: remote scope changed; folder revisions cleared");
         this.saveBaselineState();
+        // 旧目标的冲突记录不再有意义；动态导入避免静态循环依赖
+        // Old-target conflicts are meaningless; a dynamic import avoids a static cycle
+        void import("../sync/conflict_store")
+            .then(({ resetConflictRecords }) => resetConflictRecords(this.plugin))
+            .catch(() => undefined);
     }
 
     private async loadBaselineState(): Promise<void> {
@@ -230,6 +235,14 @@ export class FolderSnapshotManager {
             this.pendingDeleteBaselines.clear();
             dump("FolderSnapshotManager: stored folder revisions belong to another remote target; discarded");
             this.saveBaselineState();
+            // 启动即发现换过目标：先清旧目标的冲突记录，再由主流程读回集合
+            // Target changed since last session: clear old conflicts before main reads the set
+            try {
+                const { resetConflictRecords } = await import("../sync/conflict_store");
+                await resetConflictRecords(this.plugin);
+            } catch {
+                // Conflict cleanup is best-effort; initialization must continue
+            }
         }
     }
 
