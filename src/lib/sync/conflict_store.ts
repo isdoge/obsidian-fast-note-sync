@@ -174,10 +174,11 @@ function pauseUploadsForPath(plugin: FastSync, path: string): void {
 
 /**
  * 持久化一条统一冲突，并把路径加入暂停自动上传集合。
- * 返回 false 表示载荷无效（无路径），调用方不应据此记账。
+ * 返回 false 表示载荷无效（无路径）或元数据未能落盘，调用方不应据此记账。
  *
  * Persist one unified conflict and pause automatic uploads for the path.
- * Returns false for an invalid payload (no path); callers must not account for it.
+ * Returns false for an invalid payload (no path) or when the metadata could not be persisted;
+ * callers must not account for it in either case.
  */
 export async function storeSyncConflict(plugin: FastSync, raw: unknown): Promise<boolean> {
   const conflict = normalizeConflict(raw);
@@ -194,6 +195,7 @@ export async function storeSyncConflict(plugin: FastSync, raw: unknown): Promise
   // the stale cleanup cannot interleave with this new record
   await awaitPendingConflictReset(plugin);
 
+  let metaPersisted = false;
   try {
     const adapter = plugin.app.vault.adapter;
     const { dir, baseBackupPath, remoteBackupPath } = conflictBackupPaths(plugin, path);
@@ -270,8 +272,18 @@ export async function storeSyncConflict(plugin: FastSync, raw: unknown): Promise
         : (previous?.localHashAtDetection ? { localHashAtDetection: previous.localHashAtDetection } : {})),
     };
     await writeConflictMeta(plugin, path, meta);
+    metaPersisted = true;
   } catch (error) {
     dumpError(`[Conflict] Failed to persist conflict metadata: ${path}`, error);
+  }
+
+  // 元数据没落盘就不能进集合：否则启动自愈会把这条“没有 meta”的记录当成残留删掉，
+  // 期间还占着冲突角标、暂停上传，反而更难排查。
+  // Without metadata the path must stay out of the set: startup self-heal would treat the record
+  // as a leftover and drop it, while the badge and upload pause would linger until then.
+  if (!metaPersisted) {
+    dumpError(`[Conflict] Conflict metadata was not persisted; keeping the path out of the conflict list: ${path}`);
+    return false;
   }
 
   plugin.syncState.conflictedPaths.add(path);
