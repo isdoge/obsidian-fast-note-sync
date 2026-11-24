@@ -242,4 +242,24 @@ function lastPayload(adapter) {
   assert.equal(entries.filter(e => e.kind === 'BufferOnly' && e.level === 'warn').length, 1);
 }
 
+// 8. Redaction happens before the 800-char truncation: a credential straddling the cut is gone
+//    from both the in-memory buffer and the persisted file.
+{
+  const adapter = makeAdapter();
+  const mod = await newDiagnostics(adapter);
+  const payload = `${'x'.repeat(776)} "apiToken":"OPAQUE_CREDENTIAL_TEST_VALUE"`;
+  mod.recordDiag('error', 'CredentialCut', payload);
+  await mod.flushSyncDiagnostics();
+
+  const raw = adapter.writes[adapter.writes.length - 1];
+  assert.ok(!raw.includes('OPAQUE_CRED'), 'persisted diagnostics never leak the credential prefix');
+  assert.ok(raw.includes('[redacted]'), 'the credential is replaced as a whole');
+
+  const inMemory = lastPayload(adapter).entries.find(e => e.kind === 'CredentialCut');
+  assert.ok(inMemory, 'the entry is in the buffer');
+  assert.ok(!inMemory.message.includes('OPAQUE_CRED'), 'in-memory entry never leaks the credential prefix');
+  const text = mod.buildSyncDiagnosticsText(makePlugin(adapter));
+  assert.ok(!text.includes('OPAQUE_CRED'), 'copied diagnostics never leak the credential prefix');
+}
+
 console.log('sync-diagnostics: all checks passed');

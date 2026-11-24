@@ -216,4 +216,27 @@ const jwt = [jwtHeader, jwtPayload, 'c2lnbmF0dXJl'].join('.');
   assert.ok(!objectOut.includes(xApi) && !objectOut.includes(xApiUpper));
 }
 
+// 10. Body fields embedded in free-form text (prefixed / truncated JSON) are omitted too
+{
+  const marker = ['PRIVATE', 'NOTE', 'BODY', 'TEST'].join('_');
+
+  const closed = redactDiagnosticText(`Code=500 details={"content":"${marker}"}`);
+  assert.ok(!closed.includes(marker), 'embedded JSON content value is omitted');
+  assert.ok(closed.includes('Code=500'), 'the diagnostic context survives');
+  assert.ok(closed.includes('"content":"[content omitted]"'), 'the body key is kept, the value replaced');
+
+  const unclosed = redactDiagnosticText(`Code=500 details={"content":"${marker}`);
+  assert.ok(!unclosed.includes(marker), 'an unterminated body value (truncated upstream) is omitted too');
+  assert.ok(unclosed.includes('Code=500'), 'the diagnostic context survives for the truncated form');
+
+  for (const field of ['body', 'localContent', 'local_content', 'local-content', 'remoteContent', 'remote_content', 'remote-content', 'noteContent', 'note_content', 'note-content']) {
+    const out = redactDiagnosticText(`x={"${field}":"${marker}"}`);
+    assert.ok(!out.includes(marker), `embedded ${field} value is omitted`);
+  }
+
+  // Ordinary text without sensitive values or body keys is unchanged.
+  const ordinary = 'NoteSync page 3/20 finished in 412ms, 12 notes confirmed, path=folder/a.md';
+  assert.equal(redactDiagnosticText(ordinary), ordinary, 'new rules do not touch ordinary text');
+}
+
 console.log('PASS: diagnostic logs redact credentials, bodies and binary while keeping Error stacks');

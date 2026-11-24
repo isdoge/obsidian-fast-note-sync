@@ -89,8 +89,11 @@ function clean(value: unknown): string {
                 : typeof value === "number" || typeof value === "boolean" || typeof value === "bigint"
                     ? String(value)
                     : "";
-    const truncated = text.length > MAX_MESSAGE_LENGTH ? `${text.slice(0, MAX_MESSAGE_LENGTH)}…` : text;
-    return redactDiagnosticText(truncated);
+    // 先对完整文本脱敏再截断，避免凭据跨在截断点上时只遮住一半、留下前缀
+    // Redact the full text first, then truncate: a credential straddling the cut would
+    // otherwise leave its prefix behind
+    const redacted = redactDiagnosticText(text);
+    return redacted.length > MAX_MESSAGE_LENGTH ? `${redacted.slice(0, MAX_MESSAGE_LENGTH)}…` : redacted;
 }
 
 function append(level: DiagLevel, kind: string, message: unknown, path?: string): void {

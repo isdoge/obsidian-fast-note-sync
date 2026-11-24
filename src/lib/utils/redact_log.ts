@@ -23,6 +23,15 @@ const SENSITIVE_KEY = /^(?:[a-z0-9]+[_-])*(?:api[_-]?token|access[_-]?token|auth
 /** 命中这些键名时省略正文 / Body content is omitted when a key matches */
 const CONTENT_KEY = /^(?:content|body|local[_-]?content|remote[_-]?content|note[_-]?content|diffs)$/i;
 
+/**
+ * 文本里嵌入的 JSON 正文字段：键名与 CONTENT_KEY 中的字符串型正文键一致，值整体省略。
+ * 结尾的 `"?` 有意允许字符串没有闭合引号（上游文本已被截断），此时一直省略到文本末尾。
+ * Body fields inside pre-stringified JSON text (same string keys as CONTENT_KEY): the value is
+ * omitted wholesale. The trailing `"?` deliberately allows an unterminated value (upstream text
+ * was truncated) and then swallows the rest of the text.
+ */
+const CONTENT_JSON_FIELD_RE = /("(?:content|body|local[_-]?content|remote[_-]?content|note[_-]?content)"\s*[:：]\s*)"(?:[^"\\]|\\.)*"?/gi;
+
 /** 库名字段：`vault` / `vaultName` / `vault_name` / `remoteVault` 等 / Vault-name keys */
 const VAULT_KEY = /^(?:(?:remote|local|target|source)[_-]?)?vault(?:[_-]?name)?$/i;
 /** JSON 字符串里的库名字段 / Vault-name fields inside pre-stringified JSON */
@@ -237,6 +246,13 @@ function redactWithContext(text: string, context: DiagnosticRedactionContext | n
         result = result.replace(VAULT_QUERY_RE, `$1${PLACEHOLDER_VAULT}`);
         result = result.replace(VAULT_JSON_FIELD_RE, `$1"${PLACEHOLDER_VAULT}"`);
         result = redactVaultNameInText(result, vaultName);
+        // 库名含空格 / 中文时，网址路径里出现的是编码形式（`Private Vault` -> `Private%20Vault`）
+        // A vault name with spaces or non-ASCII text appears URL-encoded in paths
+        let encodedVaultName = "";
+        try { encodedVaultName = encodeURIComponent(vaultName); } catch { /* 孤立代理项等无法编码的库名：跳过 */ }
+        if (encodedVaultName && encodedVaultName !== vaultName) {
+            result = result.replace(new RegExp(escapeRegExp(encodedVaultName), "gi"), PLACEHOLDER_VAULT);
+        }
     }
     return result;
 }
@@ -265,6 +281,7 @@ const PRIVATE_KEY_BLOCK_RE = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END
 function redactCredentialText(text: string): string {
     return text
         .replace(PRIVATE_KEY_BLOCK_RE, "[redacted private key]")
+        .replace(CONTENT_JSON_FIELD_RE, '$1"[content omitted]"')
         .replace(URL_PARAM_RE, "$1[redacted]")
         .replace(URL_USERINFO_RE, "$1[redacted]@")
         .replace(JSON_FIELD_RE, (_match, prefix: string) => `${prefix}"[redacted]"`)

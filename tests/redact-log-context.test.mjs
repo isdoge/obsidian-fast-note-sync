@@ -294,6 +294,21 @@ const setContext = (context) => setDiagnosticRedactionContext(() => context);
   }
 }
 
+// 9. Vault names with spaces / non-ASCII also appear URL-encoded in paths.
+{
+  setContext({ vaultPath: '', vaultName: 'Private Vault', serverHosts: [] });
+  const encoded = redactDiagnosticText('/files/Private%20Vault/note.md');
+  assert.ok(!encoded.includes('Private%20Vault'), 'URL-encoded vault name is masked');
+  assert.equal(encoded, '/files/[vault]/note.md');
+
+  assert.equal(
+    redactDiagnosticText('Private Vault.md'),
+    'Private Vault.md',
+    'a file name that merely contains the vault name is still kept',
+  );
+  assert.equal(redactDiagnosticText('opened Private Vault now'), 'opened [vault] now', 'the plain form is still masked');
+}
+
 setDiagnosticRedactionContext(null);
 
 console.log('PASS: diagnostic logs redact vault paths, user names, vault names and server addresses');
