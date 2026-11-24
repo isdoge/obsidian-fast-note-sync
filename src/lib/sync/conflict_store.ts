@@ -310,13 +310,32 @@ export async function pruneInvalidConflictRecords(plugin: FastSync): Promise<num
   const paths = plugin.syncState.conflictedPaths;
   if (!paths || paths.size === 0) return 0;
   const adapter = plugin.app.vault.adapter;
+  const dir = `${getPluginDir(plugin)}/conflict-notes`;
+  // 一次列举目录，而不是逐条 exists()：事故里的集合有 2315 条，逐条探测会明显拖慢启动。
+  // 目录本身不存在时说明元数据全被清掉，集合里的记录全部失效。
+  // List once instead of one exists() per path: the incident had 2315 entries, and per-path
+  // probes visibly slow startup. A missing directory means every record lost its metadata.
+  let existing: Set<string>;
+  try {
+    if (!(await adapter.exists(dir))) {
+      existing = new Set();
+    } else {
+      const listed = await adapter.list(dir);
+      existing = new Set(listed?.files ?? []);
+    }
+  } catch (error) {
+    // 列举失败时保守保留全部记录，留待下次启动再判断
+    // On a failed listing keep every record and try again next startup
+    dump("[Conflict] Unable to list conflict metadata, keeping all records", error);
+    return 0;
+  }
   const invalid: string[] = [];
   for (const path of Array.from(paths)) {
     try {
       const { metaPath } = conflictBackupPaths(plugin, path);
-      if (!(await adapter.exists(metaPath))) invalid.push(path);
+      if (!existing.has(metaPath)) invalid.push(path);
     } catch (error) {
-      dump(`[Conflict] Unable to check conflict metadata, keeping record: ${path}`, error);
+      dump(`[Conflict] Unable to resolve conflict metadata, keeping record: ${path}`, error);
     }
   }
   if (invalid.length === 0) return 0;

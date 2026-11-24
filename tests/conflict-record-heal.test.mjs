@@ -126,6 +126,19 @@ function makePlugin(existingFiles, initialPaths) {
     assert.equal(statusBarCalls.count, 0, "badge is untouched when nothing changes");
 }
 
+// 2b. The whole conflict-notes directory is gone (the incident: plugin-dir state wiped):
+//     every surviving path is invalid and gets dropped in one pass.
+{
+    const a = "notes/a.md";
+    const b = "files/b.png";
+    const { plugin, persisted } = makePlugin([], [a, b]);
+    plugin.app.vault.adapter.exists = async () => false;
+    assert.equal(await store.pruneInvalidConflictRecords(plugin), 2);
+    assert.equal(plugin.syncState.conflictedPaths.size, 0, "all records are dropped when no metadata remains");
+    assert.equal(persisted.length, 1);
+    assert.equal(persisted[0].size, 0);
+}
+
 // 3. Reset: clear the set/localStorage and delete metadata, but keep content backups.
 {
     const a = "notes/a.md";
