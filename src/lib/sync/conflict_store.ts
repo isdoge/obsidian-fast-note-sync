@@ -311,6 +311,14 @@ export async function pruneInvalidConflictRecords(plugin: FastSync): Promise<num
   if (!paths || paths.size === 0) return 0;
   const adapter = plugin.app.vault.adapter;
   const dir = `${getPluginDir(plugin)}/conflict-notes`;
+  // 先取候选快照，再列目录。storeSyncConflict 先写 meta 再把路径加入集合，所以在这份快照
+  // 之后新增的路径一定不在候选里，不会被误删；反过来先列目录再取集合，会把同步中刚加入、
+  // meta 尚未落盘（或正好在两次 await 之间写入）的记录当成“没有元数据的残留”清掉。
+  // Snapshot the candidates before listing. storeSyncConflict writes the meta before adding the
+  // path, so anything added after this snapshot is absent from the candidates and can never be
+  // pruned. Listing first and snapshotting later could drop a record added concurrently, before
+  // its metadata reached the directory.
+  const candidates = Array.from(paths);
   // 一次列举目录，而不是逐条 exists()：事故里的集合有 2315 条，逐条探测会明显拖慢启动。
   // 目录本身不存在时说明元数据全被清掉，集合里的记录全部失效。
   // List once instead of one exists() per path: the incident had 2315 entries, and per-path
@@ -330,7 +338,7 @@ export async function pruneInvalidConflictRecords(plugin: FastSync): Promise<num
     return 0;
   }
   const invalid: string[] = [];
-  for (const path of Array.from(paths)) {
+  for (const path of candidates) {
     try {
       const { metaPath } = conflictBackupPaths(plugin, path);
       if (!existing.has(metaPath)) invalid.push(path);

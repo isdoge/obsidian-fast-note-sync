@@ -160,4 +160,22 @@ function makePlugin(existingFiles, initialPaths) {
     assert.ok(files.size > 0, "conflict folder itself is not removed");
 }
 
+// 4. Race: a path added while the directory is being listed (meta not written yet) must not be
+//    mistaken for a leftover. The candidate snapshot is taken before listing.
+{
+    const stable = "notes/stable.md";
+    const addedDuringList = "notes/added-during-list.md";
+    const { plugin } = makePlugin([conflictBackupPaths({}, stable).metaPath], [stable]);
+    const originalList = plugin.app.vault.adapter.list;
+    plugin.app.vault.adapter.list = async (dir) => {
+        // storeSyncConflict adds the path after writing its meta; here it lands between the
+        // candidate snapshot and the listing result, so the meta is not in the listing yet.
+        plugin.syncState.conflictedPaths.add(addedDuringList);
+        return originalList(dir);
+    };
+    assert.equal(await store.pruneInvalidConflictRecords(plugin), 0, "no record is pruned");
+    assert.ok(plugin.syncState.conflictedPaths.has(addedDuringList), "a path added during listing survives");
+    assert.ok(plugin.syncState.conflictedPaths.has(stable), "existing record is kept");
+}
+
 console.log("PASS: invalid conflict records self-heal and sync-state reset clears metadata");
