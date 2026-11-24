@@ -105,6 +105,7 @@ The following items have been removed in this independently maintained edition. 
     > Combined with the plugin's exclusion settings, you can directly use a third-party repository (like WebDav) for certain types of attachments without uploading via the server.
 - 🗒️ **Sync Logs**:
     - Provides sync log functionality, making it easy to view detailed information for each synchronization.
+    - "Copy sync diagnostics" copies an overview of recent sync rounds together with failure and conflict records in one click (includes file paths; excludes the server address and token). Records are kept even when the debug log is off, which makes problems easier to report.
 - 🌐 **Astro Firefly Blog Writing & Auto-Publish Assistant**:
     - Validates post frontmatter, converges images into the note's `./assets/` and rewrites references, runs pre-publish checks, and triggers the server-side Git/Firefly build with a live build receipt.
     > ⚠️ **Note**: Requires server v3.8.5+ for auto-publish, and a Firefly Git-sync target configured on the server.
