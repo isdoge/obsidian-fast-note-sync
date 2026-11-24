@@ -1,10 +1,13 @@
 import { TFolder, TFile, normalizePath } from "obsidian";
 
 import { receiveFileUpload, receiveFileSyncUpdate, receiveFileSyncDelete, receiveFileSyncMtime, receiveFileSyncChunkDownload, receiveFileSyncEnd, checkAndUploadAttachments, receiveFileSyncRename, receiveFileRenameAck, receiveFileUploadAck, receiveFileDeleteAck, isPluginUnloading, sweepStalledDownloadSessions, invalidateFileDownloads, isAttachmentUploadActive } from "./operator_file";
-import { hashContent, hashContentAsync, dump, isPathExcluded, isFolderSyncPathExcluded, configIsPathExcluded, getConfigSyncCustomDirs, generateUUID, showSyncNotice, isLargeBinarySyncRisk, describeBinarySyncLimit, hashFileAsync, formatFileSize, yieldToMain, getPluginDir } from "../utils/helpers";
+import { hashContent, hashContentAsync, dump, dumpError, isPathExcluded, isFolderSyncPathExcluded, configIsPathExcluded, getConfigSyncCustomDirs, generateUUID, showSyncNotice, isLargeBinarySyncRisk, describeBinarySyncLimit, hashFileAsync, formatFileSize, yieldToMain, getPluginDir } from "../utils/helpers";
 import { receiveConfigSyncModify, receiveConfigUpload, receiveConfigSyncMtime, receiveConfigSyncDelete, receiveConfigSyncEnd, configAllPaths, receiveConfigSyncClear, receiveConfigModifyAck, receiveConfigDeleteAck } from "./operator_config";
-import { receiveNoteSyncModify, receiveNoteUpload, receiveNoteSyncMtime, receiveNoteSyncDelete, receiveNoteSyncEnd, receiveNoteSyncRename, receiveNoteModifyAck, receiveNoteRenameAck, receiveNoteDeleteAck, conflictBackupPaths } from "./operator_note";
+import { receiveNoteSyncModify, receiveNoteUpload, receiveNoteSyncMtime, receiveNoteSyncDelete, receiveNoteSyncEnd, receiveNoteSyncRename, receiveNoteModifyAck, receiveNoteRenameAck, receiveNoteDeleteAck, conflictBackupPaths, probeEmptyNoteInsteadOfUpload } from "./operator_note";
 import { SyncMode, SnapFile, SnapFolder, SyncEndData, PathHashFile, NoteSyncData, FileSyncData, ConfigSyncData, FolderSyncData } from "../utils/types";
+// 诊断通道：测试会以最小 stub 注入本模块，调用处统一用可选调用，缺失时静默跳过
+// Diagnostics channel: tests inject minimal stubs, so calls are optional and silently skipped when absent
+import * as syncDiagnostics from "../utils/sync_diagnostics";
 import { receiveFolderSyncModify, receiveFolderSyncDelete, receiveFolderSyncRename, receiveFolderSyncEnd, receiveFolderModifyAck, receiveFolderDeleteAckWithRevision, receiveFolderRenameAckWithRevision } from "./operator_folder";
 import { FileCloudPreview } from "../storage/file_cloud_preview";
 import { SyncLogManager } from "./sync_log_manager";
@@ -14,6 +17,7 @@ import { $ } from "../../i18n/lang";
 import { SyncType } from "./sync_progress_tracker";
 import { ConfirmModal } from "../../views/confirm-modal";
 import { buildBaselineFields, buildDeleteBaselineFields } from "../storage/baseline_scope";
+import { evaluateMassDeleteGuard } from "./mass_delete_guard";
 import { conflictKindToSyncType, normalizeConflict, storeSyncConflict } from "./conflict_store";
 
 // C9: 离线超墓碑期保护 — 默认与服务端 soft-delete-retention-time 默认值对应（90 天），
@@ -208,6 +212,7 @@ function restartStalledSync(plugin: FastSync, intervalId?: number): void {
       : 'Sync stalled waiting for server pages; restarting a new round', timestamp: Date.now()
   });
   plugin.syncState.activeSyncContext = null;
+  plugin.syncRoundReadonly = false; // 停滞重启：本轮已中止 / Round aborted: clear the read-only snapshot
   plugin.syncTypeCompleteCount = 0;
   plugin.resetSyncTasks();
   plugin.syncPageStateMap.clear();
@@ -359,6 +364,25 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, _sync
       showSyncNotice($("ui.notice.hash_timeout", { count: String(hashTimeoutCount) }), 10000);
       plugin.syncState.hasSyncedThisConnection = false;
     }
+
+    // 诊断摘要与“首次同步上传较多”提示：都在本轮状态被清空前取数
+    // Diagnostic summary and the first-sync upload notice: read round state before it is cleared
+    const diagConflicts = Array.from(plugin.syncState.conflictCountsThisRound?.values() ?? [])
+      .reduce((sum, count) => sum + count, 0);
+    const diagUnaligned = plugin.syncState.newUnalignedPathsThisRound?.size ?? 0;
+    const roundUploadTotals = syncDiagnostics.getRoundUploadTotals?.();
+    syncDiagnostics.recordRoundSummary?.({
+      failed: totalFailed,
+      conflicts: diagConflicts,
+      unaligned: diagUnaligned,
+      hashTimeouts: hashTimeoutCount,
+    });
+    if (roundUploadTotals && !roundUploadTotals.readonly && !roundUploadTotals.initSync) {
+      const firstSyncUploadCount = roundUploadTotals.notes + roundUploadTotals.files;
+      if (firstSyncUploadCount >= 20 && plugin.settings.isShowNotice) {
+        showSyncNotice($("ui.notice.first_sync_uploaded", { count: String(firstSyncUploadCount) }), 15000);
+      }
+    }
     // 未参与完成判定的类型（如本轮中途关闭了同步）仍有暂存时间时回到基线
     // Types left unsettled (e.g. sync disabled mid-round) fall back to their baseline
     settleSyncTimes(plugin, true);
@@ -366,6 +390,7 @@ export function checkSyncCompletion(plugin: FastSync, intervalId?: number, _sync
 
     if (totalFailed === 0 && hashTimeoutCount === 0) plugin.retryQueue?.completeScan(plugin.progressTracker.getActiveTypes());
     plugin.syncState.activeSyncContext = null; // 同步完成，清空活跃的上下文 / Sync completed, reset the active context
+    plugin.syncRoundReadonly = false; // 本轮结束，清空只读快照 / Round finished: clear the read-only snapshot
     plugin.isSyncing = false;
     plugin.syncTypeCompleteCount = 0;
     plugin.resetSyncTasks();
@@ -767,6 +792,14 @@ async function receiveSyncEndWrapper(data: unknown, plugin: FastSync, type: "not
   } else {
     dump(`[Sync] Skipping initial ACK for type: ${trackerType} because total tasks is 0 or initial ACK already sent`);
   }
+
+  // 所有类型的 SyncEnd 都到齐才清除入口只读快照：多类型轮次里若按单个 SyncEnd 清除，
+  // 后续类型（如配置）的 NeedPush 就会绕过本轮快照。
+  // Clear the entry read-only snapshot only once every type has sent SyncEnd: clearing on a
+  // single type's SyncEnd would let later types' NeedPush bypass the round snapshot.
+  if (plugin.noteSyncEnd && plugin.fileSyncEnd && plugin.folderSyncEnd && plugin.configSyncEnd) {
+    plugin.syncRoundReadonly = false;
+  }
 }
 
 /**
@@ -845,13 +878,25 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       return;
     }
 
-    if (plugin.settings.readonlySyncEnabled) {
+    // 只读模式快照：本轮扫描与发送阶段一律使用入口时的取值，避免同步中途切换开关
+    // 导致同一轮扫描/发送半新半旧（扫描期与发送期原本各自实时读设置）。
+    // Read-only snapshot: the scan and send phases of this round use the value captured at
+    // entry, so flipping the toggle mid-round cannot make one round half-new/half-old.
+    const readonlyThisRound = !!plugin.settings.readonlySyncEnabled;
+    // 同时记到插件本轮状态上，供轮次内的接收端门禁（NeedPush 上传等）做 fail-closed 取或。
+    // Also record it on the plugin as this round's state, so receive-side gates inside the round
+    // (NeedPush uploads, etc.) can OR it fail-closed with the live setting.
+    plugin.syncRoundReadonly = readonlyThisRound;
+    if (readonlyThisRound) {
       dump("Read-only mode: Proceeding with state gathering for remote-to-local sync.");
     }
 
     plugin.currentSyncType = isLoadLastTime ? 'incremental' : 'full';
     plugin.syncTypeCompleteCount = 0;
     plugin.resetSyncTasks();
+    // 本轮诊断统计从这里开始（isInitSync 取本轮开始前的值）
+    // Per-round diagnostics start here (isInitSync is the value before this round)
+    syncDiagnostics.beginSyncRound?.(plugin.currentSyncType, readonlyThisRound, !!plugin.localStorageManager.getMetadata("isInitSync"));
 
     const shouldSyncNotes = syncMode === "auto" || syncMode === "note";
     const shouldSyncConfigs = syncMode === "auto" || syncMode === "config";
@@ -937,6 +982,16 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     const delNotes: PathHashFile[] = [], delFiles: PathHashFile[] = [], delConfigs: PathHashFile[] = [], delFolders: PathHashFile[] = [];
     const missingNotes: PathHashFile[] = [], missingFiles: PathHashFile[] = [], missingConfigs: PathHashFile[] = [], missingFolders: PathHashFile[] = [];
 
+    // 大批消失护栏计数：已确认基线总数，以及其中被扫描推断为本地缺失、准备上报删除的数量。
+    // 只在 offlineDeleteSyncEnabled 的扫描循环里累加；首次同步/空基线时保持 0，护栏不会触发。
+    // Mass-disappearance guard counters: confirmed baseline entries and how many of them the scan
+    // inferred missing and queued for remote deletion. Only accumulated in the offline-delete scan
+    // loop; first sync / empty baseline keeps them at 0, so the guard cannot trigger.
+    let confirmedBaselineTotal = 0;
+    let confirmedMissingCount = 0;
+    let confirmedFolderBaselineTotal = 0;
+    let confirmedFolderMissingCount = 0;
+
     // 预先标记未参与本次同步的模块为已结束，避免 checkSyncCompletion 永远等待它们
     // Pre-mark modules not participating in this sync as ended to prevent checkSyncCompletion from waiting forever
     if (!(plugin.settings.syncEnabled && shouldSyncNotes)) {
@@ -1021,7 +1076,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
 
         try {
           if (file instanceof TFolder) {
-            if (plugin.settings.readonlySyncEnabled) continue;
+            if (readonlyThisRound) continue;
             if (file.path === "/") continue;
             if (isFolderSyncPathExcluded(file.path, plugin)) continue;
             let mtime = plugin.folderSnapshotManager.getMtime(file.path) || Date.now();
@@ -1060,6 +1115,26 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
               const noteLimit = (plugin.settings.noteSyncLimit ?? 20) * 1024 * 1024;
               if (file.stat.size > noteLimit) continue;
 
+              // #205 扫描路径：0 字节且没有任何同步基线的笔记，如果照常以 baseHashMissing 上报，
+              // 服务端基线决策会把"客户端无基线且内容与服务端不同"判成 no_baseline 冲突，不下发内容，
+              // 新设备上的空白日记永远补不上。与实时路径一致，先 NoteRePush 探测：服务端有内容则
+              // 由 NoteSyncModify 覆盖本地；服务端没有则由 NoteSyncDelete 触发正常新建上传。
+              // 只读模式、仅手动同步模式、兼容模式（旧服务端）与已有基线的有意清空都保持原行为，不进探测。
+              //
+              // #205 scan path: a zero-byte note with no sync baseline reported as baseHashMissing makes
+              // the server's baseline decision a no_baseline conflict (nothing is downloaded), so an
+              // empty daily note on a new device never fills in. Mirror the live path and probe with
+              // NoteRePush first: server has content -> NoteSyncModify overwrites the local empty file;
+              // server doesn't -> NoteSyncDelete re-uploads it as a normal create. Read-only mode,
+              // manual-only mode, compatibility mode (legacy server) and a deliberate clear with an
+              // existing baseline keep the previous behavior and never probe.
+              if (!readonlyThisRound
+                && !plugin.settings.manualSyncEnabled
+                && plugin.isSyncBaselineModeEnabled?.() === true
+                && file.stat.size === 0
+                && plugin.fileHashManager.getPathHash(file.path) === null
+                && probeEmptyNoteInsteadOfUpload(plugin, file.path, "", null)) continue;
+
               const cachedNoteHash = plugin.fileHashManager.getValidHash(file.path, file.stat.mtime, file.stat.size);
               if (cachedNoteHash !== null) {
                 notes.push({
@@ -1097,6 +1172,9 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                   } catch (error) {
                     // 超时单独计数，受影响类型保留游标供下轮重试。 / Count timeouts separately and retry the type next round.
                     if (error instanceof Error && error.name === "HashTimeoutError") timedOutNoteCount++;
+                    // 超时已在摘要的 hashTimeouts 单列，不再计入扫描错误
+                    // Timeouts are reported as hashTimeouts; they are not counted as scan errors
+                    else syncDiagnostics.recordScanFileError?.(notePath, error);
                   }
                 });
               }
@@ -1161,12 +1239,18 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
                   } catch (error) {
                     // 超时单独计数，受影响类型保留游标供下轮重试。 / Count timeouts separately and retry the type next round.
                     if (error instanceof Error && error.name === "HashTimeoutError") timedOutFileCount++;
+                    // 超时已在摘要的 hashTimeouts 单列，不再计入扫描错误
+                    // Timeouts are reported as hashTimeouts; they are not counted as scan errors
+                    else syncDiagnostics.recordScanFileError?.(attPath, error);
                   }
                 });
               }
             }
           }
-        } catch {
+        } catch (error) {
+          // 单文件扫描异常：计数并记录前 10 个路径，继续处理下一个（行为不变）
+          // Per-file scan error: count, log the first 10 paths, keep going (behavior unchanged)
+          syncDiagnostics.recordScanFileError?.(file.path, error);
           continue;
         }
       }
@@ -1185,6 +1269,34 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       commitScannedHashes(plugin.scannedNoteHashes, (m) => plugin.fileHashManager.bulkSetFromScanned(m));
       commitScannedHashes(plugin.scannedFileHashes, (m) => plugin.fileHashManager.bulkSetFromScanned(m));
       dump(`[ScanPerf] Scan done: ${hashComputeCount}/${MAX_HASH_PER_CYCLE} hashes computed, notes=${notes.length}, files=${files.length}, folders=${folders.length}`);
+
+      // 设备本地驱逐日志：「上传后删除本地」的附件不能被当作离线删除上报服务端。
+      // 日志不可读时本轮不上报任何附件离线删除（宁可少删，也不能误删云端/其它设备副本）。
+      // Device-local eviction journal: attachments removed locally after upload must never be
+      // reported as offline deletions. If the journal is unreadable, no attachment deletion is
+      // reported this round — better to under-report than destroy remote/other-device copies.
+      const eviction = plugin.cloudAttachmentEviction;
+      let evictionUsable = false;
+      if (eviction) {
+        try {
+          await eviction.initialize();
+          evictionUsable = eviction.isUsable;
+        } catch (error) {
+          evictionUsable = false;
+          dumpError("Cloud attachment eviction journal initialization failed", error);
+        }
+        if (evictionUsable) {
+          // 附件重新出现在本地（用户下载回来或新建）：清除驱逐记录，恢复正常的删除语义
+          // The attachment reappeared locally (downloaded back or recreated): drop the eviction record
+          const reappeared = list
+            .filter(file => !(file instanceof TFolder) && eviction.isEvicted(file.path))
+            .map(file => file.path);
+          if (reappeared.length > 0) await eviction.forget(reappeared);
+        } else {
+          dumpError("Cloud attachment eviction journal unavailable; offline attachment deletions are not reported this round");
+        }
+      }
+
       if (truncatedNoteCount > 0) plugin.syncState.truncatedSyncFields?.add("lastNoteSyncTime");
       if (truncatedFileCount > 0) plugin.syncState.truncatedSyncFields?.add("lastFileSyncTime");
       const truncatedTotal = truncatedNoteCount + truncatedFileCount;
@@ -1208,7 +1320,22 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
           if (isPathExcluded(path, plugin) || plugin.retryQueue?.shouldSkipScanDelete(path)) continue;
           // 冲突冻结的路径不由批量扫描替用户决定删除 / Frozen conflicted paths are never batch-deleted
           if (plugin.syncState.conflictedPaths.has(path)) continue;
+          // 只把服务端确认过的基线计入大批消失护栏；旧版未确认缓存不计入。
+          // Only server-confirmed baselines count toward the guard; legacy unconfirmed caches don't.
+          const baselineConfirmed = plugin.fileHashManager.getBaselineProvenance?.(path, null) === "confirmed";
+          if (baselineConfirmed) confirmedBaselineTotal++;
           if (!localPathsSet.has(path)) {
+            // 设备本地驱逐（云附件上传后删除）不是用户删除；日志不可读时一律不上报附件删除
+            // Device-local eviction (cloud attachment deleted after upload) is not a user delete;
+            // an unreadable journal means no file deletion is reported at all
+            if (!path.endsWith(".md") && eviction && (!evictionUsable || eviction.isEvicted(path))) continue;
+            if (baselineConfirmed) confirmedMissingCount++;
+            // 只读模式只接收远端更新，本地删除绝不上报（也不转成 missing 清单把文件拉回来）；
+            // 哈希表保留跟踪，关闭只读后由正常流程处理。护栏计数/判定照旧运行。
+            // Read-only mode only receives remote updates: local deletes are never reported (and
+            // never turned into a missing list that would pull the files back). The hash table
+            // keeps tracking them for the normal flow once read-only is off. Guard counters still run.
+            if (readonlyThisRound) continue;
             const item = { path: path, pathHash: hashContent(path) };
             if (path.endsWith(".md")) {
               delNotes.push({ ...item, ...buildDeleteBaselineFields(plugin, "note", path) });
@@ -1219,7 +1346,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
         }
 
         // 检测被删除的文件夹（只读模式下不上传本地删除的目录）
-        if (!plugin.settings.readonlySyncEnabled && plugin.folderSnapshotManager && plugin.folderSnapshotManager.isReady()) {
+        if (!readonlyThisRound && plugin.folderSnapshotManager && plugin.folderSnapshotManager.isReady()) {
           const trackedFolderPaths = plugin.folderSnapshotManager.getAllPaths();
           const localFolderPathsSet = new Set(list.filter(f => f instanceof TFolder).map(f => f.path));
           let folderCount = 0;
@@ -1227,10 +1354,54 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
             if (++folderCount % 100 === 0) await yieldToMain();
             if (isFolderSyncPathExcluded(path, plugin) || plugin.retryQueue?.shouldSkipScanDelete(path)) continue;
             if (plugin.syncState.conflictedPaths.has(path)) continue;
+            const folderBaselineConfirmed = plugin.folderSnapshotManager.isBaselineConfirmed?.(path) === true;
+            if (folderBaselineConfirmed) confirmedFolderBaselineTotal++;
             if (!localFolderPathsSet.has(path)) {
+              if (folderBaselineConfirmed) confirmedFolderMissingCount++;
               delFolders.push({ path: path, pathHash: hashContent(path), ...buildDeleteBaselineFields(plugin, "folder", path) });
             }
           }
+        }
+
+        // 大批消失护栏（Fail-Closed）：扫描推断出的批量离线删除在发送前统一判定。
+        // 只在"已确认基线 >= 100 且缺失占比 > 80%"时中止；小库、首次同步、空基线不会误触发。
+        // 用户逐条触发的删除事件不经过这里，因此不受影响。
+        // Mass-disappearance guard (fail-closed): decide on scan-inferred batch offline deletes right
+        // before sending. Aborts only when confirmed baseline >= 100 AND the missing ratio > 80%;
+        // small vaults, first sync and empty baselines never trigger. User-triggered per-item
+        // deletes don't go through this path, so they are never blocked.
+        const fileGuard = evaluateMassDeleteGuard({
+          confirmedBaselineCount: confirmedBaselineTotal,
+          pendingDeleteCount: confirmedMissingCount,
+        });
+        const folderGuard = evaluateMassDeleteGuard({
+          confirmedBaselineCount: confirmedFolderBaselineTotal,
+          pendingDeleteCount: confirmedFolderMissingCount,
+        });
+        if (fileGuard.triggered || folderGuard.triggered) {
+          let blockedDeleteCount = 0;
+          let judgedBaselineCount = 0;
+          if (fileGuard.triggered) {
+            blockedDeleteCount += delNotes.length + delFiles.length;
+            judgedBaselineCount += fileGuard.confirmedBaselineCount;
+            delNotes.length = 0;
+            delFiles.length = 0;
+            plugin.syncState.truncatedSyncFields?.add("lastNoteSyncTime");
+            plugin.syncState.truncatedSyncFields?.add("lastFileSyncTime");
+          }
+          if (folderGuard.triggered) {
+            blockedDeleteCount += delFolders.length;
+            judgedBaselineCount += folderGuard.confirmedBaselineCount;
+            delFolders.length = 0;
+            plugin.syncState.truncatedSyncFields?.add("lastFolderSyncTime");
+          }
+          const msg = $("ui.notice.mass_delete_guard", {
+            deleted: String(blockedDeleteCount),
+            total: String(judgedBaselineCount),
+          });
+          dump(`[MassDeleteGuard] Blocked ${blockedDeleteCount}/${judgedBaselineCount} scan-inferred deletes (file=${fileGuard.triggered}, folder=${folderGuard.triggered}); delete upload aborted, cursors held`);
+          SyncLogManager.getInstance().addLog("error", "MassDeleteGuard", msg, "error");
+          showSyncNotice(msg, 10000);
         }
       } else if (isLoadLastTime) {
         // 增量同步且未开启离线删除同步：检测缺失的文件（哈希表中有但本地不存在）
@@ -1242,6 +1413,9 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
           if (isPathExcluded(path, plugin)) continue;
           if (plugin.syncState.conflictedPaths.has(path)) continue;
           if (!localPathsSet.has(path)) {
+            // 被设备本地驱逐的附件不是「服务端缺少」，不进入 missingFiles 上报
+            // An intentionally evicted attachment is not "missing on the server"
+            if (!path.endsWith(".md") && eviction && (!evictionUsable || eviction.isEvicted(path))) continue;
             const item = { path: path, pathHash: hashContent(path) };
             if (path.endsWith(".md")) {
               missingNotes.push(item);
@@ -1383,6 +1557,10 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
           if (configIsPathExcluded(path, plugin)) continue;
           if (plugin.syncState.conflictedPaths.has(path)) continue;
           if (!localConfigPathsSet.has(path)) {
+            // 只读模式不上报本地删除，也不转成 missing 清单（理由同笔记/附件扫描）
+            // Read-only mode never reports local deletes and never turns them into a missing
+            // list (same reasoning as the note/attachment scan)
+            if (readonlyThisRound) continue;
             delConfigs.push({ path: path, pathHash: hashContent(path), ...buildDeleteBaselineFields(plugin, "setting", path) });
           }
         }
@@ -1426,6 +1604,17 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     // 分批发送方案替代原截断方案：不再对 sync 数组截断，所有数据通过 sendInBatches 分批发送
     // Replaced truncation with batch-send: arrays are no longer capped; sendInBatches handles chunking
     dump(`[Sync] Arrays ready: notes=${notes.length}, files=${files.length}, folders=${folders.length}, configs=${configs.length}`);
+    // 扫描上报条数与其中无基线的条数（只统计已有字段，不改变扫描行为）
+    // Reported scan counts and their no-baseline subset (existing fields only; scan behavior unchanged)
+    syncDiagnostics.recordScanReport?.({
+      notes: notes.length,
+      files: files.length,
+      configs: configs.length,
+      folders: folders.length,
+      noBaselineNotes: notes.filter(n => n.baseHashMissing === true).length,
+      noBaselineFiles: files.filter(f => f.baseHashMissing === true).length,
+      noBaselineConfigs: configs.filter(c => c.baseHashMissing === true).length,
+    });
 
     const noteData: NoteSyncData = { lastTime: noteTime, notes, delNotes, missingNotes };
     const fileData: FileSyncData = { lastTime: fileTime, files, delFiles, missingFiles };
@@ -1458,7 +1647,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     plugin.isSyncRequesting = true;
 
     try {
-      await handleRequestSend(plugin, syncMode, noteData, fileData, configData, folderData);
+      await handleRequestSend(plugin, syncMode, noteData, fileData, configData, folderData, { readonly: readonlyThisRound });
     } finally {
       plugin.isSyncRequesting = false;
     }
@@ -1479,6 +1668,7 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     // clobber a newer session that has already taken over.
     if (plugin.syncState.activeSyncContext === context) {
       plugin.syncState.activeSyncContext = null; // 同步失败，清空上下文 / Sync failed, reset the context
+      plugin.syncRoundReadonly = false; // 出错即清空本轮只读快照 / Round failed: clear the read-only snapshot
       plugin.updateStatusBar($("ui.status.failed") || "Sync Failed");
       window.setTimeout(() => plugin.updateStatusBar(""), 10000);
     } else {
@@ -1492,6 +1682,10 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     if (plugin.syncState.activeSyncContext === null) {
       plugin.isSyncing = false;
       plugin.syncState.silentSync = false;
+      // 本轮已无活跃会话（提前返回/出错/已收尾）：清掉入口只读快照，避免影响下一轮
+      // No active session remains (early return / failure / already settled): clear the entry
+      // read-only snapshot so it cannot leak into the next round
+      plugin.syncRoundReadonly = false;
     }
   }
 };
@@ -1520,6 +1714,7 @@ export function cancelSync(plugin: FastSync): void {
   invalidateFileDownloads(plugin);
 
   plugin.syncState.activeSyncContext = null;
+  plugin.syncRoundReadonly = false; // 中止本轮：清空只读快照 / Round cancelled: clear the read-only snapshot
   plugin.syncTypeCompleteCount = 0;
   plugin.resetSyncTasks();
   plugin.syncPageStateMap.clear();
@@ -1859,8 +2054,15 @@ async function sendSyncInBatches<T1, T2, T3>(
  * Send sync requests
  * The four batch types (folder/note/file/setting) are dispatched concurrently (folder barrier removed);
  * concurrent createFolder races are absorbed by each handler's lazy folder-creation fallback (design §6.2)
+ *
+ * opts.readonly 为 handleSync 在入口处取的只读快照（可选；缺省时回落到实时读设置，
+ * 兼容直接调用本函数的测试/恢复路径）。发送阶段的只读判断一律用这个值。
+ * opts.readonly is the read-only snapshot taken at handleSync entry (optional; falls back to the
+ * live setting for tests / recovery paths that call this directly). All send-phase read-only
+ * decisions use this value.
  */
-export const handleRequestSend = async function (plugin: FastSync, syncMode: SyncMode, noteData: NoteSyncData, fileData: FileSyncData, configData: ConfigSyncData, folderData: FolderSyncData) {
+export const handleRequestSend = async function (plugin: FastSync, syncMode: SyncMode, noteData: NoteSyncData, fileData: FileSyncData, configData: ConfigSyncData, folderData: FolderSyncData, opts?: { readonly?: boolean }) {
+  const isReadonly = opts?.readonly ?? !!plugin.settings.readonlySyncEnabled;
   const queue = plugin.retryQueue;
   // 冲突冻结的路径既不上传删除也不参与本轮上行，统一在发送前剔除（扫描侧已跳过，这里再兜一层）
   // Frozen conflicted paths are never uploaded as deletes or as this round's upstream items; the
@@ -1897,7 +2099,6 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
 
     // 并发分批发送 FolderSync / NoteSync / FileSync
     // Concurrently batch-send FolderSync / NoteSync / FileSync
-    const isReadonly = !!plugin.settings.readonlySyncEnabled;
     const foldersToSend = isReadonly ? [] : folderData.folders;
     const delFoldersToSend = !isReadonly && plugin.settings.offlineDeleteSyncEnabled ? folderData.delFolders : [];
     dump(`[Sync] Starting batch send: ${foldersToSend.length} folders, ${noteData.notes.length} notes, ${fileData.files.length} files`);
@@ -1927,13 +2128,18 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
       }
     ));
 
+    // 删除清单：只读时一律为空（与 delFolders 的写法对齐），字段也不随包发送
+    // Delete lists: always empty in read-only mode (aligned with delFolders), and the field is
+    // omitted from the payload entirely
+    const delNotesToSend = !isReadonly && plugin.settings.offlineDeleteSyncEnabled ? noteData.delNotes : [];
+    const delFilesToSend = !isReadonly && plugin.settings.offlineDeleteSyncEnabled ? fileData.delFiles : [];
     jobs.push(sendSyncInBatches(
       plugin,
       "NoteSync",
       "NoteSyncBatchAck",
       noteData.context,
       noteData.notes,
-      plugin.settings.offlineDeleteSyncEnabled ? noteData.delNotes : [],
+      delNotesToSend,
       noteData.missingNotes,
       (mainChunk, delChunk, missingChunk, batchIndex, totalBatches) => ({
         vault: plugin.settings.vault,
@@ -1942,10 +2148,18 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
         context: noteData.context,
         batchIndex,
         totalBatches,
-        ...(plugin.settings.offlineDeleteSyncEnabled ? { delNotes: delChunk } : {}),
+        ...(!isReadonly && plugin.settings.offlineDeleteSyncEnabled ? { delNotes: delChunk } : {}),
         ...(missingChunk.length > 0 ? { missingNotes: missingChunk } : {}),
       }),
       () => {
+        // 只读模式下仍要发元数据清单（服务端据此比对并回 NeedPush），但本地改动的清单不是上传：
+        // 若记进 pendingNoteModifies，SyncEnd 会把从未上传的内容写成已同步基线，关闭只读后
+        // 这条本地修改就再也检测不出来。
+        // Read-only still sends the metadata list (the server diffs it and answers NeedPush), but
+        // that list is not an upload: recording it in pendingNoteModifies would let SyncEnd mark
+        // never-uploaded local content as synced, so the edit could never be detected after
+        // read-only is turned off.
+        if (isReadonly) return;
         for (const note of noteData.notes) {
           plugin.pendingNoteModifies.set(note.path, note.contentHash);
         }
@@ -1962,7 +2176,7 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
         "FileSyncBatchAck",
         fileData.context,
         fileData.files,
-        plugin.settings.offlineDeleteSyncEnabled ? fileData.delFiles : [],
+        delFilesToSend,
         fileData.missingFiles,
         (mainChunk, delChunk, missingChunk, batchIndex, totalBatches) => ({
           vault: plugin.settings.vault,
@@ -1971,7 +2185,7 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
           context: fileData.context,
           batchIndex,
           totalBatches,
-          ...(plugin.settings.offlineDeleteSyncEnabled ? { delFiles: delChunk } : {}),
+          ...(!isReadonly && plugin.settings.offlineDeleteSyncEnabled ? { delFiles: delChunk } : {}),
           ...(missingChunk.length > 0 ? { missingFiles: missingChunk } : {}),
         })
       ));
@@ -1984,13 +2198,14 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
     // 注意：客户端发送字段名为 settings / delSettings / missingSettings（非 configs）
     // Note: client sends field names 'settings' / 'delSettings' / 'missingSettings' (not 'configs')
     const isCover = Number(plugin.localStorageManager.getMetadata("lastConfigSyncTime")) === 0;
+    const delConfigsToSend = !isReadonly && plugin.settings.offlineDeleteSyncEnabled ? configData.delConfigs : [];
     jobs.push(sendSyncInBatches(
       plugin,
       "SettingSync",
       "SettingSyncBatchAck",
       configData.context,
       configData.configs,
-      plugin.settings.offlineDeleteSyncEnabled ? configData.delConfigs : [],
+      delConfigsToSend,
       configData.missingConfigs,
       (mainChunk, delChunk, missingChunk, batchIndex, totalBatches) => ({
         vault: plugin.settings.vault,
@@ -2000,10 +2215,14 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
         context: configData.context,
         batchIndex,
         totalBatches,
-        ...(plugin.settings.offlineDeleteSyncEnabled ? { delSettings: delChunk } : {}),
+        ...(!isReadonly && plugin.settings.offlineDeleteSyncEnabled ? { delSettings: delChunk } : {}),
         ...(missingChunk.length > 0 ? { missingSettings: missingChunk } : {}),
       }),
       () => {
+        // 只读模式同样只发元数据清单，不把本地改动记为基线（理由见 NoteSync 回调）
+        // Read-only likewise only sends the metadata list and never records local edits as a
+        // baseline (see the NoteSync callback for the reasoning)
+        if (isReadonly) return;
         for (const config of configData.configs) {
           plugin.pendingConfigModifies.set(config.path, config.contentHash);
         }
@@ -2018,19 +2237,20 @@ export const handleRequestSend = async function (plugin: FastSync, syncMode: Syn
   if (plugin.settings.syncEnabled && shouldSyncNotes) {
     // 将已删除路径加入 pending set，等待 SyncEnd 确认服务端已处理后再从 hashManager 移除
     // Populate pending delete sets; remove from hashManager only after SyncEnd confirms server processed
-    if (plugin.settings.offlineDeleteSyncEnabled) {
+    // 只读模式不发送删除，因此也不写 pending 删除集合（哈希表继续跟踪这些路径）
+    // Read-only sends no deletes, so it records no pending delete paths either (the hash table
+    // keeps tracking them)
+    if (plugin.settings.offlineDeleteSyncEnabled && !isReadonly) {
       plugin.pendingDeleteNotePaths = new Set(noteData.delNotes.map(i => i.path));
       plugin.pendingDeleteFilePaths = new Set(fileData.delFiles.map(i => i.path));
-      if (!plugin.settings.readonlySyncEnabled) {
-        plugin.pendingDeleteFolderPaths = new Set(folderData.delFolders.map(i => i.path));
-      }
+      plugin.pendingDeleteFolderPaths = new Set(folderData.delFolders.map(i => i.path));
     }
   }
 
   if (plugin.settings.configSyncEnabled && shouldSyncConfigs) {
     // 将已删除配置路径加入 pending set，等待 SettingSyncEnd 确认服务端已处理后再移除
     // Populate pending config delete set; remove from hashManager only after SettingSyncEnd
-    if (plugin.settings.offlineDeleteSyncEnabled && plugin.configHashManager && plugin.configHashManager.isReady()) {
+    if (plugin.settings.offlineDeleteSyncEnabled && !isReadonly && plugin.configHashManager && plugin.configHashManager.isReady()) {
       plugin.pendingDeleteConfigPaths = new Set(configData.delConfigs.map(i => i.path));
     }
   }

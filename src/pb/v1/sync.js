@@ -16964,6 +16964,7 @@ export const proto = $root.proto = (() => {
              * @property {number|Long|null} [chunkSize] FileSyncDownloadMessage chunkSize
              * @property {number|Long|null} [totalChunks] FileSyncDownloadMessage totalChunks
              * @property {number|Long|null} [size] FileSyncDownloadMessage size
+             * @property {string|null} [revision] FileSyncDownloadMessage revision
              * @property {Array.<Uint8Array>} [$unknowns] Unknown fields preserved while decoding when enabled
              */
 
@@ -17060,6 +17061,14 @@ export const proto = $root.proto = (() => {
             FileSyncDownloadMessage.prototype.size = $util.Long ? $util.Long.fromBits(0,0,false) : 0;
 
             /**
+             * FileSyncDownloadMessage revision.
+             * @member {string} revision
+             * @memberof proto.v1.FileSyncDownloadMessage
+             * @instance
+             */
+            FileSyncDownloadMessage.prototype.revision = "";
+
+            /**
              * Creates a new FileSyncDownloadMessage instance using the specified properties.
              * @function create
              * @memberof proto.v1.FileSyncDownloadMessage
@@ -17107,6 +17116,8 @@ export const proto = $root.proto = (() => {
                     writer.uint32(/* id 7, wireType 0 =*/56).int64(message.totalChunks);
                 if (message.size != null && $Object.hasOwnProperty.call(message, "size") && (typeof message.size === "object" ? message.size.low || message.size.high : message.size !== 0))
                     writer.uint32(/* id 8, wireType 0 =*/64).int64(message.size);
+                if (message.revision != null && $Object.hasOwnProperty.call(message, "revision") && message.revision !== "")
+                    writer.uint32(/* id 9, wireType 2 =*/74).string(message.revision);
                 if (message.$unknowns != null && $Object.hasOwnProperty.call(message, "$unknowns"))
                     for (let i = 0; i < message.$unknowns.length; ++i)
                         writer.raw(message.$unknowns[i]);
@@ -17226,6 +17237,15 @@ export const proto = $root.proto = (() => {
                                 delete message.size;
                             continue;
                         }
+                    case 9: {
+                            if (wireType !== 2)
+                                break;
+                            if ((value = reader.stringVerify()).length)
+                                message.revision = value;
+                            else
+                                delete message.revision;
+                            continue;
+                        }
                     }
                     reader.skipType(wireType, _depth, tag);
                     if (!reader.discardUnknown) {
@@ -17293,6 +17313,9 @@ export const proto = $root.proto = (() => {
                 if (message.size != null && $Object.hasOwnProperty.call(message, "size"))
                     if (!$util.isInteger(message.size) && !(message.size && $util.isInteger(message.size.low) && $util.isInteger(message.size.high)))
                         return "size: integer|Long expected";
+                if (message.revision != null && $Object.hasOwnProperty.call(message, "revision"))
+                    if (!$util.isString(message.revision))
+                        return "revision: string expected";
                 return null;
             };
 
@@ -17373,6 +17396,9 @@ export const proto = $root.proto = (() => {
                             message.size = object.size;
                         else if (typeof object.size === "object")
                             message.size = new $util.LongBits(object.size.low >>> 0, object.size.high >>> 0).toNumber();
+                if (object.revision != null)
+                    if (typeof object.revision !== "string" || object.revision.length)
+                        message.revision = $String(object.revision);
                 return message;
             };
 
@@ -17422,6 +17448,7 @@ export const proto = $root.proto = (() => {
                         object.size = options.longs === $String ? long.toString() : options.longs === $Number ? long.toNumber() : typeof $BigInt !== "undefined" && options.longs === $BigInt ? long.toBigInt() : long;
                     } else
                         object.size = options.longs === $String ? "0" : typeof $BigInt !== "undefined" && options.longs === $BigInt ? $BigInt("0") : 0;
+                    object.revision = "";
                 }
                 if (message.path != null && $Object.hasOwnProperty.call(message, "path"))
                     object.path = message.path;
@@ -17464,6 +17491,8 @@ export const proto = $root.proto = (() => {
                         object.size = options.longs === $String ? $String(message.size) : message.size;
                     else
                         object.size = options.longs === $String ? $util.Long.prototype.toString.call(message.size) : options.longs === $Number ? new $util.LongBits(message.size.low >>> 0, message.size.high >>> 0).toNumber() : message.size;
+                if (message.revision != null && $Object.hasOwnProperty.call(message, "revision"))
+                    object.revision = message.revision;
                 return object;
             };
 

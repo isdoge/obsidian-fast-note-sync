@@ -59,6 +59,9 @@ export class FileHashManager {
   private revisions: Map<string, string> = new Map();
   private pendingDeleteBaselines: Map<string, BaselineDeleteRecord> = new Map();
   private baselineScope: string = "";
+  // 诊断用：本次启动加载基线状态时是否发现远端目标变化（旧令牌已被丢弃）
+  // Diagnostics: whether startup found a changed remote target (old tokens discarded)
+  private baselineScopeChangedAtLoad: boolean = false;
   private baselineMirror: LocalStateFileMirror;
   private isInitialized: boolean = false;
   // 脏标记 + 防抖落盘：高频单条写入（下载/Ack 路径）不再逐条同步整表 JSON.stringify，
@@ -413,6 +416,7 @@ export class FileHashManager {
       if (raw) this.plugin.app.saveLocalStorage(this.baselineStorageKey, raw);
     }
     const { state, scopeChanged } = parseScopedState(raw, scope);
+    this.baselineScopeChangedAtLoad = scopeChanged;
     this.revisions = new Map(Object.entries(state.revisions));
     this.pendingDeleteBaselines = new Map(Object.entries(state.pendingDeletes));
     if (scopeChanged) {
@@ -822,6 +826,20 @@ export class FileHashManager {
     return {
       totalFiles: this.hashMap.size,
       storageKey: this.storageKey,
+    };
+  }
+
+  /**
+   * 诊断用计数：本地哈希缓存、基线条目、服务端确认基线，以及启动时是否发现远端目标变化
+   * Diagnostic counters: local hash cache, baseline entries, server-confirmed baselines, and
+   * whether startup detected a changed remote target
+   */
+  getDiagnosticCounts(): { hashEntries: number; baselineEntries: number; confirmedBaselines: number; baselineScopeChanged: boolean } {
+    return {
+      hashEntries: this.hashMap.size,
+      baselineEntries: this.syncHashMap.size,
+      confirmedBaselines: this.confirmedPaths.size,
+      baselineScopeChanged: this.baselineScopeChangedAtLoad,
     };
   }
 }

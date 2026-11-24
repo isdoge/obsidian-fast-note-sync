@@ -331,7 +331,13 @@ function deReceiveProtobufToDTO(action: WSAction.WSReceiveAction, data: Uint8Arr
                     sessionId: pbObj.sessionId,
                     chunkSize: pbObj.chunkSize,
                     totalChunks: pbObj.totalChunks,
-                    size: pbObj.size
+                    size: pbObj.size,
+                    // 就绪消息的版本令牌：与服务端 sync.proto 的 string revision = 9 对应。
+                    // 字段缺省时 toObject 给的是空串，归一成 undefined，避免下游把它当成有效令牌。
+                    // Revision token of the ready message, matching the server's sync.proto field 9.
+                    // toObject yields "" for a missing field; normalize it to undefined so downstream
+                    // code cannot mistake it for a real token.
+                    revision: pbObj.revision || undefined
                 };
             } catch {
                 return tryJsonDecode();

@@ -446,7 +446,7 @@ const managerModule = (() => {
         case "../utils/types": return { CLIENT_TYPE: "ObsidianPlugin" };
         case "../../i18n/lang": return { $: (key) => key };
         case "./operator_file": return new Proxy({ BINARY_PREFIX_FILE_SYNC: "fs" }, { get: (t, n) => t[n] ?? noop });
-        case "./operator_note": return { clearEmptyNoteProbes: noop };
+        case "./operator_note": return { clearEmptyNoteProbes: noop, releaseEmptyNoteProbe: noop };
         case "./operator": return {
           receiveOperators: new Map(),
           startupSync: () => { startupRuns++; },
@@ -459,6 +459,7 @@ const managerModule = (() => {
         default:
           if (id.includes("baseline_scope")) return { buildBaselineFields: (plugin, kind, path) => { if (kind === "folder" || !plugin) return {}; const m = kind === "setting" ? plugin.configHashManager : plugin.fileHashManager; const b = m && typeof m.getPathHash === "function" ? m.getPathHash(path) : null; return b !== null && b !== undefined ? { baseHash: b } : { baseHashMissing: true }; }, buildDeleteBaselineFields: () => ({}), baselineFieldsFromDeleteRecord: () => ({}), computeRemoteScope: () => "scope", parseScopedState: () => ({ state: { scope: "scope", revisions: {}, pendingDeletes: {} }, scopeChanged: false }), serializeScopedState: (state) => JSON.stringify(state) };
     if (id.includes("conflict_store")) return { storeSyncConflict: async () => false, normalizeConflict: () => null, conflictKindToSyncType: () => "note", conflictReasonLabel: () => "", conflictKindLabel: () => "" };
+    if (id === "../utils/sync_diagnostics") return {};
     throw new Error(`Unexpected manager import: ${id}`);
       }
     },

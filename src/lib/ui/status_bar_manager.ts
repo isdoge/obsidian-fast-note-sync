@@ -3,6 +3,8 @@
 import { setIcon } from 'obsidian';
 import type FastSync from '../../main';
 import { $ } from '../../i18n/lang';
+import { readSyncModes } from '../sync/sync_mode_control';
+import { describeTokenWriteLimits, isVaultAllowedByToken } from '../api/token_capabilities';
 
 /**
  * Manages the status bar progress indicator.
@@ -20,6 +22,10 @@ export class StatusBarManager {
   private statusBarCheck: HTMLElement | null = null;
   // 失败项红点 / Failed-item red dot badge (现在改用只显示未解决的冲突笔记数量)
   private statusBarFailedBadge: HTMLElement | null = null;
+  // 只读 / 手动同步模式与令牌权限指示 / Mode and token-capability indicator
+  private statusBarModeItem: HTMLElement | null = null;
+  private statusBarModeIcon: HTMLElement | null = null;
+  private statusBarModeText: HTMLElement | null = null;
 
   // Progress protection / 进度值保护，确保不回退
   private lastPct = 0;
@@ -69,8 +75,85 @@ export class StatusBarManager {
       }
     });
 
+    // 只读 / 手动同步模式指示（无模式开启且令牌正常时隐藏）
+    // Read-only / manual sync mode indicator (hidden when no mode is on and the token is fine)
+    this.statusBarModeItem = this.plugin.addStatusBarItem();
+    this.statusBarModeItem.addClass("fns-hidden");
+    this.statusBarModeItem.addClass("mod-clickable");
+    this.statusBarModeItem.addClass("fns-status-bar-mode-item");
+    this.statusBarModeIcon = this.statusBarModeItem.createSpan("fns-status-bar-mode-icon");
+    this.statusBarModeText = this.statusBarModeItem.createSpan("fns-status-bar-mode-text");
+    // 点击弹出同步菜单，可原地切换模式 / Click opens the sync menu to toggle in place
+    this.statusBarModeItem.addEventListener("click", (evt: MouseEvent) => {
+      this.plugin.menuManager?.showRibbonMenu(evt);
+    });
+
     // Render badge count on init // 初始化时进行一次红点计数更新
     this.updateConflictBadge();
+    this.renderModeIndicators();
+  }
+
+  /**
+   * 渲染状态栏上的模式与令牌权限提示：只读同步 / 手动同步 / 令牌只读 / 库不在允许列表。
+   * 无任何提示时隐藏该状态栏项。
+   *
+   * Render the mode and token-capability hints in the status bar. The item hides itself when
+   * there is nothing to report.
+   */
+  renderModeIndicators(): void {
+    if (!this.statusBarModeItem || !this.statusBarModeIcon || !this.statusBarModeText) return;
+
+    const modes = readSyncModes(this.plugin.settings);
+    const caps = this.plugin.tokenCapabilities?.get() ?? null;
+    const limits = describeTokenWriteLimits(caps);
+    const vaultBlocked = !isVaultAllowedByToken(caps, this.plugin.settings.vault || "");
+
+    const labels: string[] = [];
+    const tooltips: string[] = [];
+    let icon = "sync";
+
+    if (limits.readOnly) {
+      // 只缺部分写权限时不能说成「令牌只读」；与菜单顶部的权限提示保持同一口径
+      // A token missing only some write bits is not read-only; mirror the menu banner's wording
+      if (limits.missingWrite.length > 0 && !caps?.readOnly) {
+        labels.push($("ui.mode.token_missing_write", { perms: limits.missingWrite.join(", ") }));
+      } else {
+        labels.push($("ui.mode.status_token_readonly"));
+      }
+      tooltips.push($("ui.mode.token_readonly_desc"));
+      icon = "lock";
+    }
+    if (vaultBlocked) {
+      labels.push($("ui.mode.status_vault_blocked"));
+      tooltips.push($("ui.mode.token_vault_blocked_desc"));
+      if (icon === "sync") icon = "alert-triangle";
+    }
+    if (modes.readonly) {
+      labels.push($("ui.mode.status_readonly"));
+      tooltips.push($("ui.mode.readonly_menu_desc"));
+      if (icon === "sync") icon = "book-open";
+    }
+    if (modes.manual) {
+      labels.push($("ui.mode.status_manual"));
+      tooltips.push($("ui.mode.manual_menu_desc"));
+      if (icon === "sync") icon = "hand";
+    }
+
+    if (labels.length === 0) {
+      this.statusBarModeItem.addClass("fns-hidden");
+      this.statusBarModeItem.removeAttribute("aria-label");
+      this.statusBarModeItem.removeAttribute("title");
+      this.statusBarModeText.setText("");
+      return;
+    }
+
+    this.statusBarModeItem.removeClass("fns-hidden");
+    this.statusBarModeText.setText(labels.join(" · "));
+    this.statusBarModeItem.setAttribute("aria-label", tooltips.join("\n"));
+    // 用原生 title 提供轻量提示，避免 Obsidian 大黑气泡遮挡邻近图标
+    // Native title gives a lightweight tooltip without Obsidian's large bubble
+    this.statusBarModeItem.setAttribute("title", tooltips.join("\n"));
+    setIcon(this.statusBarModeIcon, icon);
   }
 
   /**
@@ -81,6 +164,12 @@ export class StatusBarManager {
     if (this.statusBarItem) {
       this.statusBarItem.remove();
       this.statusBarItem = null;
+    }
+    if (this.statusBarModeItem) {
+      this.statusBarModeItem.remove();
+      this.statusBarModeItem = null;
+      this.statusBarModeIcon = null;
+      this.statusBarModeText = null;
     }
   }
 

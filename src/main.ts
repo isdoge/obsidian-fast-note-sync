@@ -13,7 +13,10 @@ import { ConfigHashManager } from "./lib/storage/config_hash_manager";
 import { RecycleBinModal } from "./views/recycle-bin-modal";
 import { FileCloudPreview } from "./lib/storage/file_cloud_preview";
 import { FileHashManager } from "./lib/storage/file_hash_manager";
+import { CloudAttachmentEviction } from "./lib/storage/cloud_attachment_eviction";
 import { DebugLogManager } from "./lib/utils/debug_log_manager";
+import { setDiagnosticRedactionContext } from "./lib/utils/redact_log";
+import { initSyncDiagnostics, recordStartupState, flushSyncDiagnostics, copySyncDiagnostics } from "./lib/utils/sync_diagnostics";
 import { SyncLogManager } from "./lib/sync/sync_log_manager";
 import { DebugLogModal } from "./views/debug-log-modal";
 import { VersionManager } from "./lib/utils/version_manager";
@@ -33,6 +36,8 @@ import { $ } from "./i18n/lang";
 import { SsoImportModal } from "./views/sso-import-modal";
 import { StatusBarManager } from "./lib/ui/status_bar_manager";
 import { SyncProgressTracker } from "./lib/sync/sync_progress_tracker";
+import { TokenCapabilitiesManager } from "./lib/api/token_capabilities_manager";
+import { toggleSyncMode, syncModeNoticeKey, effectiveIdleSyncMinutes, type SyncModeKind } from "./lib/sync/sync_mode_control";
 
 
 
@@ -68,14 +73,25 @@ export default class FastSync extends Plugin {
   localStorageManager: LocalStorageManager        // 本地存储管理器
   fileCloudPreview: FileCloudPreview              // 云端文件预览管理器
   folderSnapshotManager: FolderSnapshotManager    // 文件夹快照管理器
+  cloudAttachmentEviction: CloudAttachmentEviction // 设备本地云附件驱逐日志 / Device-local eviction journal
   statusBarManager: StatusBarManager              // 状态栏管理器
   idleSyncScheduler: IdleAutoSyncScheduler        // 空闲连接定时兜底同步 / Idle-connection fallback sync
+  tokenCapabilities: TokenCapabilitiesManager     // 当前令牌实际权限缓存 / Current token capabilities cache
   readonly progressTracker = new SyncProgressTracker() // 进度追踪器
   private menuManagerInitialized = false          // 防止 onLayoutReady 重复初始化 / Guard against duplicate onLayoutReady init
 
   // ─── Aggregated state objects (replaces 30+ scattered fields) ────────────────
   /** 同步会话运行时状态 / Sync-session runtime state */
   readonly syncState = new SyncState()
+
+  /**
+   * 本轮同步入口时的只读快照，供轮次内的接收端门禁与实时设置做 fail-closed 取或。
+   * 每轮开始时覆盖，轮次结束（SyncEnd/完成判定）、中止、出错时清除。
+   * Read-only snapshot captured at this round's entry, OR-ed fail-closed with the live
+   * setting by receive-side gates. Overwritten at each round start; cleared when the round
+   * ends (SyncEnd/completion), is cancelled, or fails.
+   */
+  syncRoundReadonly = false
 
   // ─── Sync page state tracking ───────────────────────────────────────────────
   /**
@@ -323,6 +339,23 @@ export default class FastSync extends Plugin {
 
   // ─── Delegated helpers (keep API surface unchanged) ──────────────────────────
 
+  /**
+   * 切换只读 / 手动同步模式并即时生效：改设置、落盘、刷新菜单与状态栏，弹出说明当前模式的提示。
+   * 不需要重连，也不触碰服务端令牌权限。
+   * Toggle the read-only / manual sync mode with immediate effect: update settings, persist,
+   * refresh the menu and status bar, and show a notice explaining the current mode. No
+   * reconnect is needed and server-side token permissions are untouched.
+   */
+  async toggleSyncMode(kind: SyncModeKind): Promise<boolean> {
+    const enabled = toggleSyncMode(this.settings, kind)
+    await this.saveSettings()
+    this.menuManager?.refreshModeIndicators()
+    // 手动同步模式会关闭空闲兜底定时触发 / Manual mode disables the idle fallback timer
+    this.idleSyncScheduler?.applySettings()
+    showSyncNotice($(syncModeNoticeKey(kind, enabled)), 6000)
+    return enabled
+  }
+
   /** 重置所有任务统计 / Reset all per-session task statistics */
   resetSyncTasks() {
     this.syncState.resetSession()
@@ -378,6 +411,15 @@ export default class FastSync extends Plugin {
       if (isPathMatch(path, ignoredPath)) return true
     }
     return false
+  }
+
+  /**
+   * 是否被祖先目录的屏蔽项命中，而非该路径自身
+   * True when the path is ignored through an ancestor entry, not by the path itself
+   */
+  isIgnoredByAncestor(path: string): boolean {
+    if (this.ignoredFiles.has(path)) return false
+    return this.isIgnoredFile(path)
   }
 
   addIgnoredConfigFile(path: string) {
@@ -441,15 +483,39 @@ export default class FastSync extends Plugin {
     this.setupProgressTracker();
     this.localStorageManager = new LocalStorageManager(this)
     this.api = new HttpApiService(this)
+    this.tokenCapabilities = new TokenCapabilitiesManager(this)
     this.websocket = new WebSocketManager(this)
 
     await this.loadSettings()
+
+    // 诊断日志脱敏上下文：每次脱敏时现取，用户中途改设置也能按新值遮住。
+    // 库路径桌面端从 adapter 取；移动端没有 getBasePath，留空跳过。
+    // Diagnostic-log redaction context, read on every redaction so mid-session setting
+    // changes are honoured. The vault base path is unavailable on mobile and stays empty.
+    setDiagnosticRedactionContext(() => {
+      let vaultPath = "";
+      try {
+        const adapter = this.app.vault.adapter as unknown as { getBasePath?: () => string };
+        vaultPath = typeof adapter.getBasePath === "function" ? adapter.getBasePath() : "";
+      } catch {
+        vaultPath = "";
+      }
+      const debugRemoteUrls = typeof this.settings?.debugRemoteUrls === "string"
+        ? this.settings.debugRemoteUrls.split(/\r?\n/)
+        : [];
+      return {
+        vaultPath,
+        vaultName: this.settings?.vault || this.app.vault.getName(),
+        serverHosts: [this.settings?.api || "", this.runApi || "", this.runWsApi || "", ...debugRemoteUrls],
+      };
+    });
 
     // 空闲连接定时兜底同步（服务端 #503）：只负责调度，能否触发由连接/队列/可见性共同决定
     // Idle-connection periodic fallback sync (server #503): scheduling only; the host predicates
     // decide whether a tick may actually fire
     this.idleSyncScheduler = new IdleAutoSyncScheduler({
-      getIntervalMinutes: () => this.settings.autoIdleSyncIntervalMinutes ?? DEFAULT_IDLE_SYNC_INTERVAL_MINUTES,
+      // 手动同步模式下返回 0，等于关闭定时兜底触发 / Manual mode yields 0, disabling the timer
+      getIntervalMinutes: () => effectiveIdleSyncMinutes(this.settings, this.settings.autoIdleSyncIntervalMinutes ?? DEFAULT_IDLE_SYNC_INTERVAL_MINUTES),
       isConnected: () => !!this.websocket?.isConnected?.() && !!this.websocket?.isAuth,
       isBusy: () => this.hasPendingSyncWork(),
       isVisible: () => typeof activeDocument === "undefined" || activeDocument.visibilityState === "visible",
@@ -580,6 +646,18 @@ export default class FastSync extends Plugin {
         },
       });
 
+      // 复制同步诊断（启动状态 / 协商 / 最近 5 轮摘要 / 失败记录）
+      // Copy sync diagnostics (startup state / negotiation / last 5 rounds / failures)
+      this.addCommand({
+        id: "copy-sync-diagnostics",
+        name: $("setting.support.copy_diagnostics"),
+        callback: () => {
+          void copySyncDiagnostics(this).then(ok => {
+            showSyncNotice(ok ? $("ui.history.copied") : $("setting.support.copy_diagnostics_failed"))
+          })
+        },
+      });
+
       // 3. 初始化 UI 管理器（ribbon 已在 onLayoutReady 之前创建，这里只完成其余初始化）
       // UI manager: ribbon was already created before onLayoutReady; finish the rest here
       this.menuManager.init()
@@ -590,6 +668,15 @@ export default class FastSync extends Plugin {
       this.websocket.addStatusListener((status: boolean) => {
         this.updateRibbonIcon(status)
         this.idleSyncScheduler?.setConnected(status)
+        // 鉴权成功时顺手拉取一次令牌能力（旧服务端会静默降级为 null）；断开时清缓存
+        // On auth success fetch token capabilities once (old servers degrade to null);
+        // clear the cache on disconnect
+        if (status) {
+          void this.tokenCapabilities?.refresh().then(() => this.menuManager?.refreshModeIndicators())
+        } else {
+          this.tokenCapabilities?.clear()
+          this.menuManager?.refreshModeIndicators()
+        }
       })
 
       // 注册 WebSocket 数据传输活动监听 — 任何数据收发时显示同步指示器 / Register data transfer activity listener
@@ -611,12 +698,14 @@ export default class FastSync extends Plugin {
       this.fileHashManager = new FileHashManager(this)
       this.configHashManager = new ConfigHashManager(this)
       this.folderSnapshotManager = new FolderSnapshotManager(this)
+      this.cloudAttachmentEviction = new CloudAttachmentEviction(this)
       this.configManager = new ConfigManager(this)
 
       // 5. 并行初始化哈希和快照 (耗时任务)
       const initPromises: Promise<void>[] = [
         this.fileHashManager.initialize(),
-        this.folderSnapshotManager.initialize()
+        this.folderSnapshotManager.initialize(),
+        this.cloudAttachmentEviction.initialize()
       ]
       if (this.settings.configSyncEnabled) {
         initPromises.push(this.configHashManager.initialize())
@@ -692,6 +781,12 @@ export default class FastSync extends Plugin {
         void this.eventManager.registerEvents()
       }
 
+      // 6.1 诊断缓冲：读回上次落盘内容并记录本次启动状态（不依赖调试日志开关）
+      // Diagnostics: restore the previous file and record the startup state (independent of the
+      // debug log toggle)
+      await initSyncDiagnostics(this, `${getPluginDir(this)}/diagnostics.json`)
+      recordStartupState(this)
+
       // 7. 刷新运行时设置 (包含网络探测，不阻塞主流程)
       void this.reloadServices()
 
@@ -712,6 +807,8 @@ export default class FastSync extends Plugin {
   }
 
   onunload() {
+    // 清除脱敏上下文，避免卸载后继续持有插件引用
+    setDiagnosticRedactionContext(null)
     // 取消当前正在进行的同步，重置运行时状态
     this.retryQueue?.stop()
     cancelSync(this)
@@ -726,6 +823,8 @@ export default class FastSync extends Plugin {
     this.configHashManager?.flush()
     this.folderSnapshotManager?.flush()
     this.localStorageManager?.flushSyncStateMirror()
+    // 卸载前落盘诊断缓冲（2 秒节流里的尾部记录不丢）/ Flush the throttled diagnostics tail
+    void flushSyncDiagnostics()
     // 取消注册文件事件
     void this.reloadServices(false)
     // reloadServices 末尾会重新评估空闲定时器，卸载时必须最后再清一次，避免留下定时器
@@ -994,6 +1093,9 @@ export default class FastSync extends Plugin {
       this.runApi = this.settings.api;
       this.runWsApi = this.settings.api ? this.settings.api.replace(/^http/, "ws") : "";
     }
+    // 地址或令牌变化后令牌能力缓存必须失效（切令牌/换服务器）
+    // Invalidate the capabilities cache when the address or token changed
+    this.tokenCapabilities?.invalidateIfConnectionChanged()
 
     if (forceRegister && (setItem === "configSyncOtherDirs" || setItem === "configSyncEnabled")) {
       void this.configManager?.reloadCustomDirs()

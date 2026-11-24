@@ -122,10 +122,20 @@ const ConflictListView = ({ plugin, modal }: { plugin: FastSync, modal: Conflict
             setConflicts(Array.from(plugin.syncState.conflictedPaths));
             void listUnalignedPaths(plugin).then(setUnaligned);
         }
-        const succeeded = results.filter(r => r.ok).length;
-        const skippedNewEdit = results.filter(r => r.reason === "new_edit").map(r => r.path);
-        const failed = results.filter(r => !r.ok && r.reason !== "new_edit").length;
-        new Notice($("ui.conflict.batch_result", { ok: String(succeeded), failed: String(failed) }), 8000);
+        const readonlyBlocked = results.filter(r => r.reason === "readonly").length;
+        if (readonlyBlocked > 0) {
+            // 只读模式下需要上行的处置被整体拒绝：提示先关闭只读，不并入普通失败计数
+            // Uplink resolutions were rejected in read-only mode: ask to turn it off first and
+            // keep them out of the generic failure count
+            new Notice($("ui.conflict.readonly_blocked") || "只读同步模式已开启，请先关闭后再处理冲突", 10000);
+        }
+        const actionable = results.filter(r => r.reason !== "readonly");
+        const succeeded = actionable.filter(r => r.ok).length;
+        const skippedNewEdit = actionable.filter(r => r.reason === "new_edit").map(r => r.path);
+        const failed = actionable.filter(r => !r.ok && r.reason !== "new_edit").length;
+        if (actionable.length > 0) {
+            new Notice($("ui.conflict.batch_result", { ok: String(succeeded), failed: String(failed) }), 8000);
+        }
         const missingRemote = results.filter(r => r.reason === "missing_remote").length;
         if (missingRemote > 0) {
             // 远端正文未取得：拒绝清空本地，提示先同步刷新

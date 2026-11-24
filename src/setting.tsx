@@ -3,6 +3,7 @@ import { createRoot, Root } from "react-dom/client";
 import { unzipSync } from "fflate";
 
 import { parseRules, SyncRule, getPluginDir, debounce, showSyncNotice, dump, dumpError } from "./lib/utils/helpers";
+import { copySyncDiagnostics } from "./lib/utils/sync_diagnostics";
 import { resetSettingSyncTime, rebuildAllHashes, clearAllHashes } from "./lib/sync/operator";
 import { SettingsView, SupportView } from "./views/settings-view";
 import { RuleEditorModal } from "./views/rule-editor-modal";
@@ -709,6 +710,8 @@ export class SettingTab extends PluginSettingTab {
         ...this.plugin.settings,
         api: maskValue(this.plugin.settings.api),
         apiToken: this.plugin.settings.apiToken ? "***HIDDEN***" : "",
+        // 库名与诊断日志口径一致，不随 Debug 信息带出 / Vault name is hidden, same as the diagnostic log
+        vault: this.plugin.settings.vault ? "[vault]" : "",
       },
       runtimeInfo: {
         runApi: maskValue(this.plugin.runApi),
@@ -779,6 +782,14 @@ export class SettingTab extends PluginSettingTab {
         // TODO(i18n): replace with localized key, e.g. $("setting.support.debug_copy_failed")
         showSyncNotice("Failed to copy debug info.")
       }
+    }
+
+    const diagButton = debugDiv.createEl("button")
+    diagButton.setText($("setting.support.copy_diagnostics"))
+    diagButton.setAttribute("title", $("setting.support.copy_diagnostics_desc"))
+    diagButton.onclick = async () => {
+      const ok = await copySyncDiagnostics(this.plugin)
+      showSyncNotice(ok ? $("ui.history.copied") : $("setting.support.copy_diagnostics_failed"))
     }
 
     if (isHomePage) {
@@ -1804,6 +1815,9 @@ export class SettingTab extends PluginSettingTab {
       toggle.setValue(this.plugin.settings.manualSyncEnabled).onChange(async (value) => {
         if (value != this.plugin.settings.manualSyncEnabled) {
           this.plugin.settings.manualSyncEnabled = value
+          // 与菜单/命令共用同一设置字段，切完立即刷新状态栏与菜单指示
+          // Shares the same settings field as the menu/commands; refresh indicators right away
+          this.plugin.menuManager?.refreshModeIndicators()
           await this.plugin.saveAndReloadServices()
         }
       }),
@@ -1814,6 +1828,7 @@ export class SettingTab extends PluginSettingTab {
       toggle.setValue(this.plugin.settings.readonlySyncEnabled).onChange(async (value) => {
         if (value != this.plugin.settings.readonlySyncEnabled) {
           this.plugin.settings.readonlySyncEnabled = value
+          this.plugin.menuManager?.refreshModeIndicators()
           await this.plugin.saveAndReloadServices()
         }
       }),

@@ -158,6 +158,7 @@ const configOps = loadModule("src/lib/sync/operator_config.ts", (id) => {
   if (id === "../utils/types") return {};
   if (id === "../../i18n/lang") return { $: (k) => k };
   if (id === "../../main") return {};
+  if (id === "../utils/sync_diagnostics") return {};
   throw new Error(`Unexpected require in operator_config: ${id}`);
 });
 

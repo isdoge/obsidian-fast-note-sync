@@ -1,4 +1,4 @@
-[简体中文](https://github.com/isdoge/obsidian-fast-note-sync/blob/master/docs/README.zh-CN.md) / [English](https://github.com/isdoge/obsidian-fast-note-sync/blob/master/README.md) / [日本語](https://github.com/isdoge/obsidian-fast-note-sync/blob/master/docs/README.ja.md) / [한국어](https://github.com/isdoge/obsidian-fast-note-sync/blob/master/docs/README.ko.md) / [繁體中文](https://github.com/isdoge/obsidian-fast-note-sync/blob/master/docs/README.zh-TW.md)
+[简体中文](https://github.com/isdoge/obsidian-fast-note-sync/blob/master/README.md) / [English](https://github.com/isdoge/obsidian-fast-note-sync/blob/master/docs/README.en.md) / [日本語](https://github.com/isdoge/obsidian-fast-note-sync/blob/master/docs/README.ja.md) / [한국어](https://github.com/isdoge/obsidian-fast-note-sync/blob/master/docs/README.ko.md) / [繁體中文](https://github.com/isdoge/obsidian-fast-note-sync/blob/master/docs/README.zh-TW.md)
 
 > [!IMPORTANT]
 > **이 저장소는 독립적으로 유지보수되는 수정판입니다.** 업스트림 [haierkeys/obsidian-fast-note-sync](https://github.com/haierkeys/obsidian-fast-note-sync)는 2026년 8월 이후 업데이트가 중단되었습니다. 이 저장소는 [isdoge](https://github.com/isdoge)가 업스트림 v2.4.0에서 포크하여 밀려 있던 PR을 병합하고 알려진 문제를 수정한 뒤 독립적으로 발전시켜 나가고 있으며, 버전 번호도 더 이상 업스트림을 따르지 않습니다. **Obsidian 커뮤니티 플러그인 스토어를 통해 설치하거나 업데이트하지 마세요.** 스토어에 등록된 것은 업스트림 버전입니다. 자세한 내용은 아래 「이 저장소에 대하여」를 참고해 주세요.
@@ -42,7 +42,7 @@
 - **버전 번호**: v2.5.0부터 독립적으로 증가하며 더 이상 업스트림을 따르지 않습니다.
 - **플러그인 ID 유지**: 계속 `fast-note-sync`를 사용합니다. 이 저장소에서 배포하는 파일을 `.obsidian/plugins/fast-note-sync` 폴더에 덮어쓰기만 하면 기존 설정과 동기화 기록이 그대로 유지되므로 다시 설정할 필요가 없습니다.
 - **설치 및 업데이트**: 이 저장소의 [GitHub Releases](https://github.com/isdoge/obsidian-fast-note-sync/releases)를 통해서만 배포하며, Obsidian 커뮤니티 플러그인 스토어에는 등록하지 않습니다. 플러그인 내 원클릭 업그레이드는 이 저장소의 Releases에서 다운로드합니다. 새 버전 알림은 연결된 서버에서 전달되며, 이 저장소의 서버와 함께 사용할 때 이 저장소를 가리킵니다. Obsidian 자체의 「업데이트 확인」은 스토어의 업스트림 버전을 조회하므로 이 플러그인을 업데이트할 때는 사용하지 마세요.
-- **연동 서버**: 마찬가지로 독립 유지보수되는 [isdoge/fast-note-sync-service](https://github.com/isdoge/fast-note-sync-service)와 함께 사용해 주세요. 기본 동기화에는 서버 v3.7.0 이상, 전체 동기화 베이스라인 프로토콜에는 v3.8.4 이상, Firefly 블로그 자동 게시에는 v3.8.5 이상이 필요합니다. 일부 수정 사항은 플러그인과 서버를 모두 업그레이드해야 적용됩니다.
+- **연동 서버**: 마찬가지로 독립 유지보수되는 [isdoge/fast-note-sync-service](https://github.com/isdoge/fast-note-sync-service)와 함께 사용해 주세요. 기본 동기화에는 서버 v3.7.0 이상, 전체 동기화 베이스라인 프로토콜에는 v3.8.4 이상, Firefly 블로그 자동 게시에는 v3.8.5 이상, 토큰 권한 알림에는 v3.8.8 이상이 필요합니다. 일부 수정 사항은 플러그인과 서버를 모두 업그레이드해야 적용됩니다.
 - **유지되는 항목**: 원저작자의 저작권 표시 및 후원 정보.
 - **피드백**: 문제 제보나 기능 요청은 업스트림 저장소가 아닌 이 저장소의 [Issues](https://github.com/isdoge/obsidian-fast-note-sync/issues)에 등록해 주세요.
 
@@ -84,6 +84,7 @@
     > ⚠️ **주의**: v1.4 이상, 서버 v1.0 이상이 필요합니다. 현재 테스트 단계이므로 주의하여 사용하세요.
 - 🛂 **동기화 제외 및 화이트리스트**:
     - 동기화 제외 및 화이트리스트 기능을 제공하여 자신만의 동기화 전략을 지정할 수 있습니다.
+    - 시스템 불필요 파일(`.DS_Store`, `Thumbs.db`, `desktop.ini`, `._`로 시작하는 파일)은 기본적으로 건너뜁니다. 동기화가 필요하면 화이트리스트에 추가하여 허용할 수 있습니다.
 - 🔄 **멀티 플랫폼 동기화**:
     - Mac, Windows, Android, iOS 등의 플랫폼을 지원합니다.
     - 동기화 상태를 파일 미러로 저장하여 모바일 로컬 저장소가 시스템에 의해 정리된 후에도 미러에서 복원할 수 있으며, 전체 동기화로 되돌아가지 않습니다.
@@ -100,15 +101,24 @@
     - 원클릭 업그레이드는 이 저장소의 GitHub Releases에서 다운로드합니다.
 - ☁️ **첨부 파일 클라우드 미리보기**:
     - 첨부 파일 온라인 미리보기 기능을 제공합니다. 첨부 파일을 로컬 기기에 동기화할 필요가 없어 로컬 저장 공간을 절약할 수 있습니다.
+    - 「업로드 후 삭제」는 로컬 파일을 정리하기 전에 서버의 내용과 완전히 비교하며, 일치하지 않으면 로컬 파일을 보존합니다.
     > 플러그인의 제외 설정과 함께 사용하면, 특정 첨부 파일에 대해 서버를 거치지 않고 타사 저장소(예: WebDAV)를 직접 사용할 수 있습니다.
 - 🗒️ **동기화 로그**:
     - 동기화 로그 기능을 제공하여 각 동기화의 상세 정보를 확인할 수 있습니다.
+    - 「동기화 진단 복사」로 최근 동기화의 개요와 실패·충돌 기록을 한 번에 복사할 수 있습니다(파일 경로는 포함되며 서버 주소와 토큰은 포함되지 않습니다). 디버그 로그를 켜지 않아도 기록되므로 문제를 보고할 때 편리합니다.
 - 🌐 **Astro Firefly 블로그 작성 및 자동 게시 도우미**:
     - 글의 frontmatter를 검증하고, 이미지를 노트와 같은 폴더의 `./assets/`로 모아 규격화하며 참조를 다시 씁니다. 게시 전 검사를 수행하고, 서버의 Git/Firefly 빌드를 원클릭으로 실행해 빌드 결과를 실시간으로 보여 줍니다.
     > ⚠️ **참고**: 자동 게시에는 서버 v3.8.5 이상과 서버에 설정된 Firefly Git 동기화 대상이 필요합니다.
 - 🧬 **동기화 베이스라인 프로토콜, 충돌 정렬 및 일괄 처리**:
     - 모든 쓰기는 서버가 발급한 리비전 토큰으로 검증됩니다. 충돌에는 정확한 원격 버전이 함께 전달되어 통합 패널에 나열되며, 로컬 / 원격 / 양쪽 보관으로 일괄 해결할 수 있습니다. 바이너리 설정과 첨부 파일은 바이트 단위로 손실 없이 전송·복원됩니다.
     > ⚠️ **참고**: 전체 베이스라인 프로토콜에는 서버 v3.8.4 이상이 필요하며, 구버전 서버는 자동으로 호환 모드로 전환됩니다.
+- 🔒 **읽기 전용 / 수동 동기화 모드 및 동기화 보호**:
+    - 명령 팔레트와 상태 표시줄 메뉴에서 「읽기 전용 동기화 모드」와 「수동 동기화 모드」를 한 번에 전환하고 현재 모드를 표시합니다. 이 스위치는 현재 기기에만 적용되며 서버 토큰의 권한은 변경하지 않습니다.
+    - 토큰의 실제 권한을 자동으로 확인합니다. 토큰이 읽기 전용이거나 일부 쓰기 권한이 없거나 현재 Vault가 허용 범위에 없으면 그 이유를 바로 안내합니다.
+    - 「대량 파일 사라짐」 보호: 전체 검사에서 동기화된 파일 대부분이 로컬에서 발견되지 않으면(예: Vault 폴더 이동, 디스크 미마운트) 해당 동기화에서는 서버에 삭제를 보고하지 않고 알림을 표시합니다.
+    > ⚠️ **참고**: 토큰 권한 알림에는 서버 v3.8.8 이상이 필요합니다. 읽기 전용 기기는 서버를 기준으로 합니다. 다른 기기에서 파일을 삭제하면 이 기기의 같은 이름 파일도 삭제되며, 아직 업로드하지 않은 수정 사항이 있어도 마찬가지입니다.
+- 🧹 **디버그 로그 자동 마스킹**:
+    - 디버그 로그는 기록하고 복사할 때 토큰, 비밀번호, 노트 본문, 로컬 경로, 시스템 사용자 이름, 서버 주소 및 Vault 이름을 자동으로 숨기므로 문제를 보고할 때 바로 붙여넣을 수 있습니다.
 - **클라우드 스토리지 백업**: 클라우드 스토리지 백업 기능을 제공하여 노트 데이터가 유실되지 않도록 보호합니다.
 
 ## 🗺️ 로드맵 (Roadmap)

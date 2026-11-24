@@ -57,6 +57,7 @@ function loadOps() {
     if (id === "../../i18n/lang") return { $: (k) => k };
     if (id.includes("baseline_scope")) return { buildBaselineFields: (plugin, kind, path) => { if (kind === "folder" || !plugin) return {}; const m = kind === "setting" ? plugin.configHashManager : plugin.fileHashManager; const b = m && typeof m.getPathHash === "function" ? m.getPathHash(path) : null; return b !== null && b !== undefined ? { baseHash: b } : { baseHashMissing: true }; }, buildDeleteBaselineFields: () => ({}), baselineFieldsFromDeleteRecord: () => ({}), computeRemoteScope: () => "scope", parseScopedState: () => ({ state: { scope: "scope", revisions: {}, pendingDeletes: {} }, scopeChanged: false }), serializeScopedState: (state) => JSON.stringify(state) };
     if (id.includes("conflict_store")) return { storeSyncConflict: async () => false, normalizeConflict: () => null, conflictKindToSyncType: () => "note", conflictReasonLabel: () => "", conflictKindLabel: () => "" };
+    if (id === "../utils/sync_diagnostics") return {};
     throw new Error(`Unexpected require in operator_note: ${id}`);
   });
 }
@@ -67,6 +68,7 @@ const conflictAlign = loadModule("src/lib/sync/conflict_align.ts", (id) => {
   if (id === "obsidian") return { normalizePath: (p) => p, TFile };
   if (id === "../utils/helpers") return helpers;
   if (id === "./operator_note") return ops;
+  if (id === "./conflict_resolve") return { readonlyResolutionBlocked: () => false };
   if (id === "../../main") return {};
   throw new Error(`Unexpected require in conflict_align: ${id}`);
 });

@@ -4,6 +4,7 @@ import { requestUrl } from "obsidian";
 import { hashContent, addRandomParam, showSyncNotice, dump, dumpError, nativeFetch, isAllowedRedirect } from "../utils/helpers";
 import { CLIENT_TYPE } from "../utils/types";
 import { $, getLocale } from "../../i18n/lang";
+import { classifyWSClientsResponse, parseTokenCapabilities, type TokenCapabilities, type WSClientsResult } from "./token_capabilities";
 import type FastSync from "../../main";
 
 
@@ -169,6 +170,24 @@ export interface ApiResult<T = unknown> {
     status: number;
     message: string;
     data?: T;
+}
+
+/**
+ * 判断请求 URL 是否与配置的 API 地址同源（协议 + 主机 + 端口）。
+ * requestUrl 拿不到最终 URL，无法事后校验跳转，只能限定请求本身同源。
+ *
+ * Whether a request URL shares the origin (scheme + host + port) of the configured API base.
+ * requestUrl exposes no final URL, so redirects cannot be checked after the fact; only
+ * same-origin requests are allowed instead.
+ */
+export function isSameOriginRequestUrl(requestUrl: string, apiBase: string): boolean {
+    try {
+        const request = new URL(requestUrl);
+        const base = new URL(apiBase);
+        return request.protocol === base.protocol && request.host === base.host;
+    } catch {
+        return false;
+    }
 }
 
 /**
@@ -520,6 +539,80 @@ export class HttpApiService {
 
         const res = json as ApiResponse<FileInfoResponse>;
         return res.data;
+    }
+
+    /**
+     * 只读拉取远端附件的原始字节，用于「删除本地副本」前的完整内容校验。
+     * 仅接受明确且合理的已声明大小；任何异常由调用方按「校验失败、保留本地文件」处理。
+     *
+     * Read-only fetch of an attachment's raw bytes, used to fully verify the remote copy before
+     * deleting the local one. Only an explicit, sane declared size is accepted; failures are
+     * handled by the caller as "verification failed, keep the local file".
+     */
+    async getFileContentForVerification(path: string, expectedSize: number): Promise<ArrayBuffer> {
+        if (!Number.isFinite(expectedSize) || expectedSize <= 0 || expectedSize > 20 * 1024 * 1024) {
+            throw new Error(`Refusing to read back attachment with unverifiable size: ${expectedSize}`);
+        }
+
+        const params = new URLSearchParams({
+            vault: this.plugin.settings.vault,
+            path: path,
+            pathHash: hashContent(path).toString(),
+            isRecycle: "false"
+        });
+        const base = (this.plugin.runApi || this.plugin.settings.api).replace(/\/+$/, "");
+        const url = addRandomParam(`${base}/api/file?${params.toString()}`);
+        const headers: Record<string, string> = {
+            "x-client": CLIENT_TYPE,
+            "x-client-name": encodeURIComponent(this.plugin.getClientName()),
+            "x-client-version": (this.plugin.manifest as { version?: string }).version || ""
+        };
+        if (this.plugin.settings.apiToken) {
+            headers["Authorization"] = `Bearer ${this.plugin.settings.apiToken}`;
+        }
+
+        const controller = new AbortController();
+        const timer = window.setTimeout(() => controller.abort(), 15000);
+        try {
+            if (this.plugin.settings.networkLibrary === "requestUrl") {
+                // requestUrl 不返回最终 URL，也不接受 signal：无法事后校验跳转，只能对请求 URL 本身
+                // 做同源限定，并用 Promise.race 自行加超时。非同源时按「校验失败、保留本地文件」处理。
+                // requestUrl exposes no final URL and accepts no signal: redirects cannot be checked
+                // afterwards, so only same-origin request URLs are allowed and a manual timeout is
+                // raced in. A cross-origin request URL is treated as a failed verification.
+                if (!isSameOriginRequestUrl(url, this.plugin.settings.api)) {
+                    throw new Error("Cross-origin attachment read-back blocked: requestUrl cannot verify redirects");
+                }
+                const requestPromise = requestUrl({ url, method: "GET", headers, throw: false });
+                const timeoutPromise = new Promise<never>((_, reject) => {
+                    const abort = () => reject(new Error("Network request timeout while reading back an attachment"));
+                    controller.signal.addEventListener("abort", abort, { once: true });
+                    if (controller.signal.aborted) abort();
+                });
+                const response = await Promise.race([requestPromise, timeoutPromise]);
+                if (response.status !== 200) {
+                    throw new Error(`HTTP ${response.status}: Failed to read back attachment`);
+                }
+                return response.arrayBuffer;
+            }
+
+            const response = await nativeFetch(url, {
+                method: "GET",
+                headers,
+                redirect: "follow",
+                signal: controller.signal
+            });
+            if (response.url && response.url !== url
+                && !isAllowedRedirect(url, response.url, this.plugin.settings.allowedRedirectDomains)) {
+                throw new Error("Unsafe cross-domain redirect blocked while reading back an attachment");
+            }
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: Failed to read back attachment`);
+            }
+            return await response.arrayBuffer();
+        } finally {
+            window.clearTimeout(timer);
+        }
     }
 
     /** Existing read-only endpoints; never use sync/check requests, which can mutate state. */
@@ -987,20 +1080,61 @@ export class HttpApiService {
      * 获取在线客户端列表
      */
     async getWSClients(): Promise<WSClient[]> {
+        return (await this.getWSClientsDetailed()).clients as WSClient[];
+    }
+
+    /**
+     * 获取在线客户端列表并区分失败原因：无管理员权限 / 未连接 / 其它错误 / 确实为空。
+     * Fetch online clients, distinguishing "no admin permission" from "genuinely empty".
+     *
+     * 服务端对非管理员返回 HTTP 200 + 业务码 411，网关也可能直接回 403；这些都不能当成
+     * 「没有其它在线设备」默默显示空表（haierkeys/fast-note-sync-service）。
+     * Non-admins get HTTP 200 + business code 411 (a gateway may answer 403 directly); none of
+     * these may be silently rendered as an empty device list.
+     */
+    async getWSClientsDetailed(): Promise<WSClientsResult> {
         const endpoint = `/api/admin/ws_clients`;
         try {
             const { status, json } = await this.request(endpoint, {
                 method: "GET"
             });
-
-            if (status !== 200 || !this.isSuccess(json)) {
-                return [];
-            }
-            const res = json as ApiResponse<WSClient[]>;
-            return res.data || [];
+            return classifyWSClientsResponse(status, json);
         } catch (e) {
             dumpError("getWSClients error:", e);
-            return [];
+            return { ok: false, clients: [], failure: "error" };
+        }
+    }
+
+    /**
+     * 查询当前令牌的实际权限（服务端 GET /api/user/token-capabilities）。
+     * Fetch the current token's effective capabilities.
+     *
+     * 旧版服务端没有该接口（404）或网络失败时静默返回 null，绝不弹报错、绝不打断同步。
+     * Older servers return 404 and networks may fail: degrade silently to null, never show an
+     * error and never interrupt sync.
+     */
+    async getTokenCapabilities(): Promise<TokenCapabilities | null> {
+        const controller = new AbortController();
+        const timer = window.setTimeout(() => controller.abort(), 8000);
+        try {
+            const { status, json } = await this.request("/api/user/token-capabilities", {
+                method: "GET",
+                signal: controller.signal,
+            });
+            if (status === 404 || status === 405 || status === 501) return null;
+            if (status !== 200 || !this.isSuccess(json)) {
+                dump(`getTokenCapabilities: unavailable (HTTP ${status})`);
+                return null;
+            }
+            const res = json as ApiResponse<unknown>;
+            return parseTokenCapabilities(res?.data);
+        } catch (e) {
+            // 静默降级：旧服务端 404、超时、断网都不应打扰用户
+            // Silent degradation: old-server 404, timeouts and offline all stay quiet
+            dump("getTokenCapabilities skipped:", e);
+            return null;
+        } finally {
+            window.clearTimeout(timer);
         }
     }
 

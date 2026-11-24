@@ -5,9 +5,18 @@ import { SyncLogManager } from "./sync_log_manager";
 import { noteDeleteByPath, noteRename } from "./operator_note";
 import { fileDeleteByPath, fileRename } from "./operator_file";
 import { folderDeleteByPath, folderRename } from "./operator_folder";
+import * as i18n from "../../i18n/lang";
+import * as syncDiagnostics from "../utils/sync_diagnostics";
 
 export const RETRY_QUEUE_MAX_ENTRIES = 2000;
 export const RETRY_QUEUE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+// 服务端明确拒绝（非发送失败、非无回执）的重发上限；达到后按终态丢弃并等待拉回。
+// Upper bound for retries of a server-declared rejection (not a send failure or missing reply);
+// once reached the entry is discarded as terminal and pulled back.
+export const RETRY_QUEUE_REJECT_LIMIT = 6;
+// 与 websocket_manager.ts 的 ERROR_SYNC_CONFLICT 一致：服务端条件写冲突。
+// Same as ERROR_SYNC_CONFLICT in websocket_manager.ts: the server's conditional-write conflict.
+const ERROR_SYNC_CONFLICT = 530;
 // pkg/code/common.go: invalid input, invalid credentials/restrictions, disabled access,
 // invalid storage configuration and an occupied rename target need user intervention.
 export const DETERMINISTIC_MUTATION_ERRORS = new Set([305, 306, 307, 308, 309, 310,
@@ -50,6 +59,10 @@ export class RetryQueue {
     private retiredAckKeys = new Set<string>();
     private reconnectRequested = false;
     private waiters: (() => void)[] = [];
+    // 卡住提示：每个连接只报一次；定时器在等待结束/断线时清理
+    // Stall report: once per connection; timers cleared when the wait ends or the link drops
+    private stallReported = false;
+    private stallTimers: Set<number> = new Set();
 
     constructor(private plugin: FastSync) {
         this.scope = this.getScope();
@@ -135,16 +148,21 @@ export class RetryQueue {
         const previous = [...this.entries].reverse().find(e => e.objectType === objectType
             && e.path === (oldPath || path));
         let baselineHash = objectType === "folder" ? "" : p.fileHashManager.getPathHash(oldPath || path) || "";
-        // 源路径删除前的服务端 revision：切换远端目标后管理器已清空旧令牌，这里只取当前作用域的值
+        // 源路径删除前的服务端 revision：切换远端目标后管理器已清空旧令牌，这里只取当前作用域的值。
+        // 管理器只查内存表（已按远端作用域隔离并持久化），离线时同样可读，因此不再以基线模式为前提，
+        // 否则离线期间入队的条目会丢失令牌、重连后被服务端判冲突并无限重发。
         // The source path's server revision before deletion; the manager already dropped tokens of
-        // another remote target, so this is current-scope only
-        const baselineMode = p.isSyncBaselineModeEnabled?.() === true;
-        let baselineRevision = !baselineMode ? ""
-            : objectType === "folder"
-                ? (p.folderSnapshotManager?.getBaselineRevision?.(oldPath || path) ?? "")
-                : (p.fileHashManager?.getBaselineRevision?.(oldPath || path) ?? "");
-        let baselineMissing = baselineMode && (baselineRevision === ""
-            || (objectType !== "folder" && !p.fileHashManager?.getConfirmedBaseline?.(oldPath || path, null)));
+        // another remote target, so this is current-scope only. The manager reads in-memory state
+        // (scoped and persisted), which is available offline, so this must not depend on baseline
+        // mode: otherwise offline entries carry no token and the server rejects them forever.
+        let baselineRevision = objectType === "folder"
+            ? (p.folderSnapshotManager?.getBaselineRevision?.(oldPath || path) ?? "")
+            : (p.fileHashManager?.getBaselineRevision?.(oldPath || path) ?? "");
+        // 老服务端不签发令牌，管理器里也没有令牌，因此仍然按“无基线”发送（与旧行为一致）。
+        // An old server issues no tokens and the manager holds none, so "no baseline" is still
+        // reported, matching the previous wire behaviour.
+        let baselineMissing = baselineRevision === ""
+            || (objectType !== "folder" && !p.fileHashManager?.getConfirmedBaseline?.(oldPath || path, null));
         let createdAt = Date.now();
         if (previous) {
             // Sent operations are immutable until ACK/GET settles them. Keep a successor
@@ -166,7 +184,7 @@ export class RetryQueue {
         }
         const entry: RetryQueueEntry = { id: generateUUID(), objectType, operation, path,
             ...(operation === "rename" ? { oldPath } : {}), createdAt, attempts: 0, baselineHash,
-            ...(baselineRevision ? { baselineRevision } : {}), ...(baselineMode ? { baselineMissing } : {}) };
+            ...(baselineRevision ? { baselineRevision } : {}), baselineMissing };
         this.entries.push(entry);
         // Folders have no queryable content version. Only the current continuous connection
         // may retry its observed events; restored/offline entries are discarded before sync.
@@ -249,6 +267,30 @@ export class RetryQueue {
         return hash === e.baselineHash;
     }
 
+    /**
+     * 2.6.4–2.6.9 在离线期间落盘的条目没有版本令牌。重连确认基线模式后、发送前从管理器补一次；
+     * 只有管理器记录的内容哈希与条目基线一致时才采用，查不到则保持原样（随后由队列清理兜底）。
+     * Entries persisted offline by 2.6.4–2.6.9 carry no revision token. Once the connection confirms
+     * baseline mode, fill it from the manager before sending, but only when the manager's hash still
+     * matches the entry's recorded baseline; otherwise leave the entry unchanged.
+     */
+    private refillBaselineToken(e: RetryQueueEntry): void {
+        if (e.baselineRevision || this.plugin.isSyncBaselineModeEnabled?.() !== true) return;
+        const key = e.oldPath || e.path;
+        if (e.objectType === "folder") {
+            const revision = this.plugin.folderSnapshotManager?.getBaselineRevision?.(key) ?? "";
+            if (!revision) return;
+            e.baselineRevision = revision;
+            e.baselineMissing = false;
+        } else {
+            const confirmed = this.plugin.fileHashManager?.getConfirmedBaseline?.(key, null);
+            if (!confirmed || confirmed.hash !== e.baselineHash) return;
+            e.baselineRevision = confirmed.revision;
+            e.baselineMissing = false;
+        }
+        this.persist();
+    }
+
     private async safe(e: RetryQueueEntry): Promise<boolean> {
         if (!await this.localValid(e)) return false;
         if (this.excluded(e.objectType, e.path) || (e.oldPath && this.excluded(e.objectType, e.oldPath))) return false;
@@ -309,20 +351,46 @@ export class RetryQueue {
         return false;
     }
 
-    /** The queue is serial; legacy replies identify its active sent operation by action. */
-    reject(action: string, path: string | undefined, code: number, message: string): boolean {
-        if (path && this.shouldIgnoreAck(action, path)) return true;
-        const e = this.active;
-        if (!e || e.attempts === 0 || (path && path !== e.path)) return false;
+    /** 服务端明确拒绝：终态丢弃，等待恢复扫描把远端版本拉回。 */
+    /** Server-declared rejection: discard as terminal; the recovery scan pulls the remote version back. */
+    private discardRejected(e: RetryQueueEntry, code: number, message: string, log = true): boolean {
         const expected = `${e.objectType[0].toUpperCase() + e.objectType.slice(1)}${e.operation === "delete" ? "Delete" : "Rename"}`;
-        if (action !== expected && action !== `${expected}Ack`) return false;
-        if (!DETERMINISTIC_MUTATION_ERRORS.has(code)) return true;
         this.recoveryPaths.set(e.oldPath || e.path, e.objectType);
+        if (log) {
+            dump(`[RetryQueue] Service rejected ${expected}; discarding operation`, e.path, `code=${code}`, `attempts=${e.attempts}`, message);
+            SyncLogManager.getInstance().addLog("send", "RetryQueueDiscard", `Service rejected ${expected} (Code=${code}); operation cancelled`, "cancelled", e.path);
+        }
         this.remove(e);
         this.persist();
         showSyncNotice(`Service rejected ${expected}: ${e.path} (Code=${code}) ${message}`);
         this.kick();
         return true;
+    }
+
+    /** The queue is serial; legacy replies identify its active sent operation by action. */
+    reject(action: string, path: string | undefined, code: number, message: string): boolean {
+        if (path && this.shouldIgnoreAck(action, path)) return true;
+        const e = this.active;
+        if (!e) return false;
+        // 530 的载荷动作名是 SyncConflict，path 指向被拒的具体路径。队列自己发出的删除，
+        // 以及基线模式下改名对源路径发出的条件删除，都属于终态；改名目标路径的冲突仍交给
+        // 冲突面板（返回 false），其它错误码也保持原有判定。
+        // A 530 carries the SyncConflict action and the rejected path. The queue's own delete, and
+        // the conditional delete of a baseline-mode rename's source, are terminal; a conflict on the
+        // rename target falls through to the conflict panel (false), as do all other codes.
+        if (code === ERROR_SYNC_CONFLICT && action === "SyncConflict" && path) {
+            if (e.operation === "delete" && e.attempts > 0 && path === e.path) return this.discardRejected(e, code, message);
+            if (e.operation === "rename" && path === e.oldPath) return this.discardRejected(e, code, message);
+            return false;
+        }
+        if (e.attempts === 0 || (path && path !== e.path)) return false;
+        const expected = `${e.objectType[0].toUpperCase() + e.objectType.slice(1)}${e.operation === "delete" ? "Delete" : "Rename"}`;
+        if (action !== expected && action !== `${expected}Ack`) return false;
+        if (!DETERMINISTIC_MUTATION_ERRORS.has(code) && e.attempts < RETRY_QUEUE_REJECT_LIMIT) return true;
+        // 确定性错误码保持原有处理（不额外记同步日志）；新加的冲突/重发上限终态则记日志。
+        // Deterministic codes keep their previous handling (no extra sync log); the new
+        // conflict / retry-limit terminals do log.
+        return this.discardRejected(e, code, message, !DETERMINISTIC_MUTATION_ERRORS.has(code));
     }
 
     canSend(action: string, data: { path?: string; oldPath?: string }): boolean {
@@ -425,6 +493,7 @@ export class RetryQueue {
             // Recheck local state after HTTP yields. The send guard also checks identity after drain.
             if (!await this.localValid(e)) { this.remove(e); this.persist(); return; }
             if (generation !== this.generation || !this.connected() || !this.entries.includes(e)) return;
+            this.refillBaselineToken(e);
             if (this.active === e && e.attempts > 0) {
                 const action = `${e.objectType[0].toUpperCase() + e.objectType.slice(1)}${e.operation === "delete" ? "Delete" : "Rename"}`;
                 const guard = this.sendGuard(action, { path: e.path, oldPath: e.oldPath });
@@ -469,6 +538,28 @@ export class RetryQueue {
         if (!this.connected() || !this.enabled() || !this.entries.length) return;
         const wait = new Promise<void>(resolve => this.waiters.push(resolve));
         this.kick();
+        // 等待超过 30 秒仍未清空：记录一次并提示，但不改变等待行为（不超时返回）
+        // After 30s with entries still queued: record and notify once, without changing the wait
+        // (never return early on a timeout)
+        if (!this.stallReported) {
+            const timer = window.setTimeout(() => {
+                this.stallTimers.delete(timer);
+                if (this.stallReported || !this.entries.length) return;
+                this.stallReported = true;
+                const head = this.entries[0];
+                syncDiagnostics.recordDiag?.("error", "RetryQueueStalled",
+                    `head=${head.objectType}/${head.operation} attempts=${head.attempts} remaining=${this.entries.length}${head.oldPath ? ` oldPath=${head.oldPath}` : ""}`,
+                    head.path);
+                if (this.plugin.settings.isShowNotice) {
+                    showSyncNotice(i18n.$?.("ui.notice.retry_queue_stalled", { count: String(this.entries.length) }), 12000);
+                }
+            }, 30000);
+            this.stallTimers.add(timer);
+            void wait.then(() => {
+                window.clearTimeout(timer);
+                this.stallTimers.delete(timer);
+            });
+        }
         await wait;
     }
 
@@ -478,6 +569,11 @@ export class RetryQueue {
 
     onDisconnected(): void {
         this.generation++;
+        // 每个连接只提示一次：新连接重新计数并清掉未触发的卡住定时器
+        // Once per connection: a new connection resets the flag and clears pending stall timers
+        this.stallReported = false;
+        this.stallTimers.forEach(timer => window.clearTimeout(timer));
+        this.stallTimers.clear();
         if (this.timer !== null) window.clearTimeout(this.timer);
         this.timer = null;
         if (this.active) this.release(this.active);

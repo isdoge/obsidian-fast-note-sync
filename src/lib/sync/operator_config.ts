@@ -8,6 +8,7 @@ import { ReceiveMessage, ReceiveMtimeMessage, ReceivePathMessage, SyncEndData } 
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
 import { buildBaselineFields, buildDeleteBaselineFields } from "../storage/baseline_scope";
+import * as syncDiagnostics from "../utils/sync_diagnostics";
 
 
 /**
@@ -473,9 +474,12 @@ export const receiveConfigSyncModify = async function (data: ReceiveMessage, plu
 
 export const receiveConfigUpload = async function (data: ReceivePathMessage, plugin: FastSync) {
     if (plugin.settings.configSyncEnabled == false) return;
-    // 只读端不响应服务端的配置上传请求，与笔记/附件一致（#275）
-    // A read-only device ignores the server's config upload requests, same as notes/attachments (#275)
-    if (plugin.settings.readonlySyncEnabled) {
+    // 只读端不响应服务端的配置上传请求，与笔记/附件一致（#275）；本轮入口快照与实时设置
+    // fail-closed 取或，轮次中途刚打开只读也要拦住。
+    // A read-only device ignores the server's config upload requests, same as notes/attachments
+    // (#275); OR the round's entry snapshot with the live setting fail-closed so read-only
+    // enabled mid-round still blocks.
+    if (plugin.syncRoundReadonly || plugin.settings.readonlySyncEnabled) {
         dump(`Read-only mode: Intercepted config upload request for ${data.path}`)
         plugin.recordSyncCompleted('setting', data.pageIndex)
         return
@@ -733,6 +737,9 @@ export const receiveConfigSyncEnd = async function (data: unknown, plugin: FastS
     plugin.configSyncTasks.needModify = syncData.needModifyCount || 0
     plugin.configSyncTasks.needSyncMtime = syncData.needSyncMtimeCount || 0
     plugin.configSyncTasks.needDelete = syncData.needDeleteCount || 0
+    // 本轮服务端计数留档，供每轮摘要使用（不改变任何处理行为）
+    // Keep this round's server counts for the round summary (no behavior change)
+    syncDiagnostics.recordSyncEndCounts?.("config", syncData)
 
     // 与 note/file/folder 三类一致：无条件暂存（service#101）。服务端 SettingSyncEnd 的
     // lastTime 同样取查询开始时刻（ws_setting.go syncStartTime），无下行更新时也有效；

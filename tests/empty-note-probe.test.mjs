@@ -24,7 +24,7 @@ function load(name) {
   const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
   const module = { exports: {} };
   vm.runInNewContext(code, {
-    module, exports: module.exports, console, Map, Set,
+    module, exports: module.exports, console, Map, Set, Date,
     window: { setTimeout: () => 1, clearTimeout() {} },
     require(id) {
       if (id.includes("baseline_scope")) return { buildBaselineFields: (plugin, kind, path) => { if (kind === "folder" || !plugin) return {}; const m = kind === "setting" ? plugin.configHashManager : plugin.fileHashManager; const b = m && typeof m.getPathHash === "function" ? m.getPathHash(path) : null; return b !== null && b !== undefined ? { baseHash: b } : { baseHashMissing: true }; }, buildDeleteBaselineFields: () => ({}), baselineFieldsFromDeleteRecord: () => ({}), computeRemoteScope: () => "scope", parseScopedState: () => ({ state: { scope: "scope", revisions: {}, pendingDeletes: {} }, scopeChanged: false }), serializeScopedState: (state) => JSON.stringify(state) };
@@ -41,7 +41,7 @@ function load(name) {
 }
 const note = load("operator_note");
 
-function fixture({ content = "", base = null, conflicted = false } = {}) {
+function fixture({ content = "", base = null, conflicted = false } = {}, { sendMode = "ok" } = {}) {
   const file = new TFile("diary/2026-11-18.md"), sent = [], completed = [], trashed = [], written = [];
   const plugin = {
     settings: { syncEnabled: true, readonlySyncEnabled: false, vault: "v" },
@@ -57,7 +57,15 @@ function fixture({ content = "", base = null, conflicted = false } = {}) {
       fileManager: { trashFile: async f => trashed.push(f.path) },
     },
     lockManager: { withLock: async (_, fn) => fn() },
-    websocket: { SendMessage: async (action, data) => sent.push([action, data.path]) },
+    websocket: {
+      SendMessage: async (action, data, _before, after) => {
+        sent.push([action, data.path]);
+        // 模拟“消息真正交给连接”：第三个回调只在真正发出时被调用
+        // Simulate "handed to the connection": the 4th-arg callback only fires on a real send
+        if (sendMode === "ok") after?.();
+        if (sendMode === "reject") throw new Error("connection not open");
+      },
+    },
     syncState: { conflictedPaths: new Set(conflicted ? [file.path] : []), pendingNotePushPageIndex: new Map() },
     fileHashManager: {
       getPathHash: () => base,
@@ -154,6 +162,60 @@ function fixture({ content = "", base = null, conflicted = false } = {}) {
   f.sent.length = 0;
   await note.noteModify(f.file, f.plugin, true);
   assert.deepEqual(f.sent, [["NoteRePush", f.file.path]], "after disconnect-clear, modify re-probes");
+}
+
+// --- a probe whose message never actually left (connection closed / dropped) must not stay
+// --- "in flight" forever; the next scan probes again. The upload is still held either way. ---
+{
+  const f = fixture({}, { sendMode: "drop" });
+  assert.equal(note.probeEmptyNoteInsteadOfUpload(f.plugin, f.file.path, "", null), true, "dropped: upload still held");
+  await new Promise(r => setImmediate(r));
+  assert.equal(note.probeEmptyNoteInsteadOfUpload(f.plugin, f.file.path, "", null), true, "dropped: still held on retry");
+  assert.equal(f.sent.length, 2, "dropped: the unsent probe is released and re-sent");
+}
+
+// --- a probe that was really sent is not repeated within the TTL ---
+{
+  const f = fixture();
+  assert.equal(note.probeEmptyNoteInsteadOfUpload(f.plugin, f.file.path, "", null), true);
+  await new Promise(r => setImmediate(r));
+  assert.equal(note.probeEmptyNoteInsteadOfUpload(f.plugin, f.file.path, "", null), true, "in-flight: upload held");
+  assert.equal(f.sent.length, 1, "in-flight: no duplicate probe within the TTL");
+}
+
+// --- a probe with no verdict past the 60s TTL is retried ---
+{
+  const f = fixture();
+  assert.equal(note.probeEmptyNoteInsteadOfUpload(f.plugin, f.file.path, "", null), true);
+  await new Promise(r => setImmediate(r));
+  const realNow = Date.now;
+  const base = realNow();
+  try {
+    Date.now = () => base + 61_000;
+    assert.equal(note.probeEmptyNoteInsteadOfUpload(f.plugin, f.file.path, "", null), true, "expired: upload still held");
+  } finally {
+    Date.now = realNow;
+  }
+  assert.equal(f.sent.length, 2, "expired: the probe is re-sent after the TTL");
+}
+
+// --- a rejected send releases the registration ---
+{
+  const f = fixture({}, { sendMode: "reject" });
+  assert.equal(note.probeEmptyNoteInsteadOfUpload(f.plugin, f.file.path, "", null), true, "rejected: upload still held");
+  await new Promise(r => setImmediate(r));
+  assert.equal(note.probeEmptyNoteInsteadOfUpload(f.plugin, f.file.path, "", null), true, "rejected: still held on retry");
+  assert.equal(f.sent.length, 2, "rejected: the next scan re-sends");
+}
+
+// --- releaseEmptyNoteProbe (plain server error) allows an immediate re-probe ---
+{
+  const f = fixture();
+  assert.equal(note.probeEmptyNoteInsteadOfUpload(f.plugin, f.file.path, "", null), true);
+  await new Promise(r => setImmediate(r));
+  note.releaseEmptyNoteProbe(f.plugin, f.file.path);
+  assert.equal(note.probeEmptyNoteInsteadOfUpload(f.plugin, f.file.path, "", null), true, "released: upload still held");
+  assert.equal(f.sent.length, 2, "released: the next scan re-sends");
 }
 
 assert(logs.some(l => l[1] === "NoteEmptyProbe"), "probe is recorded in the sync log");

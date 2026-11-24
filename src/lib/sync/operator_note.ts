@@ -9,6 +9,7 @@ import { SyncLogManager } from "./sync_log_manager";
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
 import { BaselineDeleteRecord, baselineFieldsFromDeleteRecord, buildBaselineFields, buildDeleteBaselineFields } from "../storage/baseline_scope";
+import * as syncDiagnostics from "../utils/sync_diagnostics";
 
 // 同一插件会话中每条失败路径只通知一次；重试仍逐次保留同步错误日志。
 const notifiedNoteFailures = new WeakMap<FastSync, Set<string>>();
@@ -126,12 +127,29 @@ export async function removeConflictBackups(
   }
 }
 
-// #205：正在通过 NoteRePush 探测服务端是否已有该笔记的路径集合（挂在 plugin 实例上，
-// 每个插件实例独立；断线重连后由 websocket_manager onClose 统一清空，探测随下一轮事件重发）。
-// #205: paths currently being probed via NoteRePush for whether the server already has the note
-// (per plugin instance; cleared on disconnect by websocket_manager onClose, the probe is re-issued
-// by the next vault event).
-const emptyNoteProbing = new WeakMap<FastSync, Set<string>>();
+// #205：正在通过 NoteRePush 探测服务端是否已有该笔记的路径 → 本次查询的登记对象（挂在 plugin
+// 实例上，每个插件实例独立）。登记超过 EMPTY_NOTE_PROBE_TTL_MS、或消息没有真正发出时允许重新查询；
+// 断线重连后由 websocket_manager onClose 统一清空，探测随下一轮事件重发。
+// #205: path -> registration of the in-flight NoteRePush probe for whether the server already has
+// the note (per plugin instance). A registration older than EMPTY_NOTE_PROBE_TTL_MS, or a send that
+// never actually left, allows a fresh probe. Cleared on disconnect by websocket_manager onClose,
+// where the next vault event re-issues the probe.
+const emptyNoteProbing = new WeakMap<FastSync, Map<string, EmptyNoteProbeEntry>>();
+
+/** 在途探测的登记对象 / In-flight probe registration */
+interface EmptyNoteProbeEntry {
+  /** 本次查询的登记时间（毫秒） / When this probe was registered (ms) */
+  startedAt: number;
+}
+
+/**
+ * 在途探测的有效期：查询发出后超过该时长仍没有结论（回复丢失、服务端回普通错误等），
+ * 允许同一路径重新查询，避免一篇笔记在同一连接内永久卡在“探测在途”。
+ * Probe TTL: once a query has been outstanding this long without a verdict (lost reply, plain
+ * server error), the same path may be probed again instead of being stuck "in flight" forever
+ * within one connection.
+ */
+const EMPTY_NOTE_PROBE_TTL_MS = 60_000;
 // #205：探测结论为"服务端没有该笔记"的路径集合。下一次 noteModify（#277 保留分支的重传）
 // 检查到本标记时跳过拦截直接上传，打断"探测→NoteSyncDelete→重传→再探测"的循环；
 // 上传发起后标记即清除（一次性），Ack 后 hashManager 建立基线，后续编辑走正常路径。
@@ -141,13 +159,13 @@ const emptyNoteProbing = new WeakMap<FastSync, Set<string>>();
 // upload is issued), and after the Ack the hashManager baseline makes later edits normal.
 const emptyNoteConfirmedAbsent = new WeakMap<FastSync, Set<string>>();
 
-function emptyNoteProbeSet(plugin: FastSync): Set<string> {
-  let set = emptyNoteProbing.get(plugin);
-  if (!set) {
-    set = new Set<string>();
-    emptyNoteProbing.set(plugin, set);
+function emptyNoteProbeSet(plugin: FastSync): Map<string, EmptyNoteProbeEntry> {
+  let map = emptyNoteProbing.get(plugin);
+  if (!map) {
+    map = new Map<string, EmptyNoteProbeEntry>();
+    emptyNoteProbing.set(plugin, map);
   }
-  return set;
+  return map;
 }
 
 function emptyNoteConfirmedAbsentSet(plugin: FastSync): Set<string> {
@@ -165,6 +183,7 @@ function emptyNoteConfirmedAbsentSet(plugin: FastSync): Set<string> {
  * 改发 NoteRePush 探测：服务端有 → 回 NoteSyncModify 覆盖本地空文件；没有 → 回
  * NoteSyncDelete，由 receiveNoteSyncDelete 的 #277 保留分支重传空文件完成新建。
  * 服务端证据：ws_note.go NoteRePush（存在且非删除回 NoteSyncModify，否则回 NoteSyncDelete）。
+ * 在途登记超过 EMPTY_NOTE_PROBE_TTL_MS 未获结论、或消息没有真正发出时，允许再次查询。
  * 返回 true 表示已拦截（调用方不再上传）。
  *
  * #205: uploading a never-synced empty local note (e.g. Obsidian's auto-created daily note)
@@ -173,9 +192,11 @@ function emptyNoteConfirmedAbsentSet(plugin: FastSync): Set<string> {
  * server has it -> NoteSyncModify overwrites the local empty file; server doesn't ->
  * NoteSyncDelete, and receiveNoteSyncDelete's #277 keep-branch re-uploads the empty file as a
  * genuine create. Server evidence: ws_note.go NoteRePush (NoteSyncModify when present and not
- * deleted, NoteSyncDelete otherwise). Returns true when the upload was intercepted.
+ * deleted, NoteSyncDelete otherwise). A registration older than EMPTY_NOTE_PROBE_TTL_MS with no
+ * verdict, or a send that never actually left, allows a fresh query. Returns true when the
+ * upload was intercepted.
  */
-function probeEmptyNoteInsteadOfUpload(plugin: FastSync, path: string, content: string, baseHash: string | null): boolean {
+export function probeEmptyNoteInsteadOfUpload(plugin: FastSync, path: string, content: string, baseHash: string | null): boolean {
   if (content.trim().length !== 0) return false
   if (baseHash !== null) return false
   if (plugin.syncState.conflictedPaths.has(path)) return false
@@ -187,22 +208,44 @@ function probeEmptyNoteInsteadOfUpload(plugin: FastSync, path: string, content: 
     return false
   }
   const probing = emptyNoteProbeSet(plugin)
-  if (probing.has(path)) return true
-  probing.add(path)
+  const inFlight = probing.get(path)
+  if (inFlight && Date.now() - inFlight.startedAt < EMPTY_NOTE_PROBE_TTL_MS) return true
+  // 没有登记或登记已超时：登记本次查询（超时的旧登记被直接覆盖）
+  // No registration or a timed-out one: register this attempt (a stale one is overwritten)
+  const entry: EmptyNoteProbeEntry = { startedAt: Date.now() }
+  probing.set(path, entry)
   dump(`Empty unsynced note, probing server instead of uploading: ${path}`)
   SyncLogManager.getInstance().addLog('send', 'NoteEmptyProbe',
     `本地空白笔记尚未同步，先探测服务端是否已有该笔记: ${path}`, 'cancelled', path)
-  void plugin.websocket.SendMessage("NoteRePush", {
+  // 第四个参数只在消息真正交给连接时才被调用；连接没打开时消息被丢弃、回调不会执行。
+  // 发送结束后仍未发出（或被拒绝）就清掉本次登记，让下一次扫描可以重新查询。
+  // The 4th argument only runs when the message is really handed to the connection; if the
+  // connection is closed the message is dropped and the callback never fires. If the send
+  // finishes without it (or rejects), release this registration so the next scan can retry.
+  let sent = false
+  const release = (): void => { if (probing.get(path) === entry) probing.delete(path) }
+  void Promise.resolve(plugin.websocket.SendMessage("NoteRePush", {
     vault: plugin.settings.vault,
     path: path,
     pathHash: hashContent(path),
-  })
+  }, undefined, () => { sent = true })).then(() => { if (!sent) release() }, () => release())
   return true
 }
 
 /** #205：探测结论到达（NoteSyncModify / NoteSyncDelete 处理入口）时清除在途标记 */
 /** #205: clear the in-flight probe mark when its verdict arrives (NoteSyncModify / NoteSyncDelete) */
 function consumeEmptyNoteProbe(plugin: FastSync, path: string): void {
+  emptyNoteProbeSet(plugin).delete(path)
+}
+
+/**
+ * #205：主动放弃某路径的在途探测登记（服务端回了普通错误等），不影响“已确认缺失”标记。
+ * 登记清除后，下一次扫描可以重新查询（在确认服务端没有之前仍不会直接上传空笔记）。
+ * #205: drop the in-flight probe registration for a path (e.g. the server replied with a plain
+ * error) without touching the confirmed-absent mark. The next scan may probe again; the empty
+ * note is still never uploaded before the server is confirmed to lack it.
+ */
+export function releaseEmptyNoteProbe(plugin: FastSync, path: string): void {
   emptyNoteProbeSet(plugin).delete(path)
 }
 
@@ -304,7 +347,16 @@ export const noteModify = async function (file: TAbstractFile, plugin: FastSync,
   if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
   if (!(file instanceof TFile)) return
   if (!file.path.endsWith(".md")) return
-  if (eventEnter && plugin.isIgnoredFile(file.path)) return
+  if (eventEnter && plugin.isIgnoredFile(file.path)) {
+    // 命中的是祖先目录项时，屏蔽解除后补一次；命中路径自身（远端落盘的自我保护）仍直接丢弃
+    // An ancestor-folder hit is retried after the guard clears; a hit on the path itself
+    // (remote write self-protection) is still dropped as before
+    if (plugin.isIgnoredByAncestor(file.path)) {
+      dump(`Note modify deferred (parent folder guarded): ${file.path}`)
+      plugin.eventManager?.deferGuardedModify(file)
+    }
+    return
+  }
   if (isPathExcluded(file.path, plugin)) return
   // 冲突未解决的路径暂停上传，否则本端旧稿会覆盖其他端的新内容（#276）；解决冲突时由冲突合并窗口自行推送
   // Uploads of an unresolved conflict are paused, or this device's stale copy overwrites newer content
@@ -748,8 +800,16 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
  */
 export const receiveNoteUpload = async function (data: ReceivePathMessage, plugin: FastSync) {
   if (plugin.settings.syncEnabled == false) return
-  if (plugin.settings.readonlySyncEnabled) {
+  // 只读门禁：本轮入口快照与实时设置取或（fail-closed）。轮次中途刚打开只读时快照仍可写，
+  // 但实时设置已只读，服务端要求的上传必须拦住。
+  // Read-only gate: OR the round's entry snapshot with the live setting (fail-closed). If
+  // read-only is turned on mid-round the snapshot stays writable, but the live setting must
+  // still block the server's upload request.
+  if (plugin.syncRoundReadonly || plugin.settings.readonlySyncEnabled) {
     dump(`Read-only mode: Intercepted note upload request for ${data.path}`)
+    // 留一份带路径的清单，用户可以只开只读跑一轮看清“本机有、服务端没有”的条目
+    // Keep a per-path list so a read-only round shows what exists locally but not on the server
+    syncDiagnostics.recordUploadSkippedReadOnly?.(data.path)
     plugin.recordSyncCompleted('note', data.pageIndex)
     return
   }
@@ -981,7 +1041,10 @@ export const receiveNoteSyncDelete = async function (data: ReceiveMessage, plugi
         // 本地有未同步的改动时不执行远端删除：保留本地并重新上传（#277）。只读端以服务端为准，照常删除
         // Unsynced local edits win over a remote delete: keep the note and upload it again (#277).
         // A read-only device mirrors the server and still deletes
-        if (!plugin.settings.readonlySyncEnabled) {
+        // 本判断属于同步轮次内的接收逻辑，与上传门禁同口径 fail-closed 取或；轮次外快照为 false，退化为实时设置
+        // This runs inside the sync round's receive flow, so it uses the same fail-closed
+        // snapshot-OR-live gate; outside a round the snapshot is false and the live setting decides
+        if (!(plugin.syncRoundReadonly || plugin.settings.readonlySyncEnabled)) {
           const baseHash = plugin.fileHashManager.getPathHash(normalizedPath)
           let changed = plugin.pendingNoteModifies.has(normalizedPath) || wasEmptyNoteProbing
           if (!changed && baseHash !== null) {
@@ -1056,6 +1119,9 @@ export const receiveNoteSyncEnd = async function (data: unknown, plugin: FastSyn
   plugin.noteSyncTasks.needModify = syncData.needModifyCount || 0
   plugin.noteSyncTasks.needSyncMtime = syncData.needSyncMtimeCount || 0
   plugin.noteSyncTasks.needDelete = syncData.needDeleteCount || 0
+  // 本轮服务端计数留档，供每轮摘要使用（不改变任何处理行为）
+  // Keep this round's server counts for the round summary (no behavior change)
+  syncDiagnostics.recordSyncEndCounts?.("note", syncData)
 
   // End 先于明细到达：暂存 lastTime，待本类型全部完成且无失败时由 settleSyncTimes 落盘
   // End arrives before the details: stash lastTime; settleSyncTimes persists it once the type finished without failures

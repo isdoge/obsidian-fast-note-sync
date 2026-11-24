@@ -1,7 +1,7 @@
 import { moment, Platform, normalizePath } from "obsidian";
 
 import { invalidateFileDownloads, handleFileChunkDownload, BINARY_PREFIX_FILE_SYNC, clearUploadQueue, receiveFileUploadSessionNotFound } from "./operator_file";
-import { clearEmptyNoteProbes, conflictBackupPaths, writeConflictMeta } from "./operator_note";
+import { clearEmptyNoteProbes, conflictBackupPaths, releaseEmptyNoteProbe, writeConflictMeta } from "./operator_note";
 import { dump, addRandomParam, showSyncNotice, safeStringify } from "../utils/helpers";
 import { enSendDTOToProtobuf, deReceivePacket } from "../../pb/protobuf_mapper";
 import { receiveOperators, startupSync, startupFullSync, settleAllBatchSendSessionsOnClose, settleSyncTimes } from "./operator";
@@ -12,6 +12,7 @@ import { CLIENT_TYPE } from "../utils/types";
 import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
 import { conflictKindToSyncType, freezeConflictPath, normalizeConflict, storeSyncConflict } from "./conflict_store";
+import * as syncDiagnostics from "../utils/sync_diagnostics";
 
 
 // 冲突相关错误码
@@ -539,6 +540,10 @@ export class WebSocketManager {
     if (data.code <= 0 || data.code >= 300) {
       const isProtobufDecodeError = /(?:^|,\s*)(?:body:\s*)?Protobuf decode failed:/i.test(data.details || "");
       const errorPath = typeof data.data?.path === "string" ? data.data.path : undefined;
+      // 空白笔记探测收到普通错误回复（如 NoteRePush 被拒）：放弃在途登记，下一次扫描可重新查询
+      // An empty-note probe got a plain error reply (e.g. NoteRePush rejected): release the
+      // in-flight registration so the next scan can probe again
+      if (errorPath) releaseEmptyNoteProbe(this.plugin, errorPath);
       // Old validation errors omit both path and action. Only a unique outstanding request
       // can identify one safely; named legacy Ack errors match the serial queue by action.
       const [onlyRequest] = this.sentRequests?.size === 1 ? this.sentRequests.values() : [];
@@ -550,7 +555,26 @@ export class WebSocketManager {
         this.sentRequests?.delete(`${errorAction.replace(/Ack$/, "")}:${errorPath || onlyRequest?.path || ""}`);
         return;
       }
-      if (!isProtobufDecodeError && !data.context && errorPath && this.plugin.retryQueue?.ownsPendingPath(errorPath)) return;
+      // 冲突（530）不在这里吞掉：队列未认领的冲突（如改名目标路径）必须交给冲突面板。
+      // Never swallow a conflict (530) here: an unclaimed one (e.g. a rename target) must reach
+      // the conflict panel.
+      if (!isProtobufDecodeError && data.code !== ERROR_SYNC_CONFLICT && !data.context && errorPath
+        && this.plugin.retryQueue?.ownsPendingPath(errorPath)) return;
+      const diagPath = errorPath || (!msgAction ? onlyRequest?.path : undefined);
+      const detail = [data.message || "", data.details ? `details=${data.details}` : ""].filter(Boolean).join(" ");
+      const diagMessage = `Code=${data.code}${detail ? ` ${detail}` : ""}`;
+      // 463 带 sessionID 会走自动重传，耗尽时已有 FileUpload error：只进诊断缓冲，不记成失败
+      // 463 with a sessionID is auto-retried, and exhaustion already writes a FileUpload error:
+      // buffer only, never counted as a failure
+      if (data.code === 463 && typeof data.data?.sessionID === "string") {
+        syncDiagnostics.recordDiagBufferOnly?.("warn", errorAction || msgAction || "ErrorReply", diagMessage, diagPath);
+      } else if (!isProtobufDecodeError && data.code !== ERROR_SYNC_CONFLICT) {
+        // 带错误码的回执留一条 SyncLog error（protobuf 解码失败分支与 530 冲突各有自己的日志，不重复写）
+        // Keep one SyncLog error per error-code reply (the protobuf-decode branch and 530 conflicts
+        // already log their own, so they are skipped)
+        SyncLogManager.getInstance().addLog('receive', errorAction || msgAction || 'ErrorReply',
+          diagMessage, 'error', diagPath);
+      }
       // 处理冲突相关错误码
       if (data.code === ERROR_SYNC_CONFLICT) {
         void this.handleConflictError(data);
@@ -602,7 +626,12 @@ export class WebSocketManager {
       }
     } else {
       if (typeof data === "object" && "vault" in data && data.vault != null && data.vault !== "" && data.vault !== this.plugin.settings.vault) {
-        dump("Service vault " + data.vault + " not match " + this.plugin.settings.vault);
+        // 两个库名都放进结构化字段，诊断日志按键名整体脱敏（服务端回来的库名和本机配置的不同，整词规则遮不到）
+        // Both vault names go into keyed fields so the diagnostic log redacts them by key
+        dump("Service vault not match", { remoteVault: data.vault, localVault: this.plugin.settings.vault });
+        // 每个连接只在首条时记录动作名（不写两个库名），之后只计数进每轮摘要
+        // First drop per connection logs the action (never the two vault names); later ones are counted
+        syncDiagnostics.recordVaultMismatchDrop?.(msgAction || "Unknown");
         return;
       }
 
@@ -718,6 +747,10 @@ export class WebSocketManager {
         const processing = Promise.resolve(handler(payload, this.plugin, outsideRound)).catch(error => {
           if (detailKey) this.receivedFileDetails.delete(detailKey);
           dump('Sync handler failed', msgAction, error);
+          // 接收处理抛异常：留下错误信息与路径，便于事后排查
+          // Handler failure: keep the error message and path for later investigation
+          syncDiagnostics.recordDiag?.("error", msgAction || "HandlerFailed",
+            error instanceof Error ? error.message : String(error), path);
         });
         this.client.notifyActivity();
         return processing;
@@ -735,6 +768,12 @@ export class WebSocketManager {
     if (this.deferredMessages.length >= WebSocketManager.DEFERRED_MAX_COUNT
       || this.deferredBytes + size > WebSocketManager.DEFERRED_MAX_BYTES) {
       dump(`[SyncContext] Deferred queue overflow (${this.deferredMessages.length} items, ${this.deferredBytes} bytes); discard incoming ${action}`);
+      // 溢出状态首次出现时记录一次（带上当时条数），重复溢出只计数由 dump 体现
+      // Record the first overflow of a burst (with the current count); repeats only dump
+      if (!this.deferredOverflowed) {
+        syncDiagnostics.recordDiag?.("error", "DeferredOverflow",
+          `deferred queue overflow: ${this.deferredMessages.length} items, ${this.deferredBytes} bytes; discarded ${action}`);
+      }
       this.deferredOverflowed = true;
       return;
     }
@@ -839,6 +878,17 @@ export class WebSocketManager {
     this.plugin.syncState.negotiatedSyncBaselineVersion =
       typeof accepted === "number" && accepted > 0 ? Math.floor(accepted) : 0;
     this.plugin.syncState.clientInfoConfirmed = true;
+    // 协商结果留档：服务端声明的基线版本、最终模式与（能拿到时的）服务端版本号
+    // Negotiation result: advertised baseline version, final mode and the server version when known
+    let serverVersion = "unknown";
+    try {
+      const storedVersion = this.plugin.localStorageManager.getMetadata("serverVersion");
+      if (typeof storedVersion === "string" || typeof storedVersion === "number") serverVersion = String(storedVersion);
+    } catch {
+      serverVersion = "unknown";
+    }
+    syncDiagnostics.recordNegotiated?.("info",
+      `accepted=${this.plugin.syncState.negotiatedSyncBaselineVersion} mode=${this.plugin.syncState.negotiatedSyncBaselineVersion >= 1 ? "baseline" : "compat"} serverVersion=${serverVersion}`);
   }
 
   /** 清零连接级协商状态，并让仍在等待的闸门失败（新连接 / 断线） / Reset state and fail waiters */
@@ -855,6 +905,9 @@ export class WebSocketManager {
     this.plugin.syncState.serverAdvertisedBaselineVersion = 0;
     this.plugin.syncState.negotiatedSyncBaselineVersion = 0;
     this.plugin.syncState.clientInfoConfirmed = false;
+    // 新连接：重置连接级诊断计数（库名不符丢消息数等）
+    // New connection: reset connection-scoped diagnostic counters (vault-mismatch drops, etc.)
+    syncDiagnostics.resetConnectionDiagnostics?.();
     const waiters = this.baselineGateWaiters;
     this.baselineGateWaiters = [];
     for (const waiter of waiters) {
@@ -890,6 +943,8 @@ export class WebSocketManager {
         // 等待失败（超时或断线）：不放行同步，交给重连流程
         // The wait failed (timeout or disconnect): do not start sync; let reconnect handle it
         dump("[Baseline] ClientInfo confirmation failed; reconnecting instead of enabling the new mode", error);
+        syncDiagnostics.recordNegotiated?.("error",
+          `ClientInfo confirmation failed (${error instanceof Error ? error.message : String(error)}); reconnecting instead of enabling the new mode`);
         this.triggerReconnect();
         return;
       }

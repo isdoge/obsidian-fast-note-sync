@@ -72,6 +72,7 @@ const folderOps = loadModule("src/lib/sync/operator_folder.ts", (id) => {
   if (id === "./sync_log_manager") return { SyncLogManager: { getInstance: () => ({ addLog: noop }) } };
   if (id === "../storage/baseline_scope") return baselineScope;
   if (id === "../../main") return {};
+  if (id === "../utils/sync_diagnostics") return {};
   throw new Error(`Unexpected require in operator_folder: ${id}`);
 });
 

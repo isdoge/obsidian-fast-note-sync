@@ -7,6 +7,7 @@ import ts from "typescript";
 const root = path.resolve(import.meta.dirname, "..");
 const notices = [];
 const logs = [];
+const diagBuffer = [];
 let shouldFailDecode = false;
 let serializedMessages = 0;
 const noop = () => undefined;
@@ -83,7 +84,7 @@ const requireStub = id => {
     case "./operator_file":
       return new Proxy({ BINARY_PREFIX_FILE_SYNC: "fs" }, { get: (target, name) => target[name] ?? noop });
     case "./operator_note":
-      return { clearEmptyNoteProbes: noop };
+      return { clearEmptyNoteProbes: noop, releaseEmptyNoteProbe: noop };
     case "./operator":
       return new Proxy({}, { get: () => noop });
     case "./websocket_action":
@@ -93,6 +94,7 @@ const requireStub = id => {
     default:
       if (id.includes("baseline_scope")) return { buildBaselineFields: (plugin, kind, path) => { if (kind === "folder" || !plugin) return {}; const m = kind === "setting" ? plugin.configHashManager : plugin.fileHashManager; const b = m && typeof m.getPathHash === "function" ? m.getPathHash(path) : null; return b !== null && b !== undefined ? { baseHash: b } : { baseHashMissing: true }; }, buildDeleteBaselineFields: () => ({}), baselineFieldsFromDeleteRecord: () => ({}), computeRemoteScope: () => "scope", parseScopedState: () => ({ state: { scope: "scope", revisions: {}, pendingDeletes: {} }, scopeChanged: false }), serializeScopedState: (state) => JSON.stringify(state) };
     if (id.includes("conflict_store")) return { storeSyncConflict: async () => false, normalizeConflict: () => null, conflictKindToSyncType: () => "note", conflictReasonLabel: () => "", conflictKindLabel: () => "" };
+    if (id === "../utils/sync_diagnostics") return { recordDiagBufferOnly: (...args) => diagBuffer.push(args) };
     throw new Error(`Unexpected require: ${id}`);
   }
 };
@@ -350,6 +352,32 @@ function assertSingleFallback(plugin, manager, client, noticeStart, logStart) {
   guardClient.Send("NoteSync", { b: 2 });
   assert.equal(guardClient.ws.sent.length, 1);
   assert.equal(guardClient.ws.sent[0], 'NoteSync|{"b":2}');
+}
+
+// 463 with a sessionID is auto-recovered by re-upload; it must not be logged as a failure,
+// only kept in the diagnostics buffer. Other codes still write the error sync log.
+{
+  const { client } = fixture();
+  authenticate(client);
+  const logStart = logs.length;
+  const noticeStart = notices.length;
+  diagBuffer.length = 0;
+  client.options.onMessage(client, "FileSyncUpdate", {
+    code: 463,
+    message: "上传会话不存在",
+    data: { sessionID: "session-1", path: "attachments/a.png" },
+  });
+  assert.equal(logs.length, logStart, "463 auto-recovery must not write a failure sync log");
+  assert.equal(notices.length, noticeStart, "463 auto-recovery keeps its existing silent behavior");
+  assert.equal(diagBuffer.length, 1, "463 is recorded in the diagnostics buffer");
+  assert.equal(diagBuffer[0][0], "warn");
+  assert.match(diagBuffer[0][2], /Code=463/);
+
+  const otherLogStart = logs.length;
+  client.options.onMessage(client, "FileSyncUpdate", { code: 500, message: "内部错误" });
+  assert.equal(logs.length, otherLogStart + 1, "other error codes still write one error sync log");
+  assert.equal(logs.at(-1)[1], "FileSyncUpdate");
+  assert.equal(logs.at(-1)[3], "error");
 }
 
 console.log("protobuf decode fallback: local and server errors, one notice/log, JSON reconnect and normal protocol passed");

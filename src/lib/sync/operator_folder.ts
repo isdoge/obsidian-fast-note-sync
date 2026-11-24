@@ -7,6 +7,7 @@ import { hashContent, dump, dumpError, isFolderSyncPathExcluded, waitForFolderEm
 import { SyncLogManager } from "./sync_log_manager";
 import type FastSync from "../../main";
 import { BaselineDeleteRecord, buildBaselineFields, buildDeleteBaselineFields } from "../storage/baseline_scope";
+import * as syncDiagnostics from "../utils/sync_diagnostics";
 
 
 /**
@@ -14,7 +15,16 @@ import { BaselineDeleteRecord, buildBaselineFields, buildDeleteBaselineFields } 
  */
 export const folderModify = async function (folder: TFolder, plugin: FastSync, eventEnter: boolean = false, options?: { isConflictResolved?: boolean; baseRevision?: string }) {
     if (plugin.settings.syncEnabled == false || plugin.settings.readonlySyncEnabled) return
-    if (eventEnter && plugin.isIgnoredFile(folder.path)) return
+    if (eventEnter && plugin.isIgnoredFile(folder.path)) {
+        // 命中的是祖先目录项时，屏蔽解除后补一次；命中路径自身（远端落盘的自我保护）仍直接丢弃
+        // An ancestor-folder hit is retried after the guard clears; a hit on the path itself
+        // (remote write self-protection) is still dropped as before
+        if (plugin.isIgnoredByAncestor(folder.path)) {
+            dump(`Folder modify deferred (parent folder guarded): ${folder.path}`)
+            plugin.eventManager?.deferGuardedModify(folder)
+        }
+        return
+    }
     if (isFolderSyncPathExcluded(folder.path, plugin)) return
     // 冲突冻结的目录不响应实时写（已解决的提交除外）
     // A frozen conflicted folder ignores live writes (resolved submits excepted)
@@ -219,10 +229,15 @@ export const receiveFolderSyncModify = async function (data: { path: string, mti
 
     try {
         const locked = await plugin.lockManager.withLock(normalizedPath, async () => {
-            plugin.addIgnoredFile(normalizedPath)
-            try {
-                const existingFolder = plugin.app.vault.getAbstractFileByPath(normalizedPath)
-                if (!existingFolder) {
+            const existingFolder = plugin.app.vault.getAbstractFileByPath(normalizedPath)
+            if (!existingFolder) {
+                // 只有确实要创建目录时才屏蔽；已有目录不写盘，若同样屏蔽 500ms，
+                // 会连带丢弃该目录下用户在这段时间内的新建/修改（isIgnoredFile 前缀匹配）
+                // Guard only while actually creating the folder. An existing folder writes nothing,
+                // so masking it for 500ms would silently drop local creates/edits under it
+                // (isIgnoredFile matches by path prefix)
+                plugin.addIgnoredFile(normalizedPath)
+                try {
                     try {
                         await plugin.app.vault.createFolder(normalizedPath)
                     } catch (e) {
@@ -232,20 +247,20 @@ export const receiveFolderSyncModify = async function (data: { path: string, mti
                             dump(`Folder create ignored (may already exist): ${normalizedPath}`, e)
                         }
                     }
+                } finally {
+                    window.setTimeout(() => {
+                        plugin.removeIgnoredFile(normalizedPath)
+                    }, 500);
                 }
-                // 服务端历史数据可能存秒级 mtime（#461），比较前先归一化为毫秒（快照与
-                // lastFolderSyncTime 同为毫秒，秒级值会被误判为早于游标而跳过创建）
-                // Legacy server rows may hold second-scale mtime (#461); normalize before use. The
-                // snapshot and lastFolderSyncTime are both milliseconds; a seconds value would
-                // compare as older than the cursor and skip folder creation
-                plugin.folderSnapshotManager.setFolderMtime(normalizedPath, normalizeServerTimestamp(data.mtime) || Date.now())
-                if (typeof (data as { revision?: string }).revision === "string" && (data as { revision?: string }).revision) {
-                    plugin.folderSnapshotManager.setConfirmedRevision?.(normalizedPath, (data as { revision?: string }).revision as string)
-                }
-            } finally {
-                window.setTimeout(() => {
-                    plugin.removeIgnoredFile(normalizedPath)
-                }, 500);
+            }
+            // 服务端历史数据可能存秒级 mtime（#461），比较前先归一化为毫秒（快照与
+            // lastFolderSyncTime 同为毫秒，秒级值会被误判为早于游标而跳过创建）
+            // Legacy server rows may hold second-scale mtime (#461); normalize before use. The
+            // snapshot and lastFolderSyncTime are both milliseconds; a seconds value would
+            // compare as older than the cursor and skip folder creation
+            plugin.folderSnapshotManager.setFolderMtime(normalizedPath, normalizeServerTimestamp(data.mtime) || Date.now())
+            if (typeof (data as { revision?: string }).revision === "string" && (data as { revision?: string }).revision) {
+                plugin.folderSnapshotManager.setConfirmedRevision?.(normalizedPath, (data as { revision?: string }).revision as string)
             }
         }, { maxRetries: 5, retryInterval: 100 });
         // 抢锁失败时任务未执行：按失败处理，不能计为完成
@@ -456,6 +471,9 @@ export const receiveFolderSyncEnd = async function (data: unknown, plugin: FastS
     plugin.folderSyncTasks.needModify = syncData.needModifyCount || 0
     plugin.folderSyncTasks.needSyncMtime = syncData.needSyncMtimeCount || 0
     plugin.folderSyncTasks.needDelete = syncData.needDeleteCount || 0
+    // 本轮服务端计数留档，供每轮摘要使用（不改变任何处理行为）
+    // Keep this round's server counts for the round summary (no behavior change)
+    syncDiagnostics.recordSyncEndCounts?.("folder", syncData)
 
     // End 先于明细到达：暂存 lastTime，待本类型全部完成且无失败时由 settleSyncTimes 落盘
     // End arrives before the details: stash lastTime; settleSyncTimes persists it once the type finished without failures
