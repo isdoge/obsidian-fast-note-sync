@@ -107,6 +107,14 @@ export interface BaselineTrustProbe {
   fileHashManager?: {
     getDiagnosticCounts?: () => { baselineEntries: number; confirmedBaselines: number };
   };
+  /** 配置基线；只有配置同步的设备也可能整体拷贝进来 / Config baselines; config-only devices can be copied too */
+  configHashManager?: {
+    getDiagnosticCounts?: () => { baselineEntries: number; confirmedBaselines: number };
+  };
+  /** 文件夹快照/基线；只有文件夹基线的设备同样要识别 / Folder snapshots/baselines; folder-only devices too */
+  folderSnapshotManager?: {
+    getDiagnosticCounts?: () => { baselineEntries: number; confirmedBaselines: number };
+  };
   localStorageManager?: {
     wasSyncStateRestoredFromMirror?: () => boolean;
   };
@@ -120,8 +128,14 @@ export interface BaselineTrustProbe {
  * 于是出现“有 N 条基线、0 条已确认”，而同步时间/isInitSync 又是从目录镜像恢复的——
  * 这份历史不是本机原生积累的，游标和基线都不能按可信历史使用。
  *
- * 判据：基线条目 > 0、已确认 == 0，且本次启动的同步时间确实来自插件目录镜像。
+ * 判据：三个存储管理器（笔记/配置/文件夹）的基线条目合计 > 0、服务端确认合计 == 0，且本次
+ * 启动的同步时间确实来自插件目录镜像。只看笔记管理器会漏掉“只开了配置同步、或只有文件夹
+ * 快照”的设备：它们整目录拷过来后笔记基线为 0，配置删除/文件夹删除仍会按扫描推断上报。
  * 原地升级的旧版安装（localStorage 里本就有同步时间）不算外来状态，保持原有增量行为。
+ *
+ * 取舍：localStorage 被系统整体清空、而插件目录仍在时，也会被判为外来状态并多跑一次全量
+ * 同步。这是无法区分“整目录拷贝”和“localStorage 被清”的固有代价，方向安全（最多多扫一次，
+ * 不会漏传/误删），有意不放宽。
  *
  * Whether the persisted baselines belong to a foreign/untrusted sync state.
  *
@@ -131,14 +145,28 @@ export interface BaselineTrustProbe {
  * the sync times/isInitSync were restored from the folder mirror — history this device never
  * accumulated, so neither cursors nor baselines may be trusted as local history.
  *
- * Criterion: baselines > 0, confirmed == 0, and this startup's sync times came from the
- * plugin-dir mirror. An in-place legacy upgrade (localStorage already had the sync times) is
- * not foreign and keeps the previous incremental behavior.
+ * Criterion: the summed baseline entries of all three storage managers (note/config/folder) > 0,
+ * their summed server confirmations == 0, and this startup's sync times came from the plugin-dir
+ * mirror. Checking only the note manager misses config-only or folder-only devices: after a whole
+ * folder copy their note baselines are empty, yet config/folder deletions would still be inferred
+ * from the scan and reported.
+ *
+ * Trade-off: when localStorage is wiped entirely while the plugin folder survives, this also
+ * looks foreign and costs one extra full sync. Telling a whole-folder copy from a localStorage
+ * wipe is impossible; the direction is safe (at most one extra scan, never a lost upload or a
+ * bogus delete), so the criterion is intentionally not relaxed.
  */
 export function isUntrustedBaselineState(plugin: BaselineTrustProbe): boolean {
-  const counts = plugin.fileHashManager?.getDiagnosticCounts?.();
-  if (!counts || counts.baselineEntries <= 0 || counts.confirmedBaselines > 0) return false;
-  return plugin.localStorageManager?.wasSyncStateRestoredFromMirror?.() === true;
+  if (plugin.localStorageManager?.wasSyncStateRestoredFromMirror?.() !== true) return false;
+  let baselineEntries = 0;
+  let confirmedBaselines = 0;
+  for (const manager of [plugin.fileHashManager, plugin.configHashManager, plugin.folderSnapshotManager]) {
+    const counts = manager?.getDiagnosticCounts?.();
+    if (!counts) continue;
+    baselineEntries += counts.baselineEntries;
+    confirmedBaselines += counts.confirmedBaselines;
+  }
+  return baselineEntries > 0 && confirmedBaselines === 0;
 }
 
 interface BaselineManagerLike {

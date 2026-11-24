@@ -695,4 +695,16 @@ export class ConfigHashManager {
             storageKey: this.storageKey,
         };
     }
+
+    /**
+     * 诊断用计数：可信配置基线数与服务端确认数（供外来同步状态判定汇总）。
+     * Diagnostic counts: trusted config baselines and server confirmations (aggregated by the
+     * foreign sync-state probe in baseline_scope.ts).
+     */
+    getDiagnosticCounts(): { baselineEntries: number; confirmedBaselines: number } {
+        return {
+            baselineEntries: this.syncHashMap.size,
+            confirmedBaselines: this.confirmedPaths.size,
+        };
+    }
 }

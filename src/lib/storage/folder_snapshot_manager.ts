@@ -323,6 +323,19 @@ export class FolderSnapshotManager {
     }
 
     /**
+     * 诊断用计数：文件夹基线（快照）数与服务端确认的目录 revision 数，
+     * 供外来同步状态判定汇总（见 baseline_scope.isUntrustedBaselineState）。
+     * Diagnostic counts: folder baselines (snapshots) and server-confirmed folder revisions,
+     * aggregated by the foreign sync-state probe.
+     */
+    getDiagnosticCounts(): { baselineEntries: number; confirmedBaselines: number } {
+        return {
+            baselineEntries: this.snapshotMap.size,
+            confirmedBaselines: this.revisions.size,
+        };
+    }
+
+    /**
      * 更新单个文件夹的快照时间
      */
     setFolderMtime(path: string, mtime: number): void {

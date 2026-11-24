@@ -57,6 +57,38 @@ const { isUntrustedBaselineState, buildBaselineFields } = baselineScope;
     assert.equal(isUntrustedBaselineState({}), false, "missing managers never throw");
 }
 
+// Config-only / folder-only devices must also be recognized: a whole-folder copy may carry only
+// config or folder baselines, and their timestamp came from the plugin-dir mirror.
+{
+    const counts = (baselineEntries, confirmedBaselines) => ({ baselineEntries, confirmedBaselines });
+    const manager = (b, c) => ({ getDiagnosticCounts: () => counts(b, c) });
+    const probe = (managers, mirror = true) => ({
+        ...managers,
+        localStorageManager: { wasSyncStateRestoredFromMirror: () => mirror },
+    });
+    assert.equal(isUntrustedBaselineState(probe({
+        fileHashManager: manager(0, 0), configHashManager: manager(3, 0), folderSnapshotManager: manager(0, 0),
+    })), true, "config-only baselines are enough to mark the state foreign");
+    assert.equal(isUntrustedBaselineState(probe({
+        fileHashManager: manager(0, 0), configHashManager: manager(0, 0), folderSnapshotManager: manager(2, 0),
+    })), true, "folder-only baselines are enough to mark the state foreign");
+    assert.equal(isUntrustedBaselineState(probe({
+        fileHashManager: manager(0, 0), configHashManager: manager(3, 1), folderSnapshotManager: manager(2, 0),
+    })), false, "a single server-confirmed config baseline makes the history trusted");
+    assert.equal(isUntrustedBaselineState(probe({
+        fileHashManager: manager(0, 0), configHashManager: manager(3, 0),
+    }, false)), false, "without the mirror restore it is not foreign");
+
+    // Both inferred-delete paths stay behind the foreign-state gate.
+    const operatorSource = fs.readFileSync(path.join(root, "src/lib/sync/operator.ts"), "utf8");
+    const folderGate = operatorSource.indexOf("offlineDeleteSyncEnabled && !untrustedScanState");
+    const folderPush = operatorSource.indexOf("delFolders.push(");
+    assert.ok(folderGate > 0 && folderPush > folderGate, "folder delete inference is gated by !untrustedScanState");
+    const configGate = operatorSource.indexOf("configSyncEnabled && shouldSyncConfigs && plugin.settings.offlineDeleteSyncEnabled && !untrustedScanState");
+    const configPush = operatorSource.indexOf("delConfigs.push(");
+    assert.ok(configGate > 0 && configPush > configGate, "config delete inference is gated by !untrustedScanState");
+}
+
 // Content that still matches a persisted baseline must be reported as an equal base,
 // never as a missing base (otherwise the server can only answer with a conflict).
 {
