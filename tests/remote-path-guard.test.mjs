@@ -40,6 +40,7 @@ function load(name) {
       if (id === "../storage/file_cloud_preview") return { FileCloudPreview: { isRestrictedType: () => false } };
       if (id === "../api/http_api_service") return { HttpApiService: {} };
       if (id === "../../i18n/lang") return { $: key => key };
+      if (id === "../utils/sync_diagnostics") return {};
       throw new Error(`Unexpected import: ${id}`);
     },
   }, { filename: name });
