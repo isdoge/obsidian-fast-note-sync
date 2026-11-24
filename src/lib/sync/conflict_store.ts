@@ -1,8 +1,9 @@
 import { normalizePath } from "obsidian";
 
 import { $ } from "../../i18n/lang";
-import { dump, dumpError, hashContentAsync, hashFileAsync } from "../utils/helpers";
+import { dump, dumpError, getPluginDir, hashContentAsync, hashFileAsync } from "../utils/helpers";
 import { decodeConfigContent } from "../utils/config_codec";
+import { recordDiagBufferOnly } from "../utils/sync_diagnostics";
 import type { SyncConflictPayload } from "../utils/types";
 import { SyncLogManager } from "./sync_log_manager";
 import { clearUploadTrackingForConflict } from "./operator_file";
@@ -291,6 +292,69 @@ export async function storeSyncConflict(plugin: FastSync, raw: unknown): Promise
 
 export async function readUnifiedConflictMeta(plugin: FastSync, path: string): Promise<UnifiedConflictMeta | null> {
   return readConflictMeta(plugin, path);
+}
+
+/**
+ * 失效冲突记录自愈：集合里有路径、但没有对应 meta 的记录无法再展示类型与原因，也无法解决
+ * （常见于只清掉插件目录状态文件、没清到 localStorage 里 `fns-conflicted-paths` 的情况）。
+ * 只从集合中移除并落盘，不动本地/远端备份文件；读取失败时不误删，留待下次判断。
+ *
+ * Self-heal invalid conflict records: a path in the set without meta cannot show its kind or
+ * reason and cannot be resolved (e.g. the plugin-dir state files were cleared but the
+ * localStorage `fns-conflicted-paths` set survived). Drop and persist only the record; local
+ * and remote backups are left alone. A failed existence check keeps the record for next time.
+ *
+ * Returns the number of removed records.
+ */
+export async function pruneInvalidConflictRecords(plugin: FastSync): Promise<number> {
+  const paths = plugin.syncState.conflictedPaths;
+  if (!paths || paths.size === 0) return 0;
+  const adapter = plugin.app.vault.adapter;
+  const invalid: string[] = [];
+  for (const path of Array.from(paths)) {
+    try {
+      const { metaPath } = conflictBackupPaths(plugin, path);
+      if (!(await adapter.exists(metaPath))) invalid.push(path);
+    } catch (error) {
+      dump(`[Conflict] Unable to check conflict metadata, keeping record: ${path}`, error);
+    }
+  }
+  if (invalid.length === 0) return 0;
+  for (const path of invalid) paths.delete(path);
+  plugin.localStorageManager.setConflictedPaths(paths);
+  plugin.statusBarManager?.updateConflictBadge?.();
+  // 只记数量，避免一次启动刷出几千条日志 / Count only, never one line per path
+  recordDiagBufferOnly("warn", "ConflictState", `${invalid.length} conflicted path(s) had no metadata and were removed from the list`);
+  return invalid.length;
+}
+
+/**
+ * 重置同步状态时清空冲突记录：内存集合、localStorage 集合与 conflict-notes 的元数据。
+ * 备份正文（.base/.remote/.local-backup）默认保留，便于用户仍能找回内容；
+ * 切换远端库名的完整清理由 clearVaultConflictBackups 负责。
+ *
+ * Clear conflict records when resetting sync state: the in-memory set, the localStorage set
+ * and the conflict-notes metadata. Backup bodies (.base/.remote/.local-backup) are kept by
+ * default so content can still be recovered; a vault switch clears the whole folder separately.
+ */
+export async function resetConflictRecords(plugin: FastSync): Promise<void> {
+  const paths = plugin.syncState.conflictedPaths;
+  paths?.clear();
+  plugin.localStorageManager.setConflictedPaths(new Set());
+  plugin.statusBarManager?.updateConflictBadge?.();
+  try {
+    const adapter = plugin.app.vault.adapter;
+    const dir = `${getPluginDir(plugin)}/conflict-notes`;
+    if (!(await adapter.exists(dir))) return;
+    const listed = await adapter.list(dir);
+    const metas = (listed?.files ?? []).filter((file) => file.endsWith(".meta.json"));
+    await Promise.all(metas.map((file) => adapter.remove(file)));
+    if (metas.length > 0) {
+      recordDiagBufferOnly("info", "ConflictState", `${metas.length} conflict metadata file(s) removed by a sync-state reset`);
+    }
+  } catch (error) {
+    dump("[Conflict] Unable to clear conflict metadata on reset", error);
+  }
 }
 
 /** 清除一条冲突的记录状态（不动本地/远端内容）/ Clear the recorded state (does not touch content) */

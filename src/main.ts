@@ -17,6 +17,7 @@ import { CloudAttachmentEviction } from "./lib/storage/cloud_attachment_eviction
 import { DebugLogManager } from "./lib/utils/debug_log_manager";
 import { setDiagnosticRedactionContext } from "./lib/utils/redact_log";
 import { initSyncDiagnostics, recordStartupState, flushSyncDiagnostics, copySyncDiagnostics } from "./lib/utils/sync_diagnostics";
+import { pruneInvalidConflictRecords, resetConflictRecords } from "./lib/sync/conflict_store";
 import { SyncLogManager } from "./lib/sync/sync_log_manager";
 import { DebugLogModal } from "./views/debug-log-modal";
 import { VersionManager } from "./lib/utils/version_manager";
@@ -590,6 +591,9 @@ export default class FastSync extends Plugin {
                 }
                 this.wsSettingChange = true;
                 this.localStorageManager.clearSyncTime();
+                // 导入的连接可能指向另一个服务器/账号：旧目标的冲突记录一并清掉
+                // The imported config may target another server/account: clear old conflicts too
+                await resetConflictRecords(this);
                 await this.saveSettings();
                 showSyncNotice($("ui.status.config_imported"), 5000);
                 void this.reloadServices();
@@ -781,11 +785,25 @@ export default class FastSync extends Plugin {
         void this.eventManager.registerEvents()
       }
 
+      // 从本地存储还原当前处于手动合并冲突锁定状态的文件路径。
+      // 必须在记录启动诊断之前读回：否则 StartupState 里的 conflictedPaths 永远是 0，
+      // 排查「冲突列表有 N 条」时会得到误导性的结论。
+      // Restore the conflicted paths before recording the startup state; otherwise
+      // StartupState always reports conflictedPaths=0 and misleads conflict triage.
+      this.syncState.conflictedPaths = this.localStorageManager.getConflictedPaths()
+
       // 6.1 诊断缓冲：读回上次落盘内容并记录本次启动状态（不依赖调试日志开关）
       // Diagnostics: restore the previous file and record the startup state (independent of the
       // debug log toggle)
       await initSyncDiagnostics(this, `${getPluginDir(this)}/diagnostics.json`)
       recordStartupState(this)
+
+      // 6.2 失效冲突记录自愈：残留路径若已没有 meta（例如插件目录状态被清掉、localStorage
+      // 里的路径集合却还在），列表读不到类型与原因，也无法解决。启动时移除并落盘，只记数量。
+      // Self-heal invalid conflict records: a leftover path without meta (e.g. the plugin-dir
+      // state was cleared but the localStorage set survived) has no kind/reason and cannot be
+      // resolved. Drop and persist such paths at startup, logging only the count.
+      await pruneInvalidConflictRecords(this)
 
       // 7. 刷新运行时设置 (包含网络探测，不阻塞主流程)
       void this.reloadServices()
@@ -800,9 +818,6 @@ export default class FastSync extends Plugin {
 
       // 应用移动端 toast 高度 CSS 变量 / Apply mobile toast top CSS variable on startup
       this.applyMobileToastTop()
-
-      // 从本地存储还原当前处于手动合并冲突锁定状态的文件路径
-      this.syncState.conflictedPaths = this.localStorageManager.getConflictedPaths()
     })
   }
 
