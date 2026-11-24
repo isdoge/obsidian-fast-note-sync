@@ -16,9 +16,9 @@ import type FastSync from "../../main";
 import { $ } from "../../i18n/lang";
 import { SyncType } from "./sync_progress_tracker";
 import { ConfirmModal } from "../../views/confirm-modal";
-import { buildBaselineFields, buildDeleteBaselineFields } from "../storage/baseline_scope";
+import { buildBaselineFields, buildDeleteBaselineFields, isUntrustedBaselineState } from "../storage/baseline_scope";
 import { evaluateMassDeleteGuard } from "./mass_delete_guard";
-import { conflictKindToSyncType, normalizeConflict, storeSyncConflict } from "./conflict_store";
+import { conflictKindToSyncType, normalizeConflict, resetConflictRecords, storeSyncConflict } from "./conflict_store";
 
 // C9: 离线超墓碑期保护 — 默认与服务端 soft-delete-retention-time 默认值对应（90 天），
 // 先硬编码常量；服务端墓碑物理清除窗口过后，长期离线设备重连若检测到"本地有服务端无"的
@@ -52,8 +52,35 @@ function confirmOfflineTombstoneUpload(plugin: FastSync, uploadCount: number): P
 }
 
 
+const untrustedStateReported = new WeakSet<FastSync>();
+
+/**
+ * 启动同步是否走增量。外来/不可信的同步状态（插件目录被整份拷到新设备，服务端确认表却
+ * 留在旧机的 localStorage）必须按首次同步处理：全量扫描 + 以内容比对重建基线，而不是
+ * 拿着旧游标做增量、再把“本地缺失”的历史条目当成删除上报（服务端会逐条判 no_baseline 冲突）。
+ * 判定见 baseline_scope.isUntrustedBaselineState；原地升级的旧版本仍走增量。
+ *
+ * Whether startup sync may run incrementally. A foreign/untrusted sync state (whole plugin
+ * folder copied to a new device while the server-confirmation table stayed in the old machine's
+ * localStorage) must behave like a first sync: full scan and content-based baseline rebuild,
+ * never incremental with old cursors plus scan-inferred deletions (the server would answer each
+ * with a no_baseline conflict). See baseline_scope.isUntrustedBaselineState; an in-place legacy
+ * upgrade still runs incrementally.
+ */
+export function resolveStartupIncremental(plugin: FastSync): boolean {
+  const incremental = Boolean(plugin.localStorageManager.getMetadata("isInitSync"));
+  const untrusted = typeof isUntrustedBaselineState === "function" && isUntrustedBaselineState(plugin);
+  if (!untrusted) return incremental;
+  if (!untrustedStateReported.has(plugin)) {
+    untrustedStateReported.add(plugin);
+    syncDiagnostics.recordDiagBufferOnly?.("warn", "BaselineTrust",
+      "Foreign sync state (baselines restored from the plugin mirror, none server-confirmed): running a first full sync and re-verifying baselines by content instead of trusting the old cursors");
+  }
+  return false;
+}
+
 export const startupSync = (plugin: FastSync): void => {
-  void handleSync(plugin, plugin.localStorageManager.getMetadata("isInitSync") as boolean);
+  void handleSync(plugin, resolveStartupIncremental(plugin));
 };
 export const startupFullSync = async (plugin: FastSync) => {
   void handleSync(plugin, false);
@@ -61,6 +88,11 @@ export const startupFullSync = async (plugin: FastSync) => {
 
 export const resetSettingSyncTime = async (plugin: FastSync, silent = false) => {
   plugin.localStorageManager.clearSyncTime();
+  // 重置同步状态后旧的冲突记录不再有意义：连内存集合与 conflict-notes 元数据一起清掉，
+  // 否则清完状态文件后角标仍会挂着几千条读不到原因的记录。
+  // Old conflict records are meaningless after a reset: clear the in-memory set and the
+  // conflict-notes metadata too, or the badge keeps showing thousands of reason-less entries.
+  await resetConflictRecords(plugin);
   if (!silent) {
     showSyncNotice($("setting.debug.clear_time_success"));
   }
@@ -237,7 +269,7 @@ function restartStalledSync(plugin: FastSync, intervalId?: number): void {
   syncStallState.restartTimer = window.setTimeout(() => {
     syncStallState.restartTimer = undefined;
     if (plugin.websocket.isOpen && !plugin.isSyncing) {
-      void handleSync(plugin, plugin.localStorageManager.getMetadata("isInitSync") as boolean);
+      void handleSync(plugin, resolveStartupIncremental(plugin));
     }
   }, delay);
 }
@@ -901,6 +933,20 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     const shouldSyncNotes = syncMode === "auto" || syncMode === "note";
     const shouldSyncConfigs = syncMode === "auto" || syncMode === "config";
 
+    // 外来同步状态下，扫描推断出的“本地缺失 = 用户删除”不可信：基线不是本机确认过的，
+    // 上报删除只会让服务端逐条判 no_baseline 冲突（事故里 2315 条）。本轮不下发推断删除，
+    // 让服务端列表把内容下回来；内容一致的由服务端确认，真正不同的才进冲突。
+    // With a foreign sync state, "missing locally = user deleted" cannot be inferred: the
+    // baselines were never confirmed on this device, so reporting deletes only yields one
+    // no_baseline conflict per path (2315 in the incident). Skip inferred deletes this round and
+    // let the server list download content; equal rows get confirmed, only real differences conflict.
+    const untrustedScanState = typeof isUntrustedBaselineState === "function" && isUntrustedBaselineState(plugin);
+    if (untrustedScanState && !untrustedStateReported.has(plugin)) {
+      untrustedStateReported.add(plugin);
+      syncDiagnostics.recordDiagBufferOnly?.("warn", "BaselineTrust",
+        "Untrusted baseline state: scan-inferred deletions are skipped and baselines are re-verified by content");
+    }
+
     const activeTypes: SyncType[] = [];
     if (plugin.settings.syncEnabled && shouldSyncNotes) {
       activeTypes.push('note', 'folder');
@@ -1311,7 +1357,9 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
       }
 
       // 检测被删除的文件 (对比哈希表和本地 Vault)
-      if (plugin.settings.offlineDeleteSyncEnabled) {
+      // 外来同步状态不下发扫描推断的删除（见 untrustedScanState 注释）
+      // Never send scan-inferred deletes for a foreign sync state (see untrustedScanState)
+      if (plugin.settings.offlineDeleteSyncEnabled && !untrustedScanState) {
         const trackedPaths = plugin.fileHashManager.getAllPaths();
         const localPathsSet = new Set(list.map(f => f.path)); // 优化：使用 Set 提高查找效率
         let delCount = 0;
@@ -1542,7 +1590,9 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     }
 
     // 检测被删除的配置文件 (对比哈希表和本地配置)
-    if (plugin.settings.configSyncEnabled && shouldSyncConfigs && plugin.settings.offlineDeleteSyncEnabled) {
+    // 外来同步状态同样不下发推断删除（见 untrustedScanState 注释）
+    // Foreign sync state also skips scan-inferred config deletes (see untrustedScanState)
+    if (plugin.settings.configSyncEnabled && shouldSyncConfigs && plugin.settings.offlineDeleteSyncEnabled && !untrustedScanState) {
       if (plugin.configHashManager && plugin.configHashManager.isReady()) {
         const trackedConfigPaths = plugin.configHashManager.getAllPaths();
         const localConfigPathsSet = new Set(configPaths);

@@ -103,6 +103,44 @@ export function baselineFieldsFromDeleteRecord(record: BaselineDeleteRecord | nu
 
 export type BaselineResourceKind = "note" | "file" | "setting" | "folder";
 
+export interface BaselineTrustProbe {
+  fileHashManager?: {
+    getDiagnosticCounts?: () => { baselineEntries: number; confirmedBaselines: number };
+  };
+  localStorageManager?: {
+    wasSyncStateRestoredFromMirror?: () => boolean;
+  };
+}
+
+/**
+ * 判断持久化的基线是否属于“外来/不可信同步状态”。
+ *
+ * 典型场景：新设备把另一台机子的插件目录整份拷过来，插件目录里带着哈希/基线镜像，
+ * 但服务端确认表存在本机 localStorage（`fns-syncHashMapConfirmed`），不会随目录复制。
+ * 于是出现“有 N 条基线、0 条已确认”，而同步时间/isInitSync 又是从目录镜像恢复的——
+ * 这份历史不是本机原生积累的，游标和基线都不能按可信历史使用。
+ *
+ * 判据：基线条目 > 0、已确认 == 0，且本次启动的同步时间确实来自插件目录镜像。
+ * 原地升级的旧版安装（localStorage 里本就有同步时间）不算外来状态，保持原有增量行为。
+ *
+ * Whether the persisted baselines belong to a foreign/untrusted sync state.
+ *
+ * Typical case: a new device copies another machine's whole plugin folder. The folder carries
+ * the hash/baseline mirrors, but the server-confirmation table lives in this app's localStorage
+ * (`fns-syncHashMapConfirmed`) and is not copied. The result is "N baselines, 0 confirmed" while
+ * the sync times/isInitSync were restored from the folder mirror — history this device never
+ * accumulated, so neither cursors nor baselines may be trusted as local history.
+ *
+ * Criterion: baselines > 0, confirmed == 0, and this startup's sync times came from the
+ * plugin-dir mirror. An in-place legacy upgrade (localStorage already had the sync times) is
+ * not foreign and keeps the previous incremental behavior.
+ */
+export function isUntrustedBaselineState(plugin: BaselineTrustProbe): boolean {
+  const counts = plugin.fileHashManager?.getDiagnosticCounts?.();
+  if (!counts || counts.baselineEntries <= 0 || counts.confirmedBaselines > 0) return false;
+  return plugin.localStorageManager?.wasSyncStateRestoredFromMirror?.() === true;
+}
+
 interface BaselineManagerLike {
   getPathHash?: (path: string) => string | null;
   getVerifiedPathHash?: (path: string, localContentHash: string | null) => string | null;

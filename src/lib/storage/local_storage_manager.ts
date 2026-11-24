@@ -53,6 +53,9 @@ export class LocalStorageManager {
     private syncStateMirror: LocalStateFileMirror | null = null;
     private syncStateDirty: boolean = false;
     private stageTimer: number | null = null;
+    /** 本次启动的同步时间/isInitSync 是否来自插件目录镜像（而非本机 localStorage） */
+    /** Whether this startup's sync times/isInitSync came from the plugin-dir mirror */
+    private syncStateRestoredFromMirror: boolean = false;
 
     /**
      * 底层读原子操作
@@ -374,8 +377,21 @@ export class LocalStorageManager {
             if (!this.hasStoredMetadata("lastSyncSuccessTime") && isValidNonNegativeNumber(data.lastSyncSuccessTime)) {
                 this.write(this.getInternalKey("lastSyncSuccessTime"), String(data.lastSyncSuccessTime));
             }
+            this.syncStateRestoredFromMirror = true;
             dump("[LocalStorageManager] Restored sync state from file mirror");
         }
+    }
+
+    /**
+     * 本次启动是否从插件目录镜像恢复了同步时间/isInitSync。
+     * 为 true 而服务端确认基线为 0 时，说明这份同步状态来自其它设备或存储被清过，
+     * 游标与基线都不能当作本机可信历史（详见 baseline_scope.isUntrustedBaselineState）。
+     * Whether this startup restored the sync times/isInitSync from the plugin-dir mirror.
+     * True together with zero server-confirmed baselines means the state came from another
+     * device (or storage was evicted), so its cursors and baselines must not be trusted.
+     */
+    wasSyncStateRestoredFromMirror(): boolean {
+        return this.syncStateRestoredFromMirror;
     }
 
     constructor(plugin: FastSync) {
