@@ -69,6 +69,7 @@ function loadSettingsViewModule(navigatorValue = {}) {
       if (id === "src/main") return {};
       if (id === "../lib/api/http_api_service") return {};
       if (id === "./note-history/lucide-icon") return { LucideIcon: () => null };
+      if (id === "../lib/sync/conflict_store") return { resetConflictRecords: async () => {} };
       if (id === "../i18n/lang") return { $: key => key, getLocale: () => "en" };
       return {};
     },
