@@ -94,6 +94,17 @@ export default class FastSync extends Plugin {
    */
   syncRoundReadonly = false
 
+  /**
+   * 作用域变化触发的冲突记录清理（见 lib/sync/conflict_reset_scheduler.ts）。
+   * 非空表示清理仍在进行或尚未被等待；`conflictResetFailed` 为 true 表示上次失败，
+   * 下一轮同步开始或写入新冲突前会重试一次。
+   * Pending conflict-record cleanup triggered by a remote-scope change (see
+   * conflict_reset_scheduler.ts). Non-null means cleanup is in flight or still unawaited;
+   * `conflictResetFailed` marks a failed attempt that the next sync round / conflict write retries.
+   */
+  pendingConflictReset: Promise<void> | null = null
+  conflictResetFailed = false
+
   // ─── Sync page state tracking ───────────────────────────────────────────────
   /**
    * 追踪每个同步类型的当前下载分页状态

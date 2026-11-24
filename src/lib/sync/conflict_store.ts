@@ -189,6 +189,11 @@ export async function storeSyncConflict(plugin: FastSync, raw: unknown): Promise
   const kind = conflict.kind;
   dump("[Conflict] Store unified conflict", { kind, path, reason: conflict.reason, serverDeleted: conflict.serverDeleted });
 
+  // 作用域变化触发的旧目标冲突清理可能还没落定；先等它完成，避免旧清理与新记录交错
+  // An old-target conflict cleanup triggered by a scope change may still be running; await it so
+  // the stale cleanup cannot interleave with this new record
+  await awaitPendingConflictReset(plugin);
+
   try {
     const adapter = plugin.app.vault.adapter;
     const { dir, baseBackupPath, remoteBackupPath } = conflictBackupPaths(plugin, path);
@@ -359,12 +364,15 @@ export async function pruneInvalidConflictRecords(plugin: FastSync): Promise<num
  * 重置同步状态时清空冲突记录：内存集合、localStorage 集合与 conflict-notes 的元数据。
  * 备份正文（.base/.remote/.local-backup）默认保留，便于用户仍能找回内容；
  * 切换远端库名的完整清理由 clearVaultConflictBackups 负责。
+ * 返回值：元数据清理是否真正成功；false 让调用方（作用域变化调度）保留待重试标志。
  *
  * Clear conflict records when resetting sync state: the in-memory set, the localStorage set
  * and the conflict-notes metadata. Backup bodies (.base/.remote/.local-backup) are kept by
  * default so content can still be recovered; a vault switch clears the whole folder separately.
+ * Returns whether the metadata cleanup actually succeeded so the scope-change scheduler can keep
+ * its retry flag on failure.
  */
-export async function resetConflictRecords(plugin: FastSync): Promise<void> {
+export async function resetConflictRecords(plugin: FastSync): Promise<boolean> {
   const paths = plugin.syncState.conflictedPaths;
   paths?.clear();
   plugin.localStorageManager.setConflictedPaths(new Set());
@@ -372,16 +380,47 @@ export async function resetConflictRecords(plugin: FastSync): Promise<void> {
   try {
     const adapter = plugin.app.vault.adapter;
     const dir = `${getPluginDir(plugin)}/conflict-notes`;
-    if (!(await adapter.exists(dir))) return;
+    if (!(await adapter.exists(dir))) return true;
     const listed = await adapter.list(dir);
     const metas = (listed?.files ?? []).filter((file) => file.endsWith(".meta.json"));
     await Promise.all(metas.map((file) => adapter.remove(file)));
     if (metas.length > 0) {
       recordDiagBufferOnly("info", "ConflictState", `${metas.length} conflict metadata file(s) removed by a sync-state reset`);
     }
+    return true;
   } catch (error) {
     dump("[Conflict] Unable to clear conflict metadata on reset", error);
+    return false;
   }
+}
+
+/**
+ * 等待作用域变化触发的冲突记录清理完成；上次失败则在本轮重试一次。
+ * 每轮同步开始和每次写入新冲突前调用。清理本身可能仍在动态导入阶段（见
+ * conflict_reset_scheduler.ts），这里一并等待导入完成，导入失败则重试。
+ *
+ * Await the conflict-record cleanup scheduled by a scope change; retry once if the previous
+ * attempt failed. Called at every sync round start and before every new conflict write. The
+ * cleanup may still be resolving its dynamic import (see conflict_reset_scheduler.ts), which is
+ * awaited here too; an import failure is retried.
+ */
+export async function awaitPendingConflictReset(plugin: FastSync): Promise<void> {
+  const pending = plugin.pendingConflictReset;
+  if (pending) {
+    await pending;
+    if (plugin.pendingConflictReset === pending) plugin.pendingConflictReset = null;
+  }
+  if (!plugin.conflictResetFailed) return;
+  // 上一轮失败（动态导入失败或元数据删不掉）：合一重试一次；仍失败就保留标志等下一轮
+  // Previous attempt failed (import or metadata removal): retry once; a second failure keeps
+  // the flag for the next round
+  plugin.conflictResetFailed = false;
+  const retry = resetConflictRecords(plugin).then((ok) => {
+    if (!ok) plugin.conflictResetFailed = true;
+  });
+  plugin.pendingConflictReset = retry;
+  await retry;
+  if (plugin.pendingConflictReset === retry) plugin.pendingConflictReset = null;
 }
 
 /** 清除一条冲突的记录状态（不动本地/远端内容）/ Clear the recorded state (does not touch content) */

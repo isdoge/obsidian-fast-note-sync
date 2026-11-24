@@ -18,7 +18,7 @@ import { SyncType } from "./sync_progress_tracker";
 import { ConfirmModal } from "../../views/confirm-modal";
 import { buildBaselineFields, buildDeleteBaselineFields, isUntrustedBaselineState } from "../storage/baseline_scope";
 import { evaluateMassDeleteGuard } from "./mass_delete_guard";
-import { conflictKindToSyncType, normalizeConflict, resetConflictRecords, storeSyncConflict } from "./conflict_store";
+import { awaitPendingConflictReset, conflictKindToSyncType, normalizeConflict, resetConflictRecords, storeSyncConflict } from "./conflict_store";
 
 // C9: 离线超墓碑期保护 — 默认与服务端 soft-delete-retention-time 默认值对应（90 天），
 // 先硬编码常量；服务端墓碑物理清除窗口过后，长期离线设备重连若检测到"本地有服务端无"的
@@ -900,6 +900,11 @@ export const handleSync = async function (plugin: FastSync, isLoadLastTime: bool
     context = generateUUID();
     plugin.syncState.activeSyncContext = context; // 记录活跃的同步上下文 / Record the active sync context
     dump(`Sync context generated: ${context}`);
+    // 作用域变化触发的旧目标冲突清理可能还在异步执行：先等它落定，否则本轮新冲突可能被
+    // 旧清理的集合清空/目录枚举吞掉。失败的重置会在这里重试一次。
+    // An old-target conflict cleanup from a scope change may still be running: await it so this
+    // round's new conflicts cannot be swallowed by the stale reset. A failed reset retries here.
+    if (typeof awaitPendingConflictReset === "function") await awaitPendingConflictReset(plugin);
     if (!plugin.menuManager.ribbonIconStatus) {
       // WebSocket 处于断开/退避状态，立即触发重连，连接成功后自动执行同步
       // WebSocket is disconnected/in backoff, trigger immediate reconnect and auto-sync on connect

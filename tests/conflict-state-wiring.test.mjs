@@ -91,9 +91,11 @@ for (const file of [
     "src/lib/storage/folder_snapshot_manager.ts",
 ]) {
     const source = read(file);
-    const calls = source.match(/resetConflictRecords\(/g) ?? [];
+    const direct = source.match(/resetConflictRecords\(/g) ?? [];
+    const scheduled = source.match(/scheduleConflictRecordReset\(/g) ?? [];
     assert.ok(source.includes("ensureBaselineScope"), `${file} still checks the baseline scope`);
-    assert.ok(calls.length >= 2, `${file} resets conflict records on both live and startup scope changes`);
+    assert.ok(direct.length >= 1, `${file} clears conflict records on a startup scope change`);
+    assert.ok(scheduled.length >= 1, `${file} registers a tracked cleanup for a live scope change`);
 }
 {
     // A vault switch drops the whole conflict-notes folder and the in-memory set.

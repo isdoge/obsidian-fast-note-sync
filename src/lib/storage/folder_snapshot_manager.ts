@@ -3,6 +3,7 @@ import { TFolder } from "obsidian";
 import { dump, isFolderSyncPathExcluded, debounce, LocalStateFileMirror, computeMirrorDigest } from "../utils/helpers";
 import type FastSync from "../../main";
 import { BaselineDeleteRecord, computeRemoteScope, parseScopedState, serializeScopedState, ScopedBaselineState } from "./baseline_scope";
+import { scheduleConflictRecordReset } from "../sync/conflict_reset_scheduler";
 
 // 对账延迟：初始化后等待若干秒再比对，避开插件刚加载时的启动开销高峰
 // Reconciliation delay: wait a few seconds after init to avoid the plugin's startup load spike
@@ -212,11 +213,11 @@ export class FolderSnapshotManager {
         this.pendingDeleteBaselines.clear();
         dump("FolderSnapshotManager: remote scope changed; folder revisions cleared");
         this.saveBaselineState();
-        // 旧目标的冲突记录不再有意义；动态导入避免静态循环依赖
-        // Old-target conflicts are meaningless; a dynamic import avoids a static cycle
-        void import("../sync/conflict_store")
-            .then(({ resetConflictRecords }) => resetConflictRecords(this.plugin))
-            .catch(() => undefined);
+        // 旧目标的冲突记录不再有意义。登记成待执行的清理，下一轮同步开始 / 写入新冲突前
+        // 会等待它完成，失败则保留标志重试。
+        // Old-target conflicts are meaningless. Register a tracked cleanup that the next sync
+        // round / conflict write awaits; failures keep a retry flag.
+        scheduleConflictRecordReset(this.plugin, "folder baseline scope changed");
     }
 
     private async loadBaselineState(): Promise<void> {
@@ -235,13 +236,16 @@ export class FolderSnapshotManager {
             this.pendingDeleteBaselines.clear();
             dump("FolderSnapshotManager: stored folder revisions belong to another remote target; discarded");
             this.saveBaselineState();
-            // 启动即发现换过目标：先清旧目标的冲突记录，再由主流程读回集合
-            // Target changed since last session: clear old conflicts before main reads the set
+            // 启动即发现换过目标：先清旧目标的冲突记录，再由主流程读回集合。
+            // 失败时保留重试标志，下一轮同步开始前会再清一次。
+            // Target changed since last session: clear old conflicts before main reads the set.
+            // On failure keep the retry flag so the next sync round tries again.
             try {
                 const { resetConflictRecords } = await import("../sync/conflict_store");
-                await resetConflictRecords(this.plugin);
+                if (!(await resetConflictRecords(this.plugin))) this.plugin.conflictResetFailed = true;
             } catch {
-                // Conflict cleanup is best-effort; initialization must continue
+                // Conflict cleanup is best-effort; initialization must continue, the next round retries
+                this.plugin.conflictResetFailed = true;
             }
         }
     }
