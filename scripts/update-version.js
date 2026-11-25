@@ -2,7 +2,7 @@ import path from 'node:path';
 /**
  * 用法（在项目根目录）：
  *  pnpm run ver -- 0.7.0      # 将 version 设置为 0.7.0
- *  pnpm run ver -- patch (或 c)   # 将 patch 自增（如 0.6.24 -> 0.6.25）
+ *  pnpm run ver -- patch (或 c)   # 将 patch 自增（如 0.6.4 -> 0.6.5；修订号到 9 进位，0.6.9 -> 0.7.0）
  *  pnpm run ver -- minor (或 b)   # 将 minor 自增（如 0.6.24 -> 0.7.0）
  *  pnpm run ver -- major (或 a)   # 将 major 自增（如 0.6.24 -> 1.0.0）
  *  pnpm run ver -- c- / b- / a-  # 对应的版本回退（如 2.0.6 -> 2.0.5）
@@ -47,6 +47,9 @@ function bumpVersion(current, part) {
     }
     if (part === 'patch') {
         if (hasSuffix) return base;
+        // 修订号最大到 9：X.Y.9 之后接 X.(Y+1).0，不生成 .10
+        // Patch tops out at 9: X.Y.9 is followed by X.(Y+1).0, never .10
+        if (pat >= 9) return `${maj}.${min + 1}.0`;
         return `${maj}.${min}.${pat + 1}`;
     }
     if (part === 'down-major') {
