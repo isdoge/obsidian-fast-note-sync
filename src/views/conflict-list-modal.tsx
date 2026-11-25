@@ -7,7 +7,7 @@ import { $ } from "../i18n/lang";
 import { LucideIcon } from "./note-history/lucide-icon";
 import { alignConflictEntries, listUnalignedPaths, ConflictAlignMode, ConflictAlignResult } from "../lib/sync/conflict_align";
 import { ConfirmModal } from "./confirm-modal";
-import { conflictKindLabel, conflictReasonLabel, readUnifiedConflictMeta } from "../lib/sync/conflict_store";
+import { conflictKindLabel, conflictReasonLabel, pruneInvalidConflictRecords, readUnifiedConflictMeta } from "../lib/sync/conflict_store";
 
 export class ConflictListModal extends Modal {
     private root: Root | null = null;
@@ -79,7 +79,14 @@ const ConflictListView = ({ plugin, modal }: { plugin: FastSync, modal: Conflict
             }
             if (!disposed) setMetas(nextMetas);
         };
-        void refresh();
+        // 打开列表前先自愈失效记录（无 meta 的路径读不到原因，也无法解决）；只做一次，
+        // 后续刷新循环不再重复检查，避免几千条逐条读盘。
+        // Self-heal invalid records once before the first refresh (a path without meta has no
+        // reason and cannot be resolved); the 500ms refresh loop does not repeat the check.
+        void (async () => {
+            await pruneInvalidConflictRecords(plugin);
+            if (!disposed) await refresh();
+        })();
         const timer = window.setInterval(() => { void refresh(); }, 500);
         return () => {
             disposed = true;

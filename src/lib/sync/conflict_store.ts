@@ -1,8 +1,9 @@
 import { normalizePath } from "obsidian";
 
 import { $ } from "../../i18n/lang";
-import { dump, dumpError, hashContentAsync, hashFileAsync } from "../utils/helpers";
+import { dump, dumpError, getPluginDir, hashContentAsync, hashFileAsync } from "../utils/helpers";
 import { decodeConfigContent } from "../utils/config_codec";
+import { recordDiagBufferOnly } from "../utils/sync_diagnostics";
 import type { SyncConflictPayload } from "../utils/types";
 import { SyncLogManager } from "./sync_log_manager";
 import { clearUploadTrackingForConflict } from "./operator_file";
@@ -173,10 +174,11 @@ function pauseUploadsForPath(plugin: FastSync, path: string): void {
 
 /**
  * 持久化一条统一冲突，并把路径加入暂停自动上传集合。
- * 返回 false 表示载荷无效（无路径），调用方不应据此记账。
+ * 返回 false 表示载荷无效（无路径）或元数据未能落盘，调用方不应据此记账。
  *
  * Persist one unified conflict and pause automatic uploads for the path.
- * Returns false for an invalid payload (no path); callers must not account for it.
+ * Returns false for an invalid payload (no path) or when the metadata could not be persisted;
+ * callers must not account for it in either case.
  */
 export async function storeSyncConflict(plugin: FastSync, raw: unknown): Promise<boolean> {
   const conflict = normalizeConflict(raw);
@@ -188,6 +190,12 @@ export async function storeSyncConflict(plugin: FastSync, raw: unknown): Promise
   const kind = conflict.kind;
   dump("[Conflict] Store unified conflict", { kind, path, reason: conflict.reason, serverDeleted: conflict.serverDeleted });
 
+  // 作用域变化触发的旧目标冲突清理可能还没落定；先等它完成，避免旧清理与新记录交错
+  // An old-target conflict cleanup triggered by a scope change may still be running; await it so
+  // the stale cleanup cannot interleave with this new record
+  await awaitPendingConflictReset(plugin);
+
+  let metaPersisted = false;
   try {
     const adapter = plugin.app.vault.adapter;
     const { dir, baseBackupPath, remoteBackupPath } = conflictBackupPaths(plugin, path);
@@ -264,8 +272,18 @@ export async function storeSyncConflict(plugin: FastSync, raw: unknown): Promise
         : (previous?.localHashAtDetection ? { localHashAtDetection: previous.localHashAtDetection } : {})),
     };
     await writeConflictMeta(plugin, path, meta);
+    metaPersisted = true;
   } catch (error) {
     dumpError(`[Conflict] Failed to persist conflict metadata: ${path}`, error);
+  }
+
+  // 元数据没落盘就不能进集合：否则启动自愈会把这条“没有 meta”的记录当成残留删掉，
+  // 期间还占着冲突角标、暂停上传，反而更难排查。
+  // Without metadata the path must stay out of the set: startup self-heal would treat the record
+  // as a leftover and drop it, while the badge and upload pause would linger until then.
+  if (!metaPersisted) {
+    dumpError(`[Conflict] Conflict metadata was not persisted; keeping the path out of the conflict list: ${path}`);
+    return false;
   }
 
   plugin.syncState.conflictedPaths.add(path);
@@ -291,6 +309,130 @@ export async function storeSyncConflict(plugin: FastSync, raw: unknown): Promise
 
 export async function readUnifiedConflictMeta(plugin: FastSync, path: string): Promise<UnifiedConflictMeta | null> {
   return readConflictMeta(plugin, path);
+}
+
+/**
+ * 失效冲突记录自愈：集合里有路径、但没有对应 meta 的记录无法再展示类型与原因，也无法解决
+ * （常见于只清掉插件目录状态文件、没清到 localStorage 里 `fns-conflicted-paths` 的情况）。
+ * 只从集合中移除并落盘，不动本地/远端备份文件；读取失败时不误删，留待下次判断。
+ *
+ * Self-heal invalid conflict records: a path in the set without meta cannot show its kind or
+ * reason and cannot be resolved (e.g. the plugin-dir state files were cleared but the
+ * localStorage `fns-conflicted-paths` set survived). Drop and persist only the record; local
+ * and remote backups are left alone. A failed existence check keeps the record for next time.
+ *
+ * Returns the number of removed records.
+ */
+export async function pruneInvalidConflictRecords(plugin: FastSync): Promise<number> {
+  const paths = plugin.syncState.conflictedPaths;
+  if (!paths || paths.size === 0) return 0;
+  const adapter = plugin.app.vault.adapter;
+  const dir = `${getPluginDir(plugin)}/conflict-notes`;
+  // 先取候选快照，再列目录。storeSyncConflict 先写 meta 再把路径加入集合，所以在这份快照
+  // 之后新增的路径一定不在候选里，不会被误删；反过来先列目录再取集合，会把同步中刚加入、
+  // meta 尚未落盘（或正好在两次 await 之间写入）的记录当成“没有元数据的残留”清掉。
+  // Snapshot the candidates before listing. storeSyncConflict writes the meta before adding the
+  // path, so anything added after this snapshot is absent from the candidates and can never be
+  // pruned. Listing first and snapshotting later could drop a record added concurrently, before
+  // its metadata reached the directory.
+  const candidates = Array.from(paths);
+  // 一次列举目录，而不是逐条 exists()：事故里的集合有 2315 条，逐条探测会明显拖慢启动。
+  // 目录本身不存在时说明元数据全被清掉，集合里的记录全部失效。
+  // List once instead of one exists() per path: the incident had 2315 entries, and per-path
+  // probes visibly slow startup. A missing directory means every record lost its metadata.
+  let existing: Set<string>;
+  try {
+    if (!(await adapter.exists(dir))) {
+      existing = new Set();
+    } else {
+      const listed = await adapter.list(dir);
+      existing = new Set(listed?.files ?? []);
+    }
+  } catch (error) {
+    // 列举失败时保守保留全部记录，留待下次启动再判断
+    // On a failed listing keep every record and try again next startup
+    dump("[Conflict] Unable to list conflict metadata, keeping all records", error);
+    return 0;
+  }
+  const invalid: string[] = [];
+  for (const path of candidates) {
+    try {
+      const { metaPath } = conflictBackupPaths(plugin, path);
+      if (!existing.has(metaPath)) invalid.push(path);
+    } catch (error) {
+      dump(`[Conflict] Unable to resolve conflict metadata, keeping record: ${path}`, error);
+    }
+  }
+  if (invalid.length === 0) return 0;
+  for (const path of invalid) paths.delete(path);
+  plugin.localStorageManager.setConflictedPaths(paths);
+  plugin.statusBarManager?.updateConflictBadge?.();
+  // 只记数量，避免一次启动刷出几千条日志 / Count only, never one line per path
+  recordDiagBufferOnly("warn", "ConflictState", `${invalid.length} conflicted path(s) had no metadata and were removed from the list`);
+  return invalid.length;
+}
+
+/**
+ * 重置同步状态时清空冲突记录：内存集合、localStorage 集合与 conflict-notes 的元数据。
+ * 备份正文（.base/.remote/.local-backup）默认保留，便于用户仍能找回内容；
+ * 切换远端库名的完整清理由 clearVaultConflictBackups 负责。
+ * 返回值：元数据清理是否真正成功；false 让调用方（作用域变化调度）保留待重试标志。
+ *
+ * Clear conflict records when resetting sync state: the in-memory set, the localStorage set
+ * and the conflict-notes metadata. Backup bodies (.base/.remote/.local-backup) are kept by
+ * default so content can still be recovered; a vault switch clears the whole folder separately.
+ * Returns whether the metadata cleanup actually succeeded so the scope-change scheduler can keep
+ * its retry flag on failure.
+ */
+export async function resetConflictRecords(plugin: FastSync): Promise<boolean> {
+  const paths = plugin.syncState.conflictedPaths;
+  paths?.clear();
+  plugin.localStorageManager.setConflictedPaths(new Set());
+  plugin.statusBarManager?.updateConflictBadge?.();
+  try {
+    const adapter = plugin.app.vault.adapter;
+    const dir = `${getPluginDir(plugin)}/conflict-notes`;
+    if (!(await adapter.exists(dir))) return true;
+    const listed = await adapter.list(dir);
+    const metas = (listed?.files ?? []).filter((file) => file.endsWith(".meta.json"));
+    await Promise.all(metas.map((file) => adapter.remove(file)));
+    if (metas.length > 0) {
+      recordDiagBufferOnly("info", "ConflictState", `${metas.length} conflict metadata file(s) removed by a sync-state reset`);
+    }
+    return true;
+  } catch (error) {
+    dump("[Conflict] Unable to clear conflict metadata on reset", error);
+    return false;
+  }
+}
+
+/**
+ * 等待作用域变化触发的冲突记录清理完成；上次失败则在本轮重试一次。
+ * 每轮同步开始和每次写入新冲突前调用。清理本身可能仍在动态导入阶段（见
+ * conflict_reset_scheduler.ts），这里一并等待导入完成，导入失败则重试。
+ *
+ * Await the conflict-record cleanup scheduled by a scope change; retry once if the previous
+ * attempt failed. Called at every sync round start and before every new conflict write. The
+ * cleanup may still be resolving its dynamic import (see conflict_reset_scheduler.ts), which is
+ * awaited here too; an import failure is retried.
+ */
+export async function awaitPendingConflictReset(plugin: FastSync): Promise<void> {
+  const pending = plugin.pendingConflictReset;
+  if (pending) {
+    await pending;
+    if (plugin.pendingConflictReset === pending) plugin.pendingConflictReset = null;
+  }
+  if (!plugin.conflictResetFailed) return;
+  // 上一轮失败（动态导入失败或元数据删不掉）：合一重试一次；仍失败就保留标志等下一轮
+  // Previous attempt failed (import or metadata removal): retry once; a second failure keeps
+  // the flag for the next round
+  plugin.conflictResetFailed = false;
+  const retry = resetConflictRecords(plugin).then((ok) => {
+    if (!ok) plugin.conflictResetFailed = true;
+  });
+  plugin.pendingConflictReset = retry;
+  await retry;
+  if (plugin.pendingConflictReset === retry) plugin.pendingConflictReset = null;
 }
 
 /** 清除一条冲突的记录状态（不动本地/远端内容）/ Clear the recorded state (does not touch content) */

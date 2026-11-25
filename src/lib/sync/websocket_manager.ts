@@ -2,7 +2,7 @@ import { moment, Platform, normalizePath } from "obsidian";
 
 import { invalidateFileDownloads, handleFileChunkDownload, BINARY_PREFIX_FILE_SYNC, clearUploadQueue, receiveFileUploadSessionNotFound } from "./operator_file";
 import { clearEmptyNoteProbes, conflictBackupPaths, releaseEmptyNoteProbe, writeConflictMeta } from "./operator_note";
-import { dump, addRandomParam, showSyncNotice, safeStringify } from "../utils/helpers";
+import { dump, dumpError, addRandomParam, showSyncNotice, safeStringify } from "../utils/helpers";
 import { enSendDTOToProtobuf, deReceivePacket } from "../../pb/protobuf_mapper";
 import { receiveOperators, startupSync, startupFullSync, settleAllBatchSendSessionsOnClose, settleSyncTimes } from "./operator";
 import { SyncLogManager } from "./sync_log_manager";
@@ -1075,6 +1075,21 @@ export class WebSocketManager {
     // body. Legacy 530 payloads from old servers keep the compatibility behavior (§2.6)
     if (this.plugin.syncState.isSyncBaselineModeEnabled?.() === true) {
       if (await storeSyncConflict(this.plugin, data.data)) return;
+      // 统一载荷持久化失败时不回落旧兼容分支：旧分支按笔记处理，会把配置、附件冲突写成笔记
+      // 冲突元数据。保持路径不入集合，等服务端下次再报冲突时重试持久化。
+      // When the unified payload fails to persist, never fall back to the legacy branch: it treats
+      // every payload as a note and would write note-style meta for setting/attachment conflicts.
+      // Keep the path out of the set; the next conflict report from the server retries persisting.
+      const rawFailedPath = normalizeConflict(data.data)?.path ?? "";
+      const failedPath = rawFailedPath !== "" ? normalizePath(rawFailedPath) : "";
+      dumpError("[Conflict] Unified conflict was not persisted in baseline mode; skipping legacy fallback:", failedPath);
+      if (failedPath !== "") {
+        // 与旧分支一致先冻结在途上传，避免回执超时后自动重传反复撞冲突
+        // Freeze in-flight uploads like the legacy branch so ack recovery cannot keep re-sending
+        freezeConflictPath(this.plugin, failedPath);
+        showSyncNotice($("ui.status.conflict", { path: failedPath }), 10000);
+      }
+      return;
     }
     const payloadData = data.data;
     let path = "";
@@ -1140,6 +1155,7 @@ export class WebSocketManager {
       // Write the remote conflict copy into conflict-notes. A base file is written only when the
       // server supplied a non-empty ancestor; an empty string may just be a missing snapshot and
       // must not be presented as a real common ancestor.
+      let metaPersisted = false;
       try {
         const { dir, baseBackupPath, remoteBackupPath } = conflictBackupPaths(this.plugin, path);
         const adapter = this.plugin.app.vault.adapter;
@@ -1156,14 +1172,22 @@ export class WebSocketManager {
           baseMissing: !hasRealBase,
           remoteHash: serverHash,
         });
+        metaPersisted = true;
       } catch (e) {
-        dump("Failed to create conflict-notes backup files:", e);
+        dumpError("[Conflict] Failed to create conflict-notes backup files:", e);
       }
 
-      this.plugin.syncState.conflictedPaths.add(path);
-      this.plugin.syncState.newConflictedPathsThisRound.add(path);
-      this.plugin.localStorageManager.setConflictedPaths(this.plugin.syncState.conflictedPaths);
-      this.plugin.statusBarManager.updateConflictBadge();
+      // 元数据没写成就不能把路径加入集合：启动自愈会把它当作没有 meta 的残留清掉
+      // Without metadata the path must stay out of the set: startup self-heal would drop it as a
+      // meta-less leftover
+      if (!metaPersisted) {
+        dumpError(`[Conflict] Conflict metadata was not persisted; keeping the path out of the conflict list: ${path}`);
+      } else {
+        this.plugin.syncState.conflictedPaths.add(path);
+        this.plugin.syncState.newConflictedPathsThisRound.add(path);
+        this.plugin.localStorageManager.setConflictedPaths(this.plugin.syncState.conflictedPaths);
+        this.plugin.statusBarManager.updateConflictBadge();
+      }
     } else {
       if (typeof path === "string") {
         dump("Conflict detected:", { code: data.code, Path: path, message: data.message });

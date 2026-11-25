@@ -673,6 +673,7 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
 
             // 如果存在未同步的本地修改或已在冲突列表中，将服务端最新推送的内容写入/更新到远端备份文件 xxx.remote.md
             // If local unsynced edit exists or path is in conflict state, write/update the server's latest content into xxx.remote.md
+            let metaPersisted = false;
             try {
               const adapter = plugin.app.vault.adapter;
               const { dir, baseBackupPath, remoteBackupPath } = conflictBackupPaths(plugin, normalizedPath);
@@ -696,8 +697,17 @@ export const receiveNoteSyncModify = async function (data: ReceiveMessage, plugi
               });
 
               dump(`[FastSync] Updated remote backup file for conflict: ${remoteBackupPath}`);
+              metaPersisted = true;
             } catch (err) {
               dumpError(`[FastSync] Failed to update remote backup file: ${normalizedPath}`, err);
+            }
+
+            // 元数据没写成就不能进冲突集合：否则启动自愈会把它当成没有 meta 的残留清掉
+            // Without metadata the path must stay out of the set: startup self-heal would drop it
+            // as a meta-less leftover
+            if (!metaPersisted) {
+              dumpError(`[FastSync] Conflict metadata was not persisted; keeping the path out of the conflict list: ${normalizedPath}`);
+              return
             }
 
             // 保持在冲突列表中并刷新状态栏

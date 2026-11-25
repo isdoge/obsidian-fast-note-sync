@@ -159,6 +159,7 @@ const ops = loadModule("src/lib/sync/operator_note.ts", (id) => {
     if (id === "./baseline_scope") return baselineScope;
     if (id === "../../i18n/lang") return { $: (k) => k };
     if (id === "../../main") return {};
+    if (id.includes("conflict_reset_scheduler")) return { scheduleConflictRecordReset: () => {} };
     throw new Error(`Unexpected require in file_hash_manager: ${id}`);
   });
   const first = new FileHashManager(makePlugin());

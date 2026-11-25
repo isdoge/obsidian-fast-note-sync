@@ -2,6 +2,7 @@ import { hashContentAsync, dump, isPathExcluded, showSyncNotice, isLargeBinarySy
 import { $ } from "../../i18n/lang";
 import type FastSync from "../../main";
 import { BaselineDeleteRecord, computeRemoteScope, parseScopedState, serializeScopedState, ScopedBaselineState } from "./baseline_scope";
+import { scheduleConflictRecordReset } from "../sync/conflict_reset_scheduler";
 
 
 /**
@@ -405,6 +406,11 @@ export class FileHashManager {
     dump("FileHashManager: remote scope changed; revisions and confirmed provenance cleared");
     this.saveBaselineState();
     this.saveSyncToStorage();
+    // 旧目标的冲突记录不再有意义（路径可能在新目标上不存在）。登记成待执行的清理，
+    // 下一轮同步开始 / 写入新冲突前会等待它完成，失败则保留标志重试。
+    // Conflict records of the old target are meaningless. Register a tracked cleanup: the next
+    // sync round / conflict write awaits it, and failures keep a retry flag.
+    scheduleConflictRecordReset(this.plugin, "note/file baseline scope changed");
   }
 
   private async loadBaselineState(): Promise<void> {
@@ -428,6 +434,17 @@ export class FileHashManager {
       dump("FileHashManager: stored baseline belongs to another remote target; tokens discarded");
       this.saveBaselineState();
       this.saveSyncToStorage();
+      // 启动即发现换过目标：先把旧目标的冲突记录清掉，再让主流程读回集合。
+      // 失败时保留重试标志，下一轮同步开始前会再清一次。
+      // Target changed since last session: clear the old conflicts before main reads the set.
+      // On failure keep the retry flag so the next sync round tries again.
+      try {
+        const { resetConflictRecords } = await import("../sync/conflict_store");
+        if (!(await resetConflictRecords(this.plugin))) this.plugin.conflictResetFailed = true;
+      } catch {
+        // Conflict cleanup is best-effort; startup must continue, the next round retries
+        this.plugin.conflictResetFailed = true;
+      }
     }
   }
 

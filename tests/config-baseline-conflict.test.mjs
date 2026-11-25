@@ -100,6 +100,7 @@ const store = loadModule("src/lib/sync/conflict_store.ts", (id) => {
   if (id === "./operator_note") return operatorNoteStub;
   if (id === "../../i18n/lang") return { $: (k) => k };
   if (id === "../../main") return {};
+  if (id === "../utils/sync_diagnostics") return { recordDiagBufferOnly: noop };
   throw new Error(`Unexpected require in conflict_store: ${id}`);
 });
 
