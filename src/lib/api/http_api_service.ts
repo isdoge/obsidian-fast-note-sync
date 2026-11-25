@@ -276,16 +276,18 @@ export class HttpApiService {
      * 服务端自动升级
      * 调用 /api/admin/upgrade
      */
-    async adminUpgrade(version: string = "latest"): Promise<boolean> {
+    async adminUpgrade(version: string = "latest"): Promise<{ ok: boolean; message?: string }> {
         const endpoint = `/api/admin/upgrade?version=${version}`;
         try {
             const { status, json } = await this.request(endpoint, {
                 method: "GET"
             });
-            return status === 200 && this.isSuccess(json);
+            const res = json as ApiResponse | undefined;
+            // 失败时带回服务端说明（如容器内不支持原地升级、已有升级在进行）
+            return { ok: status === 200 && this.isSuccess(json), message: res?.message };
         } catch (e) {
             dumpError("adminUpgrade error:", e);
-            return false;
+            return { ok: false };
         }
     }
 
