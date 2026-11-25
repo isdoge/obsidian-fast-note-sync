@@ -1075,6 +1075,21 @@ export class WebSocketManager {
     // body. Legacy 530 payloads from old servers keep the compatibility behavior (§2.6)
     if (this.plugin.syncState.isSyncBaselineModeEnabled?.() === true) {
       if (await storeSyncConflict(this.plugin, data.data)) return;
+      // 统一载荷持久化失败时不回落旧兼容分支：旧分支按笔记处理，会把配置、附件冲突写成笔记
+      // 冲突元数据。保持路径不入集合，等服务端下次再报冲突时重试持久化。
+      // When the unified payload fails to persist, never fall back to the legacy branch: it treats
+      // every payload as a note and would write note-style meta for setting/attachment conflicts.
+      // Keep the path out of the set; the next conflict report from the server retries persisting.
+      const rawFailedPath = normalizeConflict(data.data)?.path ?? "";
+      const failedPath = rawFailedPath !== "" ? normalizePath(rawFailedPath) : "";
+      dumpError("[Conflict] Unified conflict was not persisted in baseline mode; skipping legacy fallback:", failedPath);
+      if (failedPath !== "") {
+        // 与旧分支一致先冻结在途上传，避免回执超时后自动重传反复撞冲突
+        // Freeze in-flight uploads like the legacy branch so ack recovery cannot keep re-sending
+        freezeConflictPath(this.plugin, failedPath);
+        showSyncNotice($("ui.status.conflict", { path: failedPath }), 10000);
+      }
+      return;
     }
     const payloadData = data.data;
     let path = "";
