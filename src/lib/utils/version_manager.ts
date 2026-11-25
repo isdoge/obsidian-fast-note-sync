@@ -297,15 +297,15 @@ export class VersionManager {
         plugin.websocket.unRegister();
 
         // 2. 发起升级请求
-        const success = await plugin.api.adminUpgrade("latest");
+        const result = await plugin.api.adminUpgrade("latest");
         if (signal?.aborted) {
             void plugin.websocket.register(); // 尝试恢复连接
             throw new Error("Upgrade aborted.");
         }
 
-        if (!success) {
+        if (!result.ok) {
             void plugin.websocket.register(); // 尝试恢复连接
-            throw new Error($("ui.version.upgrade_fail"));
+            throw new Error(result.message || $("ui.version.upgrade_fail"));
         }
 
         onProgress($("ui.version.waiting_server"));
